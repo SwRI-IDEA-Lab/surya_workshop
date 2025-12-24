@@ -1,0 +1,3 @@
+[submodule "Surya"]
+	path = Surya
+	url = https://github.com/NASA-IMPACT/Surya.git
