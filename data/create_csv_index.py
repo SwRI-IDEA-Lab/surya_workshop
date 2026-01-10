@@ -23,6 +23,7 @@ def fetch_nc_files(directory, start_year, start_month, end_year, end_month):
         #     *[f"{month:02}" for month in range(start_month, end_month + 1)],
         #     "*.nc",
         # )
+        
 
         # all_files = ['s3://' + f for f in fs.glob(glob_pattern)]  # Get all nc files recursively
     else:
