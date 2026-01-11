@@ -9,8 +9,8 @@ import xarray as xr
 import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
-from surya.utils.distributed import get_rank
-from surya.utils.log import create_logger
+from Surya.surya.utils.distributed import get_rank
+from Surya.surya.utils.log import create_logger
 from functools import cache
 
 # Optional S3 support (required only when reading s3:// URIs)
