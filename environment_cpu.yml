@@ -4,6 +4,8 @@ channels:
   - defaults
 dependencies:
   - ipykernel
+  - ipywidgets
+  - jupyter_contrib_nbextensions
   - wandb
   - numba
   - numpy
