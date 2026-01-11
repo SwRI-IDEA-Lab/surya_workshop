@@ -45,6 +45,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
     return_surya_stack : bool, optional
         If True (default), the dataset will return the full Surya stack
         otherlwise only the flare intensity label is returned
+    max_number_of_samples : int | None, optional
+        If provided, limits the maximum number of samples in the dataset, by default None
     ds_flare_index_path : str, optional
         DS index.  In this example a flare dataset, by default None
     ds_time_column : str, optional
@@ -81,6 +83,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         s3_cache_dir: str = "/tmp/helio_s3_cache",
         #### Put your donwnstream (DS) specific parameters below this line
         return_surya_stack: bool = True,
+        max_number_of_samples: int | None = None,
         ds_flare_index_path: str | None = None,
         ds_time_column: str | None = None,
         ds_time_tolerance: str | None = None,
@@ -165,6 +168,9 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         ]
         self.adjusted_length = len(self.valid_indices)
         self.df_valid_indices.set_index("valid_indices", inplace=True)
+
+        if max_number_of_samples is not None:
+            self.adjusted_length = min(self.adjusted_length, max_number_of_samples)
 
     def __len__(self):
         return self.adjusted_length
