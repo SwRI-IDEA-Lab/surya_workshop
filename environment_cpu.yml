@@ -3,6 +3,8 @@ channels:
   - conda-forge
   - defaults
 dependencies:
+  - ipykernel
+  - wandb
   - numba
   - numpy
   - scipy
@@ -23,3 +25,4 @@ dependencies:
     - lightning
     - s3fs
     - einops
+    - huggingface_hub
