@@ -20,6 +20,7 @@ dependencies:
   - bottleneck
   - h5netcdf
   - hdf5plugin
+  - opencv
   - pip
   - pip:
     - torch
