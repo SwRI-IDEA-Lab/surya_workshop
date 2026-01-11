@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Literal
+from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
@@ -34,6 +34,11 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         Input channels to use, by default None
     phase : str, optional
         Descriptor of the phase used for this database, by default "train"
+    s3_use_simplecache : bool, optional
+        If True (default), use fsspec's simplecache to keep a local read-through
+        cache of objects.
+    s3_cache_dir : str, optional
+        Directory used by simplecache. Default: /tmp/helio_s3_cache
 
     Downstream (DS) Parameters
     --------------------------
@@ -69,6 +74,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
+        s3_use_simplecache: bool = True,
+        s3_cache_dir: str = "/tmp/helio_s3_cache",
         #### Put your donwnstream (DS) specific parameters below this line
         ds_flare_index_path: str | None = None,
         ds_time_column: str | None = None,
@@ -92,6 +99,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
             channels=channels,
             phase=phase,
+            s3_use_simplecache=s3_use_simplecache,
+            s3_cache_dir=s3_cache_dir,
         )
 
         # Load ds index and find intersection with HelioFM index
