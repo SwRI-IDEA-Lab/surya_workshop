@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from infrastructure.datasets.helio import HelioNetCDFDataset
+from workshop_infrastructure.datasets.helio import HelioNetCDFDataset
 
 
 class HelioNetCDFDatasetAWS(HelioNetCDFDataset):
