@@ -1,11 +1,12 @@
 import numpy as np
 import pandas as pd
-from Surya.surya.datasets.helio import HelioNetCDFDataset
+from typing import Literal
+from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
-class FlareDSDataset(HelioNetCDFDataset):
+class FlareDSDataset(HelioNetCDFDatasetAWS):
     """
-    Template child class of HelioNetCDFDataset to show an example of how to create a
+    Template child class of HelioNetCDFDatasetAWS to show an example of how to create a
     dataset for donwstream applications. It includes both the necessary parameters
     to initialize the parent class, as well as those of the child
 
@@ -51,6 +52,7 @@ class FlareDSDataset(HelioNetCDFDataset):
     ValueError
         Error is raised if there is not overlap between the HelioFM and DS indices
         given a tolerance
+
     """
 
     def __init__(
@@ -63,16 +65,19 @@ class FlareDSDataset(HelioNetCDFDataset):
         rollout_steps: int,
         scalers=None,
         num_mask_aia_channels=0,
-        drop_hmi_probablity=0,
+        drop_hmi_probability=0,
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_flare_index_path: str = None,
-        ds_time_column: str = None,
-        ds_time_tolerance: str = None,
-        ds_match_direction: str = "forward",
+        ds_flare_index_path: str | None = None,
+        ds_time_column: str | None = None,
+        ds_time_tolerance: str | None = None,
+        ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
     ):
+
+        if ds_match_direction not in ["forward", "backward", "nearest"]:
+            raise ValueError("ds_match_direction must be one of 'forward', 'backward', or 'nearest'")
 
         ## Initialize parent class
         super().__init__(
@@ -83,14 +88,18 @@ class FlareDSDataset(HelioNetCDFDataset):
             rollout_steps=rollout_steps,
             scalers=scalers,
             num_mask_aia_channels=num_mask_aia_channels,
-            drop_hmi_probablity=drop_hmi_probablity,
+            drop_hmi_probability=drop_hmi_probability,
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
             channels=channels,
             phase=phase,
         )
 
         # Load ds index and find intersection with HelioFM index
-        self.ds_index = pd.read_csv(ds_flare_index_path)
+        if ds_flare_index_path is not None:
+            self.ds_index = pd.read_csv(ds_flare_index_path)
+        else:
+            raise ValueError("ds_flare_index_path must be provided for FlareDSDataset")
+
         self.ds_index["ds_index"] = pd.to_datetime(
             self.ds_index[ds_time_column]
         ).values.astype("datetime64[ns]")
@@ -163,11 +172,11 @@ class FlareDSDataset(HelioNetCDFDataset):
         """
 
         # This lines assembles the dictionary that HelioFM's dataset returns (defined above)
-        base_dictionary, metadata = super().__getitem__(idx=idx)
+        base_dictionary= super().__getitem__(idx=idx)
 
         # We now add the flare intensity label
         base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
             "normalized_intensity"
         ].astype(np.float32)
 
-        return base_dictionary, metadata
+        return base_dictionary
