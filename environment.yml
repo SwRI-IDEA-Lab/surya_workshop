@@ -1,4 +1,4 @@
-name: surya_cpu
+name: surya_ws
 channels:
   - conda-forge
   - defaults
