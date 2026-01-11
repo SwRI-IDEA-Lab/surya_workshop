@@ -2,6 +2,7 @@ import os
 import sys
 import random
 from datetime import datetime
+from typing import Tuple
 import torch
 import numpy as np
 import skimage.measure
@@ -231,7 +232,7 @@ class HelioNetCDFDataset(Dataset):
         phase="train",
         pooling: int | None = None,
         random_vert_flip: bool = False,
-        sdo_data_root_path: str = None,
+        sdo_data_root_path: str | None = None,
             # --- S3 options (used only if index contains s3:// URIs) ---
         s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = True,
@@ -482,16 +483,16 @@ class HelioNetCDFDataset(Dataset):
                 "forecast": stacked_targets,
                 "lead_time_delta": lead_time_delta_float,
                 "forecast_latitude": target_latitude,
-            }, metadata
+            }#, metadata
 
         return {
             "ts": stacked_inputs,
             "time_delta_input": time_delta_input_float,
             "forecast": stacked_targets,
             "lead_time_delta": lead_time_delta_float,
-        }, metadata
+        }#, metadata
 
-        def _is_s3_path(self, path: str) -> bool:
+    def _is_s3_path(self, path: str) -> bool:
         """Return True if `path` is an S3 URI (s3://...)."""
         return isinstance(path, str) and path.startswith("s3://")
 
@@ -588,7 +589,7 @@ class HelioNetCDFDataset(Dataset):
             return data
     
     @cache
-    def transformation_inputs(self) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+    def transformation_inputs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         means = np.array([self.scalers[ch].mean for ch in self.channels])
         stds = np.array([self.scalers[ch].std for ch in self.channels])
         epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
