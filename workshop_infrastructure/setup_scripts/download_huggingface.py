@@ -10,12 +10,12 @@ DATASETS = [
     "nasa-ibm-ai4science/ar_emergence",
 ]
 
-BASE_DIR = Path("/tmp/huggingface_data")
+BASE_DIR = Path("/shared/huggingface_data")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def download_dataset(dataset_name: str):
-    dataset_dir = BASE_DIR / dataset_name.replace("/", "__")
+    dataset_dir = BASE_DIR / dataset_name.split("/")[-1]    
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Downloading {dataset_name} ...")
