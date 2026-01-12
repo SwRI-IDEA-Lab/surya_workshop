@@ -1,7 +1,215 @@
 import numpy as np
 import pandas as pd
 from typing import Literal, Optional
+from pathlib import Path
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
+
+
+class RibbonDSDataset(HelioNetCDFDatasetAWS):
+    """
+    Dataset class for solar flare ribbon masks. This dataset links Surya's heliophysics data
+    with manually annotated ribbon mask images.
+
+    Surya Parameters
+    ------------------
+    index_path : str
+        Path to Surya index
+    time_delta_input_minutes : list[int]
+        Input delta times to define the input stack in minutes from the present
+    time_delta_target_minutes : int
+        Target delta time to define the output stack on rollout in minutes from the present
+    n_input_timestamps : int
+        Number of input timestamps
+    rollout_steps : int
+        Number of rollout steps
+    scalers : optional
+        scalers used to perform input data normalization, by default None
+    num_mask_aia_channels : int, optional
+        Number of aia channels to mask during training, by default 0
+    drop_hmi_probablity : int, optional
+        Probability of removing hmi during training, by default 0
+    use_latitude_in_learned_flow : bool, optional
+        Switch to provide heliographic latitude for each datapoint, by default False
+    channels : list[str] | None, optional
+        Input channels to use, by default None
+    phase : str, optional
+        Descriptor of the phase used for this database, by default "train"
+    s3_use_simplecache : bool, optional
+        If True (default), use fsspec's simplecache to keep a local read-through
+        cache of objects.
+    s3_cache_dir : str, optional
+        Directory used by simplecache. Default: /tmp/helio_s3_cache
+
+    Downstream (DS) Parameters
+    --------------------------
+    return_surya_stack : bool, optional
+        If True (default), the dataset will return the full Surya stack
+        otherwise only the ribbon mask path is returned
+    max_number_of_samples : int | None, optional
+        If provided, limits the maximum number of samples in the dataset, by default None
+    ds_ribbon_index_path : str, optional
+        Path to ribbon_masks.csv file, by default None
+    ds_data_root : str, optional
+        Root directory where ribbon mask PNG files are stored, by default None
+    ds_time_column : str, optional
+        Name of the column to use as datestamp to compare with Surya's index, by default "rounded_time"
+    ds_time_tolerance : str, optional
+        How much time difference is tolerated when finding matches between Surya and the DS, by default None
+    ds_match_direction : str, optional
+        Direction used to find matches using pd.merge_asof possible values are "forward", "backward",
+        or "nearest".  For causal relationships is better to use "forward", by default "forward"
+
+    Raises
+    ------
+    ValueError
+        Error is raised if there is not overlap between the Surya and DS indices
+        given a tolerance
+
+    """
+
+    def __init__(
+        self,
+        #### All these lines are required by the parent HelioNetCDFDataset class
+        index_path: str,
+        time_delta_input_minutes: list[int],
+        time_delta_target_minutes: int,
+        n_input_timestamps: int,
+        rollout_steps: int,
+        scalers=None,
+        num_mask_aia_channels=0,
+        drop_hmi_probability=0,
+        use_latitude_in_learned_flow=False,
+        channels: list[str] | None = None,
+        phase="train",
+        s3_use_simplecache: bool = True,
+        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        #### Put your donwnstream (DS) specific parameters below this line
+        return_surya_stack: bool = True,
+        max_number_of_samples: int | None = None,
+        ds_ribbon_index_path: str | None = None,
+        ds_data_root: str | None = None,
+        ds_time_column: str = "rounded_time",
+        ds_time_tolerance: str | None = None,
+        ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
+    ):
+
+        if ds_match_direction not in ["forward", "backward", "nearest"]:
+            raise ValueError("ds_match_direction must be one of 'forward', 'backward', or 'nearest'")
+
+        ## Initialize parent class
+        super().__init__(
+            index_path=index_path,
+            time_delta_input_minutes=time_delta_input_minutes,
+            time_delta_target_minutes=time_delta_target_minutes,
+            n_input_timestamps=n_input_timestamps,
+            rollout_steps=rollout_steps,
+            scalers=scalers,
+            num_mask_aia_channels=num_mask_aia_channels,
+            drop_hmi_probability=drop_hmi_probability,
+            use_latitude_in_learned_flow=use_latitude_in_learned_flow,
+            channels=channels,
+            phase=phase,
+            s3_use_simplecache=s3_use_simplecache,
+            s3_cache_dir=s3_cache_dir,
+        )
+
+        self.return_surya_stack = return_surya_stack
+
+        # Load ds index and find intersection with Surya index
+        if ds_ribbon_index_path is None:
+            raise ValueError("ds_ribbon_index_path must be provided for RibbonDSDataset")
+
+        if ds_data_root is None:
+            raise ValueError("ds_data_root must be provided for RibbonDSDataset")
+
+        self.ds_index = pd.read_csv(ds_ribbon_index_path)
+        self.ds_data_root = Path(ds_data_root)
+
+        self.ds_index["ds_index"] = pd.to_datetime(
+            self.ds_index[ds_time_column]
+        ).values.astype("datetime64[ns]")
+        self.ds_index.sort_values("ds_index", inplace=True)
+
+        # Create Surya valid indices and find closest match to DS index
+        self.df_valid_indices = pd.DataFrame(
+            {"valid_indices": self.valid_indices}
+        ).sort_values("valid_indices")
+        self.df_valid_indices = pd.merge_asof(
+            self.df_valid_indices,
+            self.ds_index,
+            right_on="ds_index",
+            left_on="valid_indices",
+            direction=ds_match_direction,
+        )
+        # Remove duplicates keeping closest match
+        self.df_valid_indices["index_delta"] = np.abs(
+            self.df_valid_indices["valid_indices"] - self.df_valid_indices["ds_index"]
+        )
+        self.df_valid_indices = self.df_valid_indices.sort_values(
+            ["ds_index", "index_delta"]
+        )
+        self.df_valid_indices.drop_duplicates(
+            subset="ds_index", keep="first", inplace=True
+        )
+        # Enforce a maximum time tolerance for matches
+        if ds_time_tolerance is not None:
+            self.df_valid_indices = self.df_valid_indices.loc[
+                self.df_valid_indices["index_delta"] <= pd.Timedelta(ds_time_tolerance),
+                :,
+            ]
+            if len(self.df_valid_indices) == 0:
+                raise ValueError("No intersection between Surya and DS indices")
+
+        # Override valid indices variables to reflect matches between Surya and DS
+        self.valid_indices = [
+            pd.Timestamp(date) for date in self.df_valid_indices["valid_indices"]
+        ]
+        self.adjusted_length = len(self.valid_indices)
+        self.df_valid_indices.set_index("valid_indices", inplace=True)
+
+        if max_number_of_samples is not None:
+            self.adjusted_length = min(self.adjusted_length, max_number_of_samples)
+
+    def __len__(self):
+        return self.adjusted_length
+
+    def __getitem__(self, idx: int) -> dict:
+        """
+        Args:
+            idx: Index of sample to load. (Pytorch standard.)
+        Returns:
+            Dictionary with following keys. The values are tensors with shape as follows:
+                # Surya keys--------------------------------
+                ts (torch.Tensor):                C, T, H, W
+                time_delta_input (torch.Tensor):  T
+                input_latitude (torch.Tensor):    T
+                lead_time_delta (torch.Tensor):   L
+                forecast_latitude (torch.Tensor): L
+                # Ribbon-specific keys----------------------
+                ribbon_mask_path (str):           Path to ribbon mask PNG file
+                ds_index (str):                   ISO format timestamp
+            C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
+        """
+
+        base_dictionary = {}
+        if self.return_surya_stack:
+            # This lines assembles the dictionary that Surya's dataset returns (defined above)
+            base_dictionary = super().__getitem__(idx=idx)
+
+        # Get the ribbon mask path from the CSV
+        row = self.df_valid_indices.iloc[idx]
+        ribbon_mask_relative_path = row["aia_png"]
+
+        # Create full path to the ribbon mask
+        ribbon_mask_full_path = self.ds_data_root / ribbon_mask_relative_path
+        base_dictionary["ribbon_mask_path"] = str(ribbon_mask_full_path)
+
+        # Add additional metadata that might be useful
+        base_dictionary["ds_index"] = row["ds_index"].isoformat()
+        base_dictionary["flare_class"] = row["Flaredir"]
+        base_dictionary["goes_peak_time"] = row["GOES_peak"]
+
+        return base_dictionary
 
 
 class FlareDSDataset(HelioNetCDFDatasetAWS):
