@@ -35,6 +35,23 @@
               "--out_dir", "/home/amjlowlevel/surya_workshop/data/indices",
               "--prefix", "surya_aws_s3_"
             ]
-        }        
+        },
+        {
+            "name": "Run baseline script",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+              "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config.yaml",
+              "--ds_flare_index_path", "./data/hek_flare_catalog.csv",
+              "--batch_size", "2",
+              "--max_epochs", "2",
+              "--cuda_visible_devices", "0",
+              "--use_wandb"
+            ]
+        }              
     ]
 }
