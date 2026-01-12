@@ -1,0 +1,40 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Create Index",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+              "--dirpath", "s3://nasa-surya-bench",
+              "--start_year", "2011",
+              "--start_month", "1",
+              "--end_year", "2024",
+              "--end_month", "12",
+              "--csv_output", "s3_index.csv"
+            ]
+        },
+        {
+            "name": "Create splits",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+              "--input_csv", "/home/amjlowlevel/surya_workshop/data/indices/surya_aws_s3_full_index.csv",
+              "--out_dir", "/home/amjlowlevel/surya_workshop/data/indices",
+              "--prefix", "surya_aws_s3_"
+            ]
+        }        
+    ]
+}
