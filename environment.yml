@@ -32,3 +32,4 @@ dependencies:
     - s3fs
     - einops
     - huggingface_hub
+    - datasets
