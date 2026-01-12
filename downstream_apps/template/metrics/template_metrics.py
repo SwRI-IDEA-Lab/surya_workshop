@@ -21,6 +21,14 @@ class FlareMetrics:
         """
         self.mode = mode
 
+        # Cache torchmetrics instances once (instead of recreating each call)
+        self._rrse = tm.RelativeSquaredError(squared=False)
+
+    def _ensure_device(self, preds: torch.Tensor):
+        # Move metric module to the same device as preds, but only when needed
+        if self._rrse.device != preds.device:
+            self._rrse = self._rrse.to(preds.device)        
+
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
@@ -69,8 +77,8 @@ class FlareMetrics:
         output_metrics = {}
         output_weights = []
 
-        squared_relative_squared_error = tm.RelativeSquaredError(squared=False)
-        output_metrics["rrse"] = squared_relative_squared_error(preds, target)
+        self._ensure_device(preds)
+        output_metrics["rrse"] = self._rrse(preds, target)
         output_weights.append(1)        
 
 
@@ -100,8 +108,8 @@ class FlareMetrics:
         output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
         output_weights.append(1)
 
-        root_relative_squared_error = tm.RelativeSquaredError(squared=False)
-        output_metrics["rrse"] = root_relative_squared_error(preds, target)
+        self._ensure_device(preds)
+        output_metrics["rrse"] = self._rrse(preds, target)
         output_weights.append(1)            
 
         return output_metrics, output_weights
