@@ -209,6 +209,9 @@ __marimo__/
 # Files
 scalers.yaml
 
+# wandb directories
+wandb/
+
 # File types
 *.csv
 *.jpg
