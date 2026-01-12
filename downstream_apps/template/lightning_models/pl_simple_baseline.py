@@ -29,7 +29,7 @@ class FlareLightningModule(pl.LightningModule):
                 loss += training_losses[key] * training_loss_weights[n]
 
         # Add all reporting for losses
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size)
         for key in training_losses.keys():
             self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size)
 
@@ -56,7 +56,7 @@ class FlareLightningModule(pl.LightningModule):
                 loss += val_losses[key] * val_loss_weights[n]
 
         # Add all reporting for losses
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size)
         for key in val_losses.keys():
             self.log(f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size)
 
