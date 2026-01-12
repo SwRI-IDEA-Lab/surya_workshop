@@ -27,6 +27,7 @@ dependencies:
     - torch
     - torchvision
     - lightning
+    - peft
     - torchmetrics
     - s3fs
     - einops
