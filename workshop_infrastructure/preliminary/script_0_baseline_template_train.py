@@ -11,14 +11,15 @@ This script wires together:
 It is designed to match the structure shown in `1_baseline_template.ipynb`, but in a
 reproducible, command-line runnable form.
 
+IMPORTANT: Make sure to set the visible device to the assigned GPU when you run this script.
+
 Example:
   python script_0_baseline_template_train.py \
     --config ./configs/config.yaml \
     --ds_flare_index_path ./data/hek_flare_catalog.csv \
-    --ds_time_column start_time \
-    --ds_time_tolerance 4d \
     --batch_size 2 \
     --max_epochs 2 \
+    --cuda_visible_devices "0" \
     --use_wandb
 
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from typing import Any, Dict, Optional
 
 import yaml
@@ -42,6 +44,23 @@ try:
     from pytorch_lightning.loggers import WandbLogger  # type: ignore
 except Exception:
     WandbLogger = None  # type: ignore
+
+
+# Determine the absolute path to the script's directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Determine the absolute path to the main project root
+# (assuming script_0_baseline_template_train.py is in downstream_apps/your_downstream/)
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+# Construct absolute paths to Surya and hfmds directories
+SURYA_DIR = os.path.join(PROJECT_ROOT, "Surya")
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if SURYA_DIR not in sys.path:
+    sys.path.insert(0, SURYA_DIR)
+
 
 from surya.utils.data import build_scalers
 
@@ -101,7 +120,7 @@ def parse_args() -> argparse.Namespace:
                    help="Local directory where W&B stores run files (must be writable).")
 
     # CUDA visibility convenience
-    p.add_argument("--cuda_visible_devices", type=str, default=None,
+    p.add_argument("--cuda_visible_devices", type=str, default="",
                    help="If set, exports CUDA_VISIBLE_DEVICES before torch initializes CUDA.")
 
     return p.parse_args()
