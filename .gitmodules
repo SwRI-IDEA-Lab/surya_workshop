@@ -1,3 +1,6 @@
 [submodule "Surya"]
 	path = Surya
 	url = https://github.com/NASA-IMPACT/Surya.git
+[submodule "filament_surya"]
+	path = filament_surya
+	url = https://github.com/smith42/surya
