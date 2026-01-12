@@ -16,16 +16,6 @@ def fetch_nc_files(directory, start_year, start_month, end_year, end_month):
     if directory.startswith("s3://"):
         fs = s3fs.S3FileSystem()
         all_files = ['s3://' + f for f in fs.glob(os.path.join(directory, "**/*.nc"))]  # Get all nc files recursively
-        # Construct a more specific glob pattern to limit the search
-        # glob_pattern = os.path.join(
-        #     directory,
-        #     *[str(year) for year in range(start_year, end_year + 1)],
-        #     *[f"{month:02}" for month in range(start_month, end_month + 1)],
-        #     "*.nc",
-        # )
-        
-
-        # all_files = ['s3://' + f for f in fs.glob(glob_pattern)]  # Get all nc files recursively
     else:
         all_files = sorted(Path(directory).rglob("*.nc"))
 

@@ -1,0 +1,33 @@
+name: surya_ws
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - ipykernel
+  - ipywidgets
+  - jupyter_contrib_nbextensions
+  - wandb
+  - numba
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - scikit-learn
+  - scikit-image
+  - sunpy
+  - xarray
+  - dask
+  - bottleneck
+  - h5netcdf
+  - hdf5plugin
+  - opencv
+  - pip
+  - pip:
+    - torch
+    - torchvision
+    - lightning
+    - torchmetrics
+    - s3fs
+    - einops
+    - huggingface_hub

@@ -1,18 +1,19 @@
 import numpy as np
 import pandas as pd
-from Surya.surya.datasets.helio import HelioNetCDFDataset
+from typing import Literal, Optional
+from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
-class FlareDSDataset(HelioNetCDFDataset):
+class FlareDSDataset(HelioNetCDFDatasetAWS):
     """
-    Template child class of HelioNetCDFDataset to show an example of how to create a
+    Template child class of HelioNetCDFDatasetAWS to show an example of how to create a
     dataset for donwstream applications. It includes both the necessary parameters
     to initialize the parent class, as well as those of the child
 
-    HelioFM Parameters
+    Surya Parameters
     ------------------
     index_path : str
-        Path to HelioFM index
+        Path to Surya index
     time_delta_input_minutes : list[int]
         Input delta times to define the input stack in minutes from the present
     time_delta_target_minutes : int
@@ -33,15 +34,25 @@ class FlareDSDataset(HelioNetCDFDataset):
         Input channels to use, by default None
     phase : str, optional
         Descriptor of the phase used for this database, by default "train"
+    s3_use_simplecache : bool, optional
+        If True (default), use fsspec's simplecache to keep a local read-through
+        cache of objects.
+    s3_cache_dir : str, optional
+        Directory used by simplecache. Default: /tmp/helio_s3_cache
 
     Downstream (DS) Parameters
     --------------------------
+    return_surya_stack : bool, optional
+        If True (default), the dataset will return the full Surya stack
+        otherlwise only the flare intensity label is returned
+    max_number_of_samples : int | None, optional
+        If provided, limits the maximum number of samples in the dataset, by default None
     ds_flare_index_path : str, optional
         DS index.  In this example a flare dataset, by default None
     ds_time_column : str, optional
-        Name of the column to use as datestamp to compare with HelioFM's index, by default None
+        Name of the column to use as datestamp to compare with Surya's index, by default None
     ds_time_tolerance : str, optional
-        How much time difference is tolerated when finding matches between HelioFM and the DS, by default None
+        How much time difference is tolerated when finding matches between Surya and the DS, by default None
     ds_match_direction : str, optional
         Direction used to find matches using pd.merge_asof possible values are "forward", "backward",
         or "nearest".  For causal relationships is better to use "forward", by default "forward"
@@ -49,8 +60,9 @@ class FlareDSDataset(HelioNetCDFDataset):
     Raises
     ------
     ValueError
-        Error is raised if there is not overlap between the HelioFM and DS indices
+        Error is raised if there is not overlap between the Surya and DS indices
         given a tolerance
+
     """
 
     def __init__(
@@ -63,16 +75,23 @@ class FlareDSDataset(HelioNetCDFDataset):
         rollout_steps: int,
         scalers=None,
         num_mask_aia_channels=0,
-        drop_hmi_probablity=0,
+        drop_hmi_probability=0,
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
+        s3_use_simplecache: bool = True,
+        s3_cache_dir: str = "/tmp/helio_s3_cache",
         #### Put your donwnstream (DS) specific parameters below this line
-        ds_flare_index_path: str = None,
-        ds_time_column: str = None,
-        ds_time_tolerance: str = None,
-        ds_match_direction: str = "forward",
+        return_surya_stack: bool = True,
+        max_number_of_samples: int | None = None,
+        ds_flare_index_path: str | None = None,
+        ds_time_column: str | None = None,
+        ds_time_tolerance: str | None = None,
+        ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
     ):
+
+        if ds_match_direction not in ["forward", "backward", "nearest"]:
+            raise ValueError("ds_match_direction must be one of 'forward', 'backward', or 'nearest'")
 
         ## Initialize parent class
         super().__init__(
@@ -83,14 +102,22 @@ class FlareDSDataset(HelioNetCDFDataset):
             rollout_steps=rollout_steps,
             scalers=scalers,
             num_mask_aia_channels=num_mask_aia_channels,
-            drop_hmi_probablity=drop_hmi_probablity,
+            drop_hmi_probability=drop_hmi_probability,
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
             channels=channels,
             phase=phase,
+            s3_use_simplecache=s3_use_simplecache,
+            s3_cache_dir=s3_cache_dir,
         )
 
-        # Load ds index and find intersection with HelioFM index
-        self.ds_index = pd.read_csv(ds_flare_index_path)
+        self.return_surya_stack = return_surya_stack
+
+        # Load ds index and find intersection with Surya index
+        if ds_flare_index_path is not None:
+            self.ds_index = pd.read_csv(ds_flare_index_path)
+        else:
+            raise ValueError("ds_flare_index_path must be provided for FlareDSDataset")
+
         self.ds_index["ds_index"] = pd.to_datetime(
             self.ds_index[ds_time_column]
         ).values.astype("datetime64[ns]")
@@ -105,7 +132,7 @@ class FlareDSDataset(HelioNetCDFDataset):
             "normalized_intensity"
         ] / (2 * np.std(self.ds_index["normalized_intensity"]))
 
-        # Create HelioFM valid indices and find closest match to DS index
+        # Create Surya valid indices and find closest match to DS index
         self.df_valid_indices = pd.DataFrame(
             {"valid_indices": self.valid_indices}
         ).sort_values("valid_indices")
@@ -133,14 +160,17 @@ class FlareDSDataset(HelioNetCDFDataset):
                 :,
             ]
             if len(self.df_valid_indices) == 0:
-                raise ValueError("No intersection between HelioFM and DS indices")
+                raise ValueError("No intersection between Surya and DS indices")
 
-        # Override valid indices variables to reflect matches between HelioFM and DS
+        # Override valid indices variables to reflect matches between Surya and DS
         self.valid_indices = [
             pd.Timestamp(date) for date in self.df_valid_indices["valid_indices"]
         ]
         self.adjusted_length = len(self.valid_indices)
         self.df_valid_indices.set_index("valid_indices", inplace=True)
+
+        if max_number_of_samples is not None:
+            self.adjusted_length = min(self.adjusted_length, max_number_of_samples)
 
     def __len__(self):
         return self.adjusted_length
@@ -151,23 +181,28 @@ class FlareDSDataset(HelioNetCDFDataset):
             idx: Index of sample to load. (Pytorch standard.)
         Returns:
             Dictionary with following keys. The values are tensors with shape as follows:
-                # HelioFM keys--------------------------------
+                # Surya keys--------------------------------
                 ts (torch.Tensor):                C, T, H, W
                 time_delta_input (torch.Tensor):  T
                 input_latitude (torch.Tensor):    T
                 lead_time_delta (torch.Tensor):   L
                 forecast_latitude (torch.Tensor): L
-                # HelioFM keys--------------------------------
+                # Surya keys--------------------------------
                 forecast
             C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
         """
 
-        # This lines assembles the dictionary that HelioFM's dataset returns (defined above)
-        base_dictionary, metadata = super().__getitem__(idx=idx)
+        base_dictionary = {}
+        if self.return_surya_stack:
+            # This lines assembles the dictionary that Surya's dataset returns (defined above)
+            base_dictionary= super().__getitem__(idx=idx)
 
         # We now add the flare intensity label
         base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
             "normalized_intensity"
         ].astype(np.float32)
 
-        return base_dictionary, metadata
+        # And the timestamp of the auxiliary index
+        base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
+
+        return base_dictionary
