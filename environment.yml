@@ -1,4 +1,4 @@
-name: surya_ws
+name: surya_dhegde
 channels:
   - conda-forge
   - defaults
