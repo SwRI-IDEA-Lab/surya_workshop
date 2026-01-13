@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import xarray as xr
 from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
@@ -190,6 +191,41 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
     def __len__(self):
         return self.adjusted_length
 
+    def load_image(self, filepath: str) -> np.ndarray:
+        if self._is_s3_path(filepath):
+            import fsspec
+            if self.s3_use_simplecache:
+                cached_url = f"simplecache::{filepath}"
+                s3_options = {**self.s3_storage_options, **self.s3fs_kwargs}
+                opener = fsspec.open(
+                    cached_url,
+                    mode="rb",
+                    cache_storage=self.s3_cache_dir,
+                    s3=s3_options,
+                )
+            else:
+                fs = self._get_s3fs()
+                opener = fs.open(filepath, mode="rb")
+
+            with opener as f:
+                if filepath.endswith(".npy"):
+                    return np.load(f)
+                elif filepath.endswith((".fits", ".fits.gz")):
+                    from astropy.io import fits
+                    with fits.open(f) as hdul:
+                        return hdul[0].data.astype(np.float32)
+                with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
+                    return ds.to_array().load().to_numpy()
+        
+        if filepath.endswith(".npy"):
+            return np.load(filepath)
+        elif filepath.endswith((".fits", ".fits.gz")):
+            from astropy.io import fits
+            with fits.open(filepath) as hdul:
+                return hdul[0].data.astype(np.float32)
+        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
+            return ds.to_array().load().to_numpy()
+
     def __getitem__(self, idx: int) -> dict:
         """
         Args:
@@ -224,5 +260,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
 
         # And the timestamp of the auxiliary index
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
+
+        if "file_path" in self.df_valid_indices.columns:
+            base_dictionary["image"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
 
         return base_dictionary
