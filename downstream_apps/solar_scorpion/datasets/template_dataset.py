@@ -117,9 +117,14 @@ class SauronEyesDSDataset(HelioNetCDFDatasetAWS):
         else:
             raise ValueError("ds_sauroneyes_index_path must be provided for sauroneyesDSDataset")
 
+        # Convert date + time to datetime
         self.ds_index["ds_index"] = pd.to_datetime(
-            self.ds_index["date1"] + " " + self.ds_index["time1"]
+            self.ds_index["date"] + " " + self.ds_index["time"]
         )
+
+        # Ensure type is integer
+        self.ds_index["type"] = self.ds_index["type"].astype(int)
+
         self.ds_index.sort_values("ds_index", inplace=True)
 
         # Create Surya valid indices and find closest match to DS index
@@ -189,5 +194,7 @@ class SauronEyesDSDataset(HelioNetCDFDatasetAWS):
 
         # And the timestamp of the auxiliary index
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
+        
+        base_dictionary["label"] = int(self.df_valid_indices["type"].iloc[idx])
 
         return base_dictionary
