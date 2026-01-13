@@ -43,6 +43,7 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
+# working on this. Turn caiik to surya stacks
 class FlareLightningModule(L.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
@@ -93,6 +94,15 @@ class FlareLightningModule(L.LightningModule):
         self.batch_size = batch_size
         self.model = model
 
+        # create a conv layer converting input caiik to 13 channel ## 1-13-2026
+        self.caiik_to_surya_layer = torch.nn.Conv2d(
+            in_channels=1,
+            out_channels=13,
+            kernel_size=1,
+            stride=1,
+            padding=0
+        )
+
         # Loss callable: returns (loss_dict, weight_list)
         self.training_loss = metrics["train_loss"]
 
@@ -116,7 +126,14 @@ class FlareLightningModule(L.LightningModule):
         torch.Tensor
             Model predictions for the batch.
         """
-        return self.model(x)
+
+
+        # create syn surya stack from caiik stack  ## 1-13-2026
+        x = self.caiik_to_surya_layer(x['caiik'])
+
+        input_dict = {'ts': x}
+
+        return self.model(input_dict)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
@@ -198,7 +215,8 @@ class FlareLightningModule(L.LightningModule):
           a separate callable (e.g., metrics["val_loss"]).
         - No value is returned (Lightning uses logs for validation tracking).
         """
-        target = batch["forecast"].unsqueeze(1).float()
+        # target = batch["forecast"].unsqueeze(1).float()
+        target = batch["eve_13p5"].unsqueeze(1).float()
 
         output = self(batch)
         val_losses, val_loss_weights = self.training_loss(output, target)
