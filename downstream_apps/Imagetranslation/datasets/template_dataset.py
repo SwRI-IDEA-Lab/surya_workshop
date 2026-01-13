@@ -4,11 +4,11 @@ from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
-class FlareDSDataset(HelioNetCDFDatasetAWS):
+class Euv2MagDSDataset(HelioNetCDFDatasetAWS):
     """
-    Template child class of HelioNetCDFDatasetAWS to show an example of how to create a
-    dataset for donwstream applications. It includes both the necessary parameters
-    to initialize the parent class, as well as those of the child
+    Dataset for translating EUV AIA channels to HMI magnetogram targets. It includes only the necessary parameters
+    to initialize the parent class, but not the specific downstream (DS) parameters because this downstream application 
+    requires only the data from the Surya dataset itself.
 
     Surya Parameters
     ------------------

@@ -1,10 +1,13 @@
 from typing import Optional
+
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
-class EUVToMagnetogramDataset(HelioNetCDFDatasetAWS):
+class EUV2MAGDataset(HelioNetCDFDatasetAWS):
     """
-    Dataset for translating EUV AIA channels to HMI magnetogram targets.
+    Dataset for translating EUV AIA channels to HMI magnetogram targets. It includes only the necessary parameters
+    to initialize the parent class, but not the specific downstream (DS) parameters because this downstream application 
+    requires only the data from the Surya dataset itself.
 
     Surya Parameters
     ------------------
@@ -38,16 +41,25 @@ class EUVToMagnetogramDataset(HelioNetCDFDatasetAWS):
 
     Downstream (DS) Parameters
     --------------------------
-    input_channels : list[str]
+    return_surya_stack : bool, optional
+        If True (default), the dataset will return the full Surya stack
+        otherlwise only the flare intensity label is returned
+    input_channels : list[str] | None, optional
         AIA EUV input channels, e.g. ["aia304", "aia193", "aia171"].
-    target_channel : str
-        HMI magnetogram target channel, e.g. "hmi_m".
+    target_channels : list[str] | None, optional
+        HMI magnetogram target channels, e.g. ["hmi_m"] or ["hmi_bx", "hmi_by", "hmi_bz"].
+
+
+    Raises
+    ------
+    ValueError
+        Error is raised if there is not overlap between the Surya and DS indices
+        given a tolerance
 
     """
 
     def __init__(
         self,
-        #### All these lines are required by the parent HelioNetCDFDataset class
         index_path: str,
         time_delta_input_minutes: list[int],
         time_delta_target_minutes: int,
@@ -63,23 +75,9 @@ class EUVToMagnetogramDataset(HelioNetCDFDatasetAWS):
         s3_cache_dir: str = "/tmp/helio_s3_cache",
         #### Put your donwnstream (DS) specific parameters below this line
         input_channels: Optional[list[str]] = None,
-        target_channel: str = "hmi_m",
+        target_channels: Optional[list[str]] = None,
+        return_surya_stack: bool = True,
     ):
-        if input_channels is None:
-            input_channels = ["aia304", "aia193", "aia171"]
-        if target_channel in input_channels:
-            raise ValueError("target_channel must not be included in input_channels")
-
-        self.input_channels = input_channels
-        self.target_channel = target_channel
-        all_channels = input_channels + [target_channel]
-
-        if channels is not None:
-            missing = set(input_channels + [target_channel]) - set(channels)
-            if missing:
-                raise ValueError(f"channels must include input/target channels: {sorted(missing)}")
-
-        ## Initialize parent class
         super().__init__(
             index_path=index_path,
             time_delta_input_minutes=time_delta_input_minutes,
@@ -90,11 +88,18 @@ class EUVToMagnetogramDataset(HelioNetCDFDatasetAWS):
             num_mask_aia_channels=num_mask_aia_channels,
             drop_hmi_probability=drop_hmi_probability,
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
-            channels=all_channels if channels is None else channels,
+            channels=channels,
             phase=phase,
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
         )
+
+        self.input_channels = input_channels or ["aia304", "aia193", "aia171"]
+        self.target_channels = target_channels or ["hmi_m"]
+        self.return_surya_stack = return_surya_stack
+
+    def __len__(self):
+        return self.adjusted_length
 
     def __getitem__(self, idx: int) -> dict:
         """
@@ -103,20 +108,36 @@ class EUVToMagnetogramDataset(HelioNetCDFDatasetAWS):
         Returns:
             Dictionary with following keys. The values are tensors with shape as follows:
                 # Surya keys--------------------------------
-                ts (torch.Tensor):                C_in, T, H, W
+                ts (torch.Tensor):                C, T, H, W
                 time_delta_input (torch.Tensor):  T
+                input_latitude (torch.Tensor):    T
                 lead_time_delta (torch.Tensor):   L
+                forecast_latitude (torch.Tensor): L
                 # Surya keys--------------------------------
-                forecast (torch.Tensor):          C_out, L, H, W
-            C_in - Input channels, C_out - Output channels.
+                forecast
+            C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
         """
         base_dictionary = super().__getitem__(idx=idx)
 
-        channel_to_index = {name: i for i, name in enumerate(self.channels)}
-        input_indices = [channel_to_index[name] for name in self.input_channels]
-        target_index = channel_to_index[self.target_channel]
+        overlap = set(self.input_channels) & set(self.target_channels)
+        if overlap:
+            raise ValueError(f"target_channels must not overlap input_channels: {sorted(overlap)}")
 
-        base_dictionary["ts"] = base_dictionary["ts"][input_indices, ...]
-        base_dictionary["forecast"] = base_dictionary["forecast"][[target_index], ...]
+        channel_to_index = {name: i for i, name in enumerate(self.channels)}
+        missing = set(self.input_channels + self.target_channels) - set(channel_to_index.keys())
+        if missing:
+            raise ValueError(f"Missing channels in dataset: {sorted(missing)}")
+
+        input_indices = [channel_to_index[name] for name in self.input_channels]
+        target_indices = [channel_to_index[name] for name in self.target_channels]
+
+        ts = base_dictionary["ts"][input_indices, ...]
+        forecast = base_dictionary["forecast"][target_indices, ...]
+
+        if not self.return_surya_stack:
+            return {"forecast": forecast}
+
+        base_dictionary["ts"] = ts
+        base_dictionary["forecast"] = forecast
 
         return base_dictionary
