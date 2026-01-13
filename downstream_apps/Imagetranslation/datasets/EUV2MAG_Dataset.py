@@ -1,3 +1,4 @@
+import random
 from typing import Optional
 
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
@@ -44,6 +45,10 @@ class EUV2MAGDataset(HelioNetCDFDatasetAWS):
     return_surya_stack : bool, optional
         If True (default), the dataset will return the full Surya stack
         otherlwise only the flare intensity label is returned
+    max_number_of_samples : int | None, optional
+        If provided, randomly samples this many items from the dataset.
+    sampling_seed : int | None, optional
+        Random seed used for sampling when max_number_of_samples is set.
     input_channels : list[str] | None, optional
         AIA EUV input channels, e.g. ["aia304", "aia193", "aia171"].
     target_channels : list[str] | None, optional
@@ -77,6 +82,8 @@ class EUV2MAGDataset(HelioNetCDFDatasetAWS):
         input_channels: Optional[list[str]] = None,
         target_channels: Optional[list[str]] = None,
         return_surya_stack: bool = True,
+        max_number_of_samples: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
     ):
         super().__init__(
             index_path=index_path,
@@ -97,6 +104,17 @@ class EUV2MAGDataset(HelioNetCDFDatasetAWS):
         self.input_channels = input_channels or ["aia304", "aia193", "aia171"]
         self.target_channels = target_channels or ["hmi_m"]
         self.return_surya_stack = return_surya_stack
+        self.max_number_of_samples = max_number_of_samples
+        self.sampling_seed = sampling_seed
+
+        if self.max_number_of_samples is not None:
+            rng = random.Random(self.sampling_seed)
+            if self.max_number_of_samples < 1:
+                raise ValueError("max_number_of_samples must be >= 1")
+            if self.max_number_of_samples > len(self.valid_indices):
+                raise ValueError("max_number_of_samples exceeds available samples")
+            self.valid_indices = rng.sample(self.valid_indices, self.max_number_of_samples)
+            self.adjusted_length = len(self.valid_indices)
 
     def __len__(self):
         return self.adjusted_length
