@@ -64,6 +64,8 @@ class RibbonSegmentationMetrics:
         output_weights = []
 
         # Binary Cross Entropy Loss (common for segmentation)
+        # Convert target to float if it's not already (e.g., if it's uint8/Byte)
+        target = target.float()
         output_metrics["bce"] = torch.nn.functional.binary_cross_entropy_with_logits(preds, target)
         output_weights.append(1)
 
@@ -135,6 +137,8 @@ class RibbonSegmentationMetrics:
             preds = torch.sigmoid(preds)
 
         # Binary Cross Entropy Loss
+        # Convert target to float if it's not already (e.g., if it's uint8/Byte)
+        target = target.float()
         output_metrics["bce"] = torch.nn.functional.binary_cross_entropy(preds, target)
         output_weights.append(1)
 
