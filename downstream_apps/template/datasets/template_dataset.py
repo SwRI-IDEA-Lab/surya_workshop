@@ -195,7 +195,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         base_dictionary = {}
         if self.return_surya_stack:
             # This lines assembles the dictionary that Surya's dataset returns (defined above)
-            base_dictionary= super().__getitem__(idx=idx)
+            base_dictionary = super().__getitem__(idx=idx)
 
         # We now add the flare intensity label
         base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
