@@ -136,13 +136,15 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         # 1. Log Transformation: Compresses the dynamic range.
         #    Note: Ensure your data does not contain <= 0 values (common with fill values like -1).
         #    You might need: self.ds_index = self.ds_index[self.ds_index["eve_13_5"] > 0]
-        self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
+        # self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
 
-        # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
-        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
+        # # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
+        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
 
-        # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
-        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
+        # # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
+        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
+
+        self.ds_index["normalized_eve"] = self.ds_index["eve_13_5"] * 1000000
 
 
         # Create Surya valid indices and find closest match to DS index
