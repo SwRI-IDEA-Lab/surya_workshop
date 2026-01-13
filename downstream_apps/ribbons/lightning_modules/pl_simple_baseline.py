@@ -1,9 +1,9 @@
 """
 pl_simple_baseline.py
 
-A minimal PyTorch Lightning wrapper for training a flare prediction model.
+A minimal PyTorch Lightning wrapper for training a ribbon segmentation model.
 
-This module defines a single LightningModule (FlareLightningModule) that:
+This module defines a single LightningModule (RibbonLightningModule) that:
   - Calls a user-provided PyTorch model on batched inputs (batch["ts"])
   - Computes one or more training/validation losses via a user-provided loss function
   - Logs scalar losses and evaluation metrics using Lightning's built-in logging
@@ -15,8 +15,8 @@ Intended use:
   - Demonstrate how to log multiple losses/metrics consistently
 
 Key batch contract:
-  - batch["ts"]       : torch.Tensor input stack (e.g., [B, C, T, H, W])
-  - batch["forecast"] : torch.Tensor target values (e.g., [B] or [B,])
+  - batch["ts"]           : torch.Tensor input stack (e.g., [B, C, T, H, W])
+  - batch["ribbon_mask"]  : torch.Tensor target segmentation masks (e.g., [B, H, W] or [B, 1, H, W])
 
 Key metrics contract (the `metrics` dict passed to __init__):
   - metrics["train_loss"]    : callable(output, target) -> (loss_dict, weight_list)
@@ -43,9 +43,9 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class FlareLightningModule(pl.LightningModule):
+class RibbonLightningModule(pl.LightningModule):
     """
-    PyTorch LightningModule for flare prediction training.
+    PyTorch LightningModule for ribbon segmentation training.
 
     This class wraps:
       (1) a user-provided PyTorch model (nn.Module-like) and
@@ -55,7 +55,7 @@ class FlareLightningModule(pl.LightningModule):
     ----------
     model:
         A callable model (typically torch.nn.Module) that accepts the batch input tensor
-        `x = batch["ts"]` and returns predictions `output`.
+        `x = batch["ts"]` and returns segmentation predictions `output` of shape [B, 1, H, W].
 
     metrics:
         Dictionary containing the training loss function and metric functions.
@@ -126,7 +126,7 @@ class FlareLightningModule(pl.LightningModule):
         --------
         1) Extract inputs and targets from the batch:
               x = batch["ts"]
-              target = batch["forecast"]
+              target = batch["ribbon_mask"]
         2) Compute model output:
               output = self(x)
         3) Compute per-component losses and combine via provided weights:
@@ -138,8 +138,7 @@ class FlareLightningModule(pl.LightningModule):
 
         Notes
         -----
-        - Targets are reshaped to shape [B, 1] by unsqueeze(1) to match a common
-          "single output per sample" convention.
+        - Target masks are expected to be shape [B, H, W] or [B, 1, H, W].
         - The loss combination depends on dict iteration order; ensure loss dict
           insertion order is consistent if that matters.
 
@@ -149,9 +148,18 @@ class FlareLightningModule(pl.LightningModule):
             The scalar training loss used for backpropagation.
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["ribbon_mask"]
 
+        # Ensure target has the right shape [B, 1, H, W] if it comes as [B, H, W]
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
+
+        # Remove singleton channel dimension for model output if present
         output = self(x)
+        if output.shape[1] == 1:
+            output = output.squeeze(1)
+        if target.shape[1] == 1:
+            target = target.squeeze(1)
         training_losses, training_loss_weights = self.training_loss(output, target)
 
         # Combine losses according to their weights.
@@ -200,9 +208,18 @@ class FlareLightningModule(pl.LightningModule):
         - No value is returned (Lightning uses logs for validation tracking).
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["ribbon_mask"]
 
+        # Ensure target has the right shape [B, 1, H, W] if it comes as [B, H, W]
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
+
+        # Remove singleton channel dimension for model output if present
         output = self(x)
+        if output.shape[1] == 1:
+            output = output.squeeze(1)
+        if target.shape[1] == 1:
+            target = target.squeeze(1)
         val_losses, val_loss_weights = self.training_loss(output, target)
 
         # Combine losses according to their weights.
