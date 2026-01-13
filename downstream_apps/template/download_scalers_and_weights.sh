@@ -4,7 +4,6 @@ set -euo pipefail
 # ---- Config ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASSET_DIR="${SCRIPT_DIR}/assets"          # must exist
-TARGET_DIR="${ASSET_DIR}/surya_assets"    # download destination
 
 # Optional: token via env var
 HF_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}"
@@ -19,21 +18,21 @@ if [[ ! -d "${ASSET_DIR}" ]]; then
   exit 1
 fi
 
-mkdir -p "${TARGET_DIR}"
+mkdir -p "${ASSET_DIR}"
 
-echo "==> Downloading scalers and model weights into: ${TARGET_DIR}"
+echo "==> Downloading scalers and model weights into: ${ASSET_DIR}"
 
 if have hf; then
   # ---- Scalers ----
   hf download "nasa-ibm-ai4science/core-sdo" \
     --repo-type dataset \
-    --local-dir "${TARGET_DIR}" \
+    --local-dir "${ASSET_DIR}" \
     --include "scalers.yaml"
 
   # ---- Surya base model weights ----
   hf download "nasa-ibm-ai4science/Surya-1.0" \
     --repo-type model \
-    --local-dir "${TARGET_DIR}" \
+    --local-dir "${ASSET_DIR}" \
     --include "surya.366m.v1.pt"
 
 else
@@ -62,4 +61,4 @@ print("Download complete:", target_dir)
 PY
 fi
 
-echo "✓ Done. Files are in: ${TARGET_DIR}"
+echo "✓ Done. Files are in: ${ASSET_DIR}"
