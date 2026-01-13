@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-import pytorch_lightning as pl
+import lightning as L
 import torch
 
 
@@ -43,7 +43,7 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class FlareLightningModule(pl.LightningModule):
+class FlareLightningModule(L.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
 
