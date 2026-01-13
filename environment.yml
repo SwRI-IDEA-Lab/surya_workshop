@@ -34,3 +34,4 @@ dependencies:
     - huggingface_hub
     - datasets
     - hf_transfer
+    - timm
