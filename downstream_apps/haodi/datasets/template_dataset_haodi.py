@@ -137,15 +137,21 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         # 1. Log Transformation: Compresses the dynamic range.
         #    Note: Ensure your data does not contain <= 0 values (common with fill values like -1).
         #    You might need: self.ds_index = self.ds_index[self.ds_index["eve_13_5"] > 0]
-        # self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
+        self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
 
-        # # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
-        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
+        # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
+        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
 
-        # # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
-        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
+        # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
+        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
 
-        self.ds_index["normalized_eve"] = self.ds_index["eve_13_5"] * 1000000
+        # self.ds_index["normalized_eve"] = self.ds_index["eve_13_5"] * 1000000
+
+        # # Add nomalization for caiik images
+        # self.ds_index["file_path"] = self.ds_index["file_path"].astype(str)
+        # # It is a image with scale of 0 to 10000
+        # # Normalization to 0-1
+        # # self.ds_index["normalized_caiik"] = self.ds_index["caiik_image"] / 10000.0
 
 
         # Create Surya valid indices and find closest match to DS index
@@ -191,6 +197,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
     def __len__(self):
         return self.adjusted_length
 
+    # add the normaliztion for caiik images in this function
     def load_image(self, filepath: str) -> np.ndarray:
         if self._is_s3_path(filepath):
             import fsspec
@@ -213,7 +220,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
                 elif filepath.endswith((".fits", ".fits.gz")):
                     from astropy.io import fits
                     with fits.open(f) as hdul:
-                        return hdul[0].data.astype(np.float32)
+                        # return hdul[0].data.astype(np.float32)
+                        return (hdul[0].data.astype(np.float32) / 10000.0)[None, :, :]
                 with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
                     return ds.to_array().load().to_numpy()
         
@@ -222,7 +230,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         elif filepath.endswith((".fits", ".fits.gz")):
             from astropy.io import fits
             with fits.open(filepath) as hdul:
-                return hdul[0].data.astype(np.float32)
+                # return hdul[0].data.astype(np.float32)
+                return (hdul[0].data.astype(np.float32) / 10000.0)[None, :, :]
         with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
             return ds.to_array().load().to_numpy()
 
@@ -254,7 +263,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         # ].astype(np.float32)
 
         # Update the key to point to your normalized EVE column
-        base_dictionary["reconstruction"] = self.df_valid_indices.iloc[idx][
+        base_dictionary["eve_13p5"] = self.df_valid_indices.iloc[idx][
             "normalized_eve"
         ].astype(np.float32)
 
@@ -262,6 +271,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
 
         if "file_path" in self.df_valid_indices.columns:
-            base_dictionary["image"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
+            base_dictionary["caiik"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
 
         return base_dictionary
