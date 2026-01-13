@@ -33,3 +33,4 @@ dependencies:
     - einops
     - huggingface_hub
     - datasets
+    - hf_transfer
