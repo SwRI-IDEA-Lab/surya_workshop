@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Literal, Optional
 from pathlib import Path
+from PIL import Image
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
@@ -204,10 +205,17 @@ class RibbonDSDataset(HelioNetCDFDatasetAWS):
         ribbon_mask_full_path = self.ds_data_root / ribbon_mask_relative_path
         base_dictionary["ribbon_mask_path"] = str(ribbon_mask_full_path)
 
+        # Load the ribbon mask as a numpy array
+        ribbon_mask_image = Image.open(ribbon_mask_full_path)
+        ribbon_mask_array = np.array(ribbon_mask_image)
+        # Normalize from {0, 255} to {0, 1} as integers
+        ribbon_mask_array = (ribbon_mask_array / 255).astype(np.uint8)
+        base_dictionary["ribbon_mask"] = ribbon_mask_array
+
         # Add additional metadata that might be useful
         base_dictionary["ds_index"] = row["ds_index"].isoformat()
-        base_dictionary["flare_class"] = row["Flaredir"]
-        base_dictionary["goes_peak_time"] = row["GOES_peak"]
+        #base_dictionary["flare_class"] = row["Flaredir"]
+        #base_dictionary["goes_peak_time"] = row["GOES_peak"]
 
         return base_dictionary
 
