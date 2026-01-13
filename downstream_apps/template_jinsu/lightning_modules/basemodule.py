@@ -5,14 +5,10 @@ import pytorch_lightning as pl
 class BaseModule(pl.LightningModule):
     def __init__(
         self,
-        lr: float,
-        weight_decay: float,
         scheduler_dict: dict,
         optimizer_dict: dict,
     ):
         super().__init__()
-        self.lr = lr
-        self.weight_decay = weight_decay
         self.scheduler_dict = scheduler_dict
         self.optimizer_dict = optimizer_dict
 
@@ -23,11 +19,15 @@ class BaseModule(pl.LightningModule):
         match self.optimizer_dict.optimizer_type:
             case "adam":
                 optimizer = torch.optim.Adam(
-                    self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                    self.parameters(),
+                    lr=self.optimizer_dict.lr,
+                    weight_decay=self.optimizer_dict.weight_decay,
                 )
             case "adamw":
                 optimizer = torch.optim.AdamW(
-                    self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                    self.parameters(),
+                    lr=self.optimizer_dict.lr,
+                    weight_decay=self.optimizer_dict.weight_decay,
                 )
 
         match self.scheduler_dict.scheduler_type:

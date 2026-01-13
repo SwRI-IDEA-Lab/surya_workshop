@@ -53,20 +53,20 @@ class simple_baseline(nn.Module):
     def __init__(
         self,
         in_channels: int = 52,
-        hidden_channels: list[int, int] = [52, 26, 1],
+        hidden_channels: list[int] = [52, 26, 1],
         dropout: float = 0.5,
     ):
         super(simple_baseline, self).__init__()
         self.model = MLP(
             in_channels=in_channels,
             hidden_channels=hidden_channels,
-            activation_layer=nn.ReLu(),
-            layer_norm=nn.BatchNorm1d(),
+            activation_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm1d,
             dropout=dropout,
         )
 
     def forward(self, x):
-        return self.model(nn.sigmoid(x))
+        return self.model(torch.sigmoid(x))
 
 
 class FlareBaseLine(BaseModule):
@@ -115,7 +115,7 @@ class FlareBaseLine(BaseModule):
         batch_size: int = 1,
         eval_threshold: float = 0.5,
         in_channels: int = 52,
-        hidden_channels: list[int, int] = [52, 26, 1],
+        hidden_channels: list[int] = [52, 26, 1],
         dropout: float = 0.5,
         # model: torch.nn.Module,
         # metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
@@ -161,10 +161,10 @@ class FlareBaseLine(BaseModule):
             Model predictions for the batch.
         """
         x_mean = x.mean(dim=[2, 3, 4])
-        x_min = x.min(dim=[2, 3, 4])
-        x_max = x.max(dim=[2, 3, 4])
+        x_min = torch.amin(x, dim=[2, 3, 4])
+        x_max = torch.amax(x, dim=[2, 3, 4])
         x_std = x.std(dim=[2, 3, 4])
-        x_feature = torch.cat([x_mean, x_min.values, x_max.values, x_std], dim=1)
+        x_feature = torch.cat([x_mean, x_min, x_max, x_std], dim=1)
         x_feature = x_feature.view(x_feature.shape[0], -1)  # [batch, 52]
 
         return self.model(x_feature)
@@ -209,8 +209,8 @@ class FlareBaseLine(BaseModule):
         # flatten tensor [batch, 13, 4] --> [batch, 52]
         # feed [batch, 52] into baseline model!
 
-        output = self.forward(x)
-        loss = torch.nn.BCEWithLogitsLoss(output, target)
+        output = self(x)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # Log aggregate loss and component losses.
         self.log(
@@ -247,7 +247,7 @@ class FlareBaseLine(BaseModule):
         target = batch["label"].unsqueeze(1).float()
 
         output = self(x)
-        loss = torch.nn.BCEWithLogitsLoss(output, target)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # evalation metic updates
         self.evaluation_metric.update(torch.sigmoid(output), target)
