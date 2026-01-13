@@ -213,7 +213,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
                 elif filepath.endswith((".fits", ".fits.gz")):
                     from astropy.io import fits
                     with fits.open(f) as hdul:
-                        return hdul[0].data.astype(np.float32)
+                        return (hdul[0].data.astype(np.float32) / 10000.0)[None, :, :]
                 with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
                     return ds.to_array().load().to_numpy()
         
@@ -222,7 +222,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         elif filepath.endswith((".fits", ".fits.gz")):
             from astropy.io import fits
             with fits.open(filepath) as hdul:
-                return hdul[0].data.astype(np.float32)
+                return (hdul[0].data.astype(np.float32) / 10000.0)[None, :, :]
         with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
             return ds.to_array().load().to_numpy()
 
@@ -262,6 +262,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
 
         if "file_path" in self.df_valid_indices.columns:
-            base_dictionary["image"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
+            base_dictionary["caiik"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
 
         return base_dictionary
