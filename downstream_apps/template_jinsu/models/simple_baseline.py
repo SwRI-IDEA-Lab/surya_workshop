@@ -1,10 +1,31 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
+from torchvision.ops import MLP
 
 """
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
+
+
+class ClsFlareBaseLine(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 52,
+        hidden_channels: list[int] = [52, 26, 1],
+        dropout: float = 0.5,
+    ):
+        super(ClsFlareBaseLine, self).__init__()
+        self.model = MLP(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            activation_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm1d,
+            dropout=dropout,
+        )
+
+    def forward(self, x):
+        return self.model(torch.sigmoid(x))
 
 
 class RegressionFlareModel(nn.Module):
@@ -50,7 +71,7 @@ class RegressionFlareModel(nn.Module):
                 )
 
         # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
-        x = x.abs().mean(dim=[3,4])
+        x = x.abs().mean(dim=[3, 4])
 
         # Rearange in preparation for linear layer
         x = rearrange(x, "b c t -> b (c t)")

@@ -36,37 +36,16 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from torchvision.ops import MLP
 from Surya.downstream_examples.solar_flare_forcasting.metrics import (
     DistributedClassificationMetrics as DCM,
 )
-
+from downstream_apps.template_jinsu.models.simple_baseline import ClsFlareBaseLine
 from .basemodule import BaseModule
 
 # Type aliases for clarity in documentation / teaching.
 LossDict = Mapping[str, torch.Tensor]
 MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
-
-
-class simple_baseline(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 52,
-        hidden_channels: list[int] = [52, 26, 1],
-        dropout: float = 0.5,
-    ):
-        super(simple_baseline, self).__init__()
-        self.model = MLP(
-            in_channels=in_channels,
-            hidden_channels=hidden_channels,
-            activation_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm1d,
-            dropout=dropout,
-        )
-
-    def forward(self, x):
-        return self.model(torch.sigmoid(x))
 
 
 class FlareBaseLine(BaseModule):
@@ -128,7 +107,7 @@ class FlareBaseLine(BaseModule):
         self.evaluation_metric = DCM(threshold=0.5)
         self.save_hyperparameters()
 
-        self.model = simple_baseline(
+        self.model = ClsFlareBaseLine(
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             dropout=dropout,
