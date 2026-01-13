@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
 
-class FlareDSDataset(HelioNetCDFDatasetAWS):
+class SauronEyesDSDataset(HelioNetCDFDatasetAWS):
     """
     Template child class of HelioNetCDFDatasetAWS to show an example of how to create a
     dataset for donwstream applications. It includes both the necessary parameters
@@ -47,8 +47,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         otherlwise only the flare intensity label is returned
     max_number_of_samples : int | None, optional
         If provided, limits the maximum number of samples in the dataset, by default None
-    ds_flare_index_path : str, optional
-        DS index.  In this example a flare dataset, by default None
+    ds_sauroneyes_index_path : str, optional
+        DS index.  In this example a sauroneyes dataset, by default None
     ds_time_column : str, optional
         Name of the column to use as datestamp to compare with Surya's index, by default None
     ds_time_tolerance : str, optional
@@ -84,8 +84,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         #### Put your donwnstream (DS) specific parameters below this line
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
-        ds_flare_index_path: str | None = None,
-        ds_time_column: str | None = None,
+        ds_sauroneyes_index_path: str | None = None,
         ds_time_tolerance: str | None = None,
         ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
     ):
@@ -113,24 +112,15 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         self.return_surya_stack = return_surya_stack
 
         # Load ds index and find intersection with Surya index
-        if ds_flare_index_path is not None:
-            self.ds_index = pd.read_csv(ds_flare_index_path)
+        if ds_sauroneyes_index_path is not None:
+            self.ds_index = pd.read_csv(ds_sauroneyes_index_path)
         else:
-            raise ValueError("ds_flare_index_path must be provided for FlareDSDataset")
+            raise ValueError("ds_sauroneyes_index_path must be provided for sauroneyesDSDataset")
 
         self.ds_index["ds_index"] = pd.to_datetime(
-            self.ds_index[ds_time_column]
-        ).values.astype("datetime64[ns]")
+            self.ds_index["date1"] + " " + self.ds_index["time1"]
+        )
         self.ds_index.sort_values("ds_index", inplace=True)
-
-        # Implement normalization.  This is going to be DS application specific, no two will look the same
-        self.ds_index["normalized_intensity"] = np.log10(self.ds_index["intensity"])
-        self.ds_index["normalized_intensity"] = self.ds_index[
-            "normalized_intensity"
-        ] - np.min(self.ds_index["normalized_intensity"])
-        self.ds_index["normalized_intensity"] = self.ds_index[
-            "normalized_intensity"
-        ] / (2 * np.std(self.ds_index["normalized_intensity"]))
 
         # Create Surya valid indices and find closest match to DS index
         self.df_valid_indices = pd.DataFrame(
@@ -196,11 +186,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         if self.return_surya_stack:
             # This lines assembles the dictionary that Surya's dataset returns (defined above)
             base_dictionary= super().__getitem__(idx=idx)
-
-        # We now add the flare intensity label
-        base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
-            "normalized_intensity"
-        ].astype(np.float32)
 
         # And the timestamp of the auxiliary index
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
