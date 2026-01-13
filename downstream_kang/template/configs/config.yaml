@@ -1,5 +1,5 @@
 # job_id: large_scale
-job_id: AR-segmentation_lora_r32_a64_d0.1
+job_id: flare_forecasting
 data:
   # Use this to point at the paths of HelioFM data indices
   sdo_data_root_path: /nobackupnfs1/sroy14/processed_data/Helio/nc
@@ -14,9 +14,9 @@ data:
   prefetch_factor: 2
   scalers_path: ./assets/scalers.yaml
   #### Put your donwnstream (DS) specific parameters below this line
-  ar_index_train: ["./assets/surya-bench-ar-segmentation/train.csv"]
-  ar_index_valid: ["./assets/surya-bench-ar-segmentation/validation.csv"]
-  ar_index_test: ["./assets/surya-bench-ar-segmentation/test.csv"]
+  flare_index_train: ["./assets/surya-bench-flare-forecasting/train.csv"]
+  flare_index_valid: ["./assets/surya-bench-flare-forecasting/validation.csv"]
+  flare_index_test: ["./assets/surya-bench-flare-forecasting/test.csv"]
 model:
   model_type: spectformer_lora # Options: unet, spectformer_lora,
   # Spectformer options
@@ -58,10 +58,10 @@ model:
 
   # metrics for AR segmentation
   select: "bce"
-  dice:
-    smooth: 1e-5
-  iou:
-    eps: 1e-6
+  # dice:
+  #   smooth: 1e-5
+  # iou:
+  #   eps: 1e-6
   bce:
     pos_weight: 1
 
