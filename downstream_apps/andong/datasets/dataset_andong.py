@@ -131,6 +131,14 @@ class DstDataset(HelioNetCDFDatasetAWS):
             dst_history = raw_history[0, :].astype(np.float32)
         else:
             dst_history = raw_history.astype(np.float32)
+
+        # --- NEW: NORMALIZE TARGET ---
+        # Dst usually ranges from +50 to -400. 
+        # Dividing by 100.0 puts it in a range of roughly [0.5, -4.0], which is much easier for the model.
+        dst_target = dst_target / 100.0 
+        
+        # Apply the same scaling to the history input if you use it!
+        dst_history = dst_history / 100.0
             
         base_dictionary["dst_history"] = dst_history
         base_dictionary["dst_target"] = dst_target
