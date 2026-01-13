@@ -27,7 +27,7 @@ class RibbonSegmentationMetrics:
         # Cache torchmetrics instances once (instead of recreating each call)
         # For binary segmentation
         self._iou = tm.JaccardIndex(task="binary", threshold=threshold)
-        self._dice = tm.Dice(num_classes=2)  # Binary segmentation: background + foreground
+
         self._precision = tm.Precision(task="binary", threshold=threshold)
         self._recall = tm.Recall(task="binary", threshold=threshold)
         self._f1 = tm.F1Score(task="binary", threshold=threshold)
@@ -36,7 +36,6 @@ class RibbonSegmentationMetrics:
         # Move metric modules to the same device as preds, but only when needed
         if self._iou.device != preds.device:
             self._iou = self._iou.to(preds.device)
-            self._dice = self._dice.to(preds.device)
             self._precision = self._precision.to(preds.device)
             self._recall = self._recall.to(preds.device)
             self._f1 = self._f1.to(preds.device)        
@@ -141,10 +140,6 @@ class RibbonSegmentationMetrics:
 
         # IoU (Intersection over Union) - most common segmentation metric
         output_metrics["iou"] = self._iou(preds, target.int())
-        output_weights.append(1)
-
-        # Dice coefficient - similar to IoU, ranges from 0 to 1
-        output_metrics["dice"] = self._dice(preds, target.int())
         output_weights.append(1)
 
         # Precision - ratio of true positives to predicted positives
