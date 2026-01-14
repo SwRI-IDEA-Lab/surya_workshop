@@ -162,7 +162,7 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=28,
+        num_workers=8,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -171,7 +171,7 @@ def main() -> None:
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=28,
+        num_workers=8,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -288,6 +288,7 @@ def main() -> None:
         logger=loggers,
         callbacks=[ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1)],
         log_every_n_steps=2,
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(lit_model, train_loader, val_loader)

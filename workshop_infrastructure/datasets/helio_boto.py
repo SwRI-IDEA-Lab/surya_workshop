@@ -269,16 +269,16 @@ class HelioNetCDFDataset(Dataset):
         sdo_data_root_path: str | None = None,
         # --- S3 options (used only if index contains s3:// URIs) ---
         s3_storage_options: dict | None = None,
-        s3_use_simplecache: bool = True,
+        s3_use_simplecache: bool = False,
         s3_cache_dir: str = "/tmp/helio_s3_cache",
         s3fs_kwargs: dict | None = None,
         # --- Ephemeral download-to-local-then-open (recommended for NetCDF/HDF5 on S3) ---
         # If True, S3 objects are downloaded to a temporary local file, opened locally
         # with xarray/h5netcdf, and deleted immediately after loading into memory.
         s3_download_to_temp: bool = True,
-        s3_temp_dir: str | None = None,
+        s3_temp_dir: str | None = "/tmp/helio_s3_cache",
         # boto3 transfer tuning (used only when boto3 is available; otherwise falls back to s3fs/fsspec)
-        s3_boto3_max_concurrency: int = 32,
+        s3_boto3_max_concurrency: int = 2,
         s3_boto3_part_size_mb: int = 64,
     ):
         self.scalers = scalers
@@ -539,64 +539,66 @@ class HelioNetCDFDataset(Dataset):
         if self._s3fs is None:
             self._s3fs = s3fs.S3FileSystem(**self.s3fs_kwargs, **self.s3_storage_options)
 
-def _parse_s3_uri(self, s3_uri: str) -> tuple[str, str]:
-    """Parse s3://bucket/key into (bucket, key)."""
-    if not s3_uri.startswith("s3://"):
-        raise ValueError(f"Not an S3 URI: {s3_uri}")
-    path = s3_uri[5:]
-    bucket, key = path.split("/", 1)
-    return bucket, key
+        return self._s3fs
 
-def _download_s3_to_path(self, s3_uri: str, local_path: str) -> None:
-    """Download an S3 object to `local_path`.
+    def _parse_s3_uri(self, s3_uri: str) -> tuple[str, str]:
+        """Parse s3://bucket/key into (bucket, key)."""
+        if not s3_uri.startswith("s3://"):
+            raise ValueError(f"Not an S3 URI: {s3_uri}")
+        path = s3_uri[5:]
+        bucket, key = path.split("/", 1)
+        return bucket, key
 
-    Uses boto3's transfer manager when available (faster, parallel multipart),
-    otherwise falls back to streaming via s3fs.
-    """
-    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    def _download_s3_to_path(self, s3_uri: str, local_path: str) -> None:
+        """Download an S3 object to `local_path`.
 
-    # Prefer boto3 for high-throughput whole-object downloads (esp. public buckets).
-    if boto3 is not None and TransferConfig is not None:
-        anon = bool(self.s3_storage_options.get("anon") or self.s3fs_kwargs.get("anon"))
-        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        Uses boto3's transfer manager when available (faster, parallel multipart),
+        otherwise falls back to streaming via s3fs.
+        """
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
 
-        if anon:
-            client = boto3.client(
-                "s3",
-                region_name=region,
-                config=BotoConfig(
-                    signature_version=UNSIGNED,
-                    max_pool_connections=max(32, int(self.s3_boto3_max_concurrency) * 2),
-                    retries={"max_attempts": 10, "mode": "adaptive"},
-                ),
+        # Prefer boto3 for high-throughput whole-object downloads (esp. public buckets).
+        if boto3 is not None and TransferConfig is not None:
+            anon = bool(self.s3_storage_options.get("anon") or self.s3fs_kwargs.get("anon"))
+            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+            if anon:
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=BotoConfig(
+                        signature_version=UNSIGNED,
+                        max_pool_connections=max(32, int(self.s3_boto3_max_concurrency) * 2),
+                        retries={"max_attempts": 10, "mode": "adaptive"},
+                    ),
+                )
+            else:
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=BotoConfig(
+                        max_pool_connections=max(32, int(self.s3_boto3_max_concurrency) * 2),
+                        retries={"max_attempts": 10, "mode": "adaptive"},
+                    ),
+                )
+
+            tcfg = TransferConfig(
+                multipart_threshold=int(self.s3_boto3_part_size_mb) * 1024 * 1024,
+                multipart_chunksize=int(self.s3_boto3_part_size_mb) * 1024 * 1024,
+                max_concurrency=int(self.s3_boto3_max_concurrency),
+                use_threads=True,
+                io_chunksize=1024 * 1024,
             )
-        else:
-            client = boto3.client(
-                "s3",
-                region_name=region,
-                config=BotoConfig(
-                    max_pool_connections=max(32, int(self.s3_boto3_max_concurrency) * 2),
-                    retries={"max_attempts": 10, "mode": "adaptive"},
-                ),
-            )
 
-        tcfg = TransferConfig(
-            multipart_threshold=int(self.s3_boto3_part_size_mb) * 1024 * 1024,
-            multipart_chunksize=int(self.s3_boto3_part_size_mb) * 1024 * 1024,
-            max_concurrency=int(self.s3_boto3_max_concurrency),
-            use_threads=True,
-            io_chunksize=1024 * 1024,
-        )
+            bucket, key = self._parse_s3_uri(s3_uri)
+            client.download_file(bucket, key, local_path, Config=tcfg)
+            return
 
-        bucket, key = self._parse_s3_uri(s3_uri)
-        client.download_file(bucket, key, local_path, Config=tcfg)
-        return
-
-    # Fallback: use s3fs to stream the object to disk.
-    fs = self._get_s3fs()
-    with fs.open(s3_uri, "rb") as src, open(local_path, "wb") as dst:
-        for chunk in iter(lambda: src.read(8 * 1024 * 1024), b""):
-            dst.write(chunk)
+        # Fallback: use s3fs to stream the object to disk.
+        fs = self._get_s3fs()
+        with fs.open(s3_uri, "rb") as src, open(local_path, "wb") as dst:
+            for chunk in iter(lambda: src.read(8 * 1024 * 1024), b""):
+                dst.write(chunk)
 
     def load_nc_data(self, filepath: str, timestep: pd.Timestamp, channels: list[str]) -> np.ndarray:
         """
@@ -719,7 +721,7 @@ def _download_s3_to_path(self, s3_uri: str, local_path: str) -> None:
         sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
 
         return means, stds, epsilons, sl_scale_factors
-
+    
     def transform_data(self, data: np.ndarray) -> np.ndarray:
         """
         Applies scalers.
@@ -741,7 +743,7 @@ def _download_s3_to_path(self, s3_uri: str, local_path: str) -> None:
 
         means, stds, epsilons, sl_scale_factors = self.transformation_inputs()
         result_np = transform(data, means, stds, sl_scale_factors, epsilons)
-        return result_np
+        return result_np    
 
     def inverse_transform_data(self, data: np.ndarray) -> np.ndarray:
         """
