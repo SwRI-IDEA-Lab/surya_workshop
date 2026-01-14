@@ -34,6 +34,21 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 
+# Determine the absolute path to the script's directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Determine the absolute path to the main project root
+# (assuming template_tune_spectformer.py is in downstream_apps/your_downstream/)
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+# Construct absolute paths to Surya and hfmds directories
+SURYA_DIR = os.path.join(PROJECT_ROOT, "Surya")
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if SURYA_DIR not in sys.path:
+    sys.path.insert(0, SURYA_DIR)
+
 def load_yaml(path: Union[str, Path]) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -82,7 +97,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="./configs/config.yaml")
     parser.add_argument("--max-epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size under DDP.")
-    parser.add_argument("--devices", type=str, default="auto", help='e.g. "auto", "1", "2", "0,1"')
+    parser.add_argument("--devices", type=str, default="0", help='e.g. "auto", "1", "2", "0,1"')
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
@@ -125,7 +140,7 @@ def main() -> None:
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
-        ds_flare_index_path="./data/hek_flare_catalog.csv",
+        ds_flare_index_path=config["data"]["flare_index_path"],
         ds_time_column="start_time",
         ds_time_tolerance="4d",
         ds_match_direction="forward",
@@ -146,7 +161,7 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=28,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -155,7 +170,7 @@ def main() -> None:
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=28,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -165,7 +180,7 @@ def main() -> None:
     # Model + PEFT (as in notebook)
     # ---------------------------------------------------------------------
     from workshop_infrastructure.utils import apply_peft_lora
-    from downstream_apps.template.models.finetune_models import HelioSpectformer1D
+    from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
     from downstream_apps.template.metrics.template_metrics import FlareMetrics
     from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 

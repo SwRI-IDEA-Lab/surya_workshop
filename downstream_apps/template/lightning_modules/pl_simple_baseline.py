@@ -165,15 +165,15 @@ class FlareLightningModule(L.LightningModule):
             raise ValueError("training_loss returned an empty loss dict; cannot compute scalar loss.")
 
         # Log aggregate loss and component losses.
-        self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size)
+        self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
         for key in training_losses.keys():
-            self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size)
+            self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
         # Log evaluation metrics (optional).
         training_evaluation_metrics, training_evaluation_weights = self.training_evaluation(output, target)
         if len(training_evaluation_weights) > 0:
             for key in training_evaluation_metrics.keys():
-                self.log(f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
+                self.log(f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
         return loss
 
@@ -213,15 +213,15 @@ class FlareLightningModule(L.LightningModule):
             raise ValueError("training_loss returned an empty loss dict; cannot compute scalar val loss.")
 
         # Log aggregate loss and component losses.
-        self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size)
+        self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
         for key in val_losses.keys():
-            self.log(f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size)
+            self.log(f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
         # Log evaluation metrics (optional).
         val_evaluation_metrics, val_evaluation_weights = self.validation_evaluation(output, target)
         if len(val_evaluation_weights) > 0:
             for key in val_evaluation_metrics.keys():
-                self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
+                self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
