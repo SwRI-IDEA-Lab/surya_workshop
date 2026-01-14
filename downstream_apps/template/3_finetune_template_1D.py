@@ -98,7 +98,8 @@ def main() -> None:
     parser.add_argument("--max-epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size under DDP.")
     parser.add_argument("--devices", type=str, default="0", help='e.g. "auto", "1", "2", "0,1"')
-    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true")    
+    parser.add_argument("--train_baseline", action="store_true")
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("medium")
@@ -179,58 +180,69 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Model + PEFT (as in notebook)
     # ---------------------------------------------------------------------
-    from workshop_infrastructure.utils import apply_peft_lora
-    from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
     from downstream_apps.template.metrics.template_metrics import FlareMetrics
     from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 
-    model = HelioSpectformer1D(
-        img_size=config["model"]["img_size"],
-        patch_size=config["model"]["patch_size"],
-        in_chans=config["model"]["in_channels"],
-        embed_dim=config["model"]["embed_dim"],
-        time_embedding=config["model"]["time_embedding"],
-        depth=config["model"]["depth"],
-        num_heads=config["model"]["num_heads"],
-        mlp_ratio=config["model"]["mlp_ratio"],
-        drop_rate=config["model"]["drop_rate"],
-        dtype=config["dtype"],
-        window_size=config["model"]["window_size"],
-        dp_rank=config["model"]["dp_rank"],
-        learned_flow=config["model"]["learned_flow"],
-        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
-        init_weights=config["model"]["init_weights"],
-        checkpoint_layers=config["model"]["checkpoint_layers"],
-        n_spectral_blocks=config["model"]["spectral_blocks"],
-        rpe=config["model"]["rpe"],
-        ensemble=config["model"]["ensemble"],
-        finetune=config["model"]["finetune"],
-        nglo=config["model"]["nglo"],
-        # Finetuning additions
-        dropout=config["model"]["dropout"],
-        num_penultimate_transformer_layers=0,
-        num_penultimate_heads=0,
-        num_outputs=1,
-        config=config,
-    )
+    if args.train_baseline:
+        from downstream_apps.template.models.simple_baseline import RegressionFlareModel
+        n_input_timestamps = config["model"]["time_embedding"]["time_dim"]
+        n_channels = len(config["data"]["channels"])
 
-    # Optional: apply LoRA via config (mirrors notebook intent)
-    if config.get("use_lora", False):
-        model = apply_peft_lora(model, config)
+        model = RegressionFlareModel(n_input_timestamps*n_channels, config["data"]["channels"], scalers)        
 
-    # Load pretrained weights if provided
-    pretrained_path = config.get("pretrained_path")
-    if pretrained_path:
-        print(f"Loading pretrained model from {pretrained_path}.")
-        model_state = model.state_dict()
-        checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
-        filtered_checkpoint_state = {
-            k: v
-            for k, v in checkpoint_state.items()
-            if k in model_state and hasattr(v, "shape") and v.shape == model_state[k].shape
-        }
-        model_state.update(filtered_checkpoint_state)
-        model.load_state_dict(model_state, strict=True)
+    else:
+
+        from workshop_infrastructure.utils import apply_peft_lora
+        from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
+
+        model = HelioSpectformer1D(
+            img_size=config["model"]["img_size"],
+            patch_size=config["model"]["patch_size"],
+            in_chans=config["model"]["in_channels"],
+            embed_dim=config["model"]["embed_dim"],
+            time_embedding=config["model"]["time_embedding"],
+            depth=config["model"]["depth"],
+            num_heads=config["model"]["num_heads"],
+            mlp_ratio=config["model"]["mlp_ratio"],
+            drop_rate=config["model"]["drop_rate"],
+            dtype=config["dtype"],
+            window_size=config["model"]["window_size"],
+            dp_rank=config["model"]["dp_rank"],
+            learned_flow=config["model"]["learned_flow"],
+            use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
+            init_weights=config["model"]["init_weights"],
+            checkpoint_layers=config["model"]["checkpoint_layers"],
+            n_spectral_blocks=config["model"]["spectral_blocks"],
+            rpe=config["model"]["rpe"],
+            ensemble=config["model"]["ensemble"],
+            finetune=config["model"]["finetune"],
+            nglo=config["model"]["nglo"],
+            # Finetuning additions
+            dropout=config["model"]["dropout"],
+            num_penultimate_transformer_layers=0,
+            num_penultimate_heads=0,
+            num_outputs=1,
+            config=config,
+        )
+
+        # Load pretrained weights if provided
+        pretrained_path = config.get("pretrained_path")
+        if pretrained_path:
+            print(f"Loading pretrained model from {pretrained_path}.")
+            model_state = model.state_dict()
+            checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
+            filtered_checkpoint_state = {
+                k: v
+                for k, v in checkpoint_state.items()
+                if k in model_state and hasattr(v, "shape") and v.shape == model_state[k].shape
+            }
+            model_state.update(filtered_checkpoint_state)
+            model.load_state_dict(model_state, strict=True)
+
+        # Optional: apply LoRA via config (mirrors notebook intent)
+        if config.get("use_lora", False):
+            model = apply_peft_lora(model, config)
+
 
     # Metrics + LightningModule
     metrics = {
