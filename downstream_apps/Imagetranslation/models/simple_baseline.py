@@ -6,6 +6,20 @@ from einops import rearrange
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
 
+class EUV2MagBaselineModel(nn.Module):
+    def __init__(self, input_dim):
+        """
+        Initializes the EUV2MagBaselineModel.
+
+        Args:
+            input_dim (int): The size of the input vector after channel and time dimensions are flattened.
+        """
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+
+
+
 
 class RegressionFlareModel(nn.Module):
     def __init__(self, input_dim, channel_order, scalers):
