@@ -80,7 +80,7 @@ class FlareForecastingDataset(HelioNetCDFDatasetAWS):
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
-        s3_use_simplecache: bool = True,
+        s3_use_simplecache: bool = False,
         # s3_cache_dir: str = "/tmp/helio_s3_cache",
         s3_cache_dir: str = None,
 
@@ -93,10 +93,6 @@ class FlareForecastingDataset(HelioNetCDFDatasetAWS):
         ds_match_direction: Literal["forward",
                                     "backward", "nearest"] = "forward",
     ):
-        if s3_cache_dir is None:
-            user = os.getenv('USER', 'default')
-            s3_cache_dir = f"/tmp/helio_s3_cache_{user}"
-            os.makedirs(s3_cache_dir, exist_ok=True)
 
         if ds_match_direction not in ["forward", "backward", "nearest"]:
             raise ValueError(
