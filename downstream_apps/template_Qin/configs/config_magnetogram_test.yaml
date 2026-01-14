@@ -1,0 +1,82 @@
+job_id: magnetogram_rt_test
+data:
+  sdo_data_root_path: /nobackupnfs1/sroy14/processed_data/Helio/nc
+  train_data_path: ../../data/indices/surya_aws_s3_train.csv
+  valid_data_path: ../../data/indices/surya_aws_s3_val.csv
+  channels: ['aia94', 'aia131', 'aia171', 'aia193', 'aia211', 'aia304', 'aia335', 'aia1600', 'hmi_m', 'hmi_bx', 'hmi_by', 'hmi_bz', 'hmi_v']
+  time_delta_input_minutes: [0]
+  time_delta_target_minutes: +60
+  n_input_timestamps: 1
+  batch_size: 1
+  num_data_workers: 4
+  prefetch_factor: 2
+  pooling: 1
+  random_vert_flip: false
+  scalers_path: ./assets/scalers.yaml
+  # Magnetogram testing specific
+  return_stokes: false  # Set to true if you have observed Stokes profiles
+  stokes_data_path: null  # Path to Stokes profile data directory
+
+# ME PINN parameters for HMI line
+me_pinn:
+  lambda_rest: 6173.15  # HMI Fe I line wavelength (Angstroms)
+  geff: 2.5  # Effective Landé factor for HMI line
+  wavelength_range: [-0.5, 0.5]  # Wavelength range around line center (Angstroms)
+  n_wavelengths: 50  # Number of wavelength points
+
+# Testing parameters
+testing:
+  n_samples: 10  # Number of samples to test
+  output_dir: ./magnetogram_rt_test_results
+  save_visualizations: true
+  save_stokes: true
+
+model:
+  model_type: spectformer
+  img_size: 4096
+  patch_size: 16
+  in_channels: 13
+  time_embedding:
+    type: linear
+    n_queries: null
+    time_dim: 1
+  embed_dim: 1280
+  depth: 10
+  spectral_blocks: 2
+  num_heads: 16
+  mlp_ratio: 4.0
+  rpe: false
+  drop_rate: 0.0
+  window_size: 2
+  dp_rank: 4
+  learned_flow: false
+  epochs_to_learn_flow: 0
+  init_weights: false
+  checkpoint_layers: [0,1,2,3,4,5,6,7,8,9]
+  ensemble: null
+  finetune: true
+  nglo: 1
+  global_average_pooling: False
+  global_max_pooling: False
+  attention_pooling: False
+  transformer_pooling: False
+  global_class_token: True
+  penultimate_linear_layer: True
+  freeze_backbone: false
+  dropout: 0.2
+  use_lora: true
+  lora_config:
+    r: 8
+    lora_alpha: 8
+    target_modules: ['q_proj', 'v_proj', 'k_proj', 'out_proj', 'fc1', 'fc2']
+    lora_dropout: 0.1
+    bias: 'none'
+
+use_latitude_in_learned_flow: false
+pretrained_path: ./assets/surya.366m.v1.pt
+loss_weights: []
+rollout_steps: 0
+num_mask_aia_channels: 0
+drop_hmi_probability: 0.0
+validate_after_epoch: 1
+dtype: float32
