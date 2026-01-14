@@ -30,6 +30,7 @@ dependencies:
     - peft
     - torchmetrics
     - s3fs
+    - boto3               # <--- ADDED
     - einops
     - huggingface_hub
     - datasets
