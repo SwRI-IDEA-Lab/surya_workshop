@@ -169,6 +169,7 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
         self.ds_index["bbox_ll_y_pixel"] = self.ds_index["bbox_ll_y_pixel"] + shift_y
         self.ds_index["bbox_ur_y_pixel"] = self.ds_index["bbox_ur_y_pixel"] + shift_y
 
+
         # Implement normalization.  This is going to be DS application specific, no two will look the same
         #self.ds_index["normalized_intensity"] = np.log10(self.ds_index["intensity"])
         #self.ds_index["normalized_intensity"] = self.ds_index[
@@ -256,11 +257,10 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
 
         # And the timestamp of the auxiliary index
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
-
+        base_dictionary["jet"] = int(self.df_valid_indices["jet"].iloc[idx])
         # Add bounding box coordinates
         #base_dictionary["bbox_ll_x_arcsec"] = self.df_valid_indices["bbox_ll_x_arcsec"].iloc[idx]
         #base_dictionary["bbox_ur_x_arcsec"] = self.df_valid_indices["bbox_ur_x_arcsec"].iloc[idx]
         #base_dictionary["bbox_ll_y_arcsec"] = self.df_valid_indices["bbox_ll_y_arcsec"].iloc[idx]
         #base_dictionary["bbox_ur_y_arcsec"] = self.df_valid_indices["bbox_ur_y_arcsec"].iloc[idx]
-        print("Reloaded!5")
         return base_dictionary
