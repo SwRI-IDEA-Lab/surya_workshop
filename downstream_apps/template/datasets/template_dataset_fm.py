@@ -3,6 +3,7 @@ import pandas as pd
 from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 from astropy.io import fits
+from datetime import datetime
 
 
 class FlareDSDataset(HelioNetCDFDatasetAWS):
@@ -124,18 +125,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         ).values.astype("datetime64[ns]")
         self.ds_index.sort_values("ds_index", inplace=True)
         
-        # ---- Load filament mask (once) ----
-        mask_fits_path = "/shared/huggingface_data/filaments/AIA171_masked_20110825_010000.fits"
 
-        with fits.open(mask_fits_path) as hdul:
-            mask = hdul[0].data
-
-        # Ensure mask is float32 and binary
-        #self.mask = (mask > 0).astype(np.float32)
-        self.mask = np.flipud((mask > 0).astype(np.float32))
-
-        # Optional sanity check
-        assert self.mask.ndim == 2, "Mask must be 2D (H, W)"
 
         
         self.ds_time_column = ds_time_column
@@ -177,41 +167,32 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
                 forecast
             C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
         """
-
         base_dictionary = {}
         if self.return_surya_stack:
             # This lines assembles the dictionary that Surya's dataset returns (defined above)
             base_dictionary= super().__getitem__(idx=idx)
-            
-            # Apply spatial mask to Surya images
-        # ts shape: (C, T, H, W)
-            ts = base_dictionary["ts"]
+        
+        # ---- Load filament mask (once) ----
+        fits_time = self.ds_index.iloc[idx][self.ds_time_column]
+        fits_time = datetime.strptime(fits_time, "%Y-%m-%d %H:%M:%S")
+        mask_fits_path = f"/shared/huggingface_data/filaments/AIA171_masked_{fits_time.strftime('%Y%m%d_%H')}00*.fits"
 
-        # Broadcast mask → (1, 1, H, W)
-            ts = ts * self.mask[None, None, :, :]
-            base_dictionary["ts"] = ts
-            
-            
+        with fits.open(mask_fits_path) as hdul:
+            mask = np.array(hdul[0].data)
 
-        # We now add the flare intensity label
-       # base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
-      #      "normalized_intensity"
-      #  ].astype(np.float32)
-      
-        row = self.ds_index.iloc[idx]
+        # Ensure mask is float32 and binary
+        self.mask = np.flipud((mask > 0).astype(np.float32)).copy()
 
-    # 
-       # base_dictionary["forecast"] = np.float32(row["present"])
-        #base_dictionary["ds_index"] = row[self.ds_time_column].isoformat()
-
-        # And the timestamp of the auxiliary index
-       # base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
-       
+        # Optional sanity check
+        assert self.mask.ndim == 2, "Mask must be 2D (H, W)"
+        
+        base_dictionary["mask"] = self.mask
+        base_dictionary["ds_index"] = self.ds_index.iloc[idx][self.ds_time_column]
+        print(self.ds_index.iloc[idx][self.ds_time_column])
         
         
-        
-        base_dictionary["ds_index"] = self.ds_index.iloc[idx][self.ds_time_column]#.isoformat()
-        
-        print(base_dictionary["ds_index"])
-        print(type(base_dictionary["ds_index"]))
+        #print(base_dictionary["ds_index"])
+        #print(type(base_dictionary["ds_index"]))
+        print(self.mask.shape)
+        print(base_dictionary)
         return base_dictionary
