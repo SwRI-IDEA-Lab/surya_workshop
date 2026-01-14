@@ -58,3 +58,8 @@ File /opt/anaconda3/envs/surya_ws/lib/python3.12/site-packages/lightning/pytorch
 ---> 77 return _VF.broadcast_tensors(tensors)
 
 RuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 2
+
+Solved
+
+
+FileNotFoundError: [Errno 2] No such file or directory: '/shared/huggingface_data/caiik/20130719.1650.HW.K.P.rdc.fits.gz'
