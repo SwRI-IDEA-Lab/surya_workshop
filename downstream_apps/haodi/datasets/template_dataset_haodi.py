@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import xarray as xr
+import torch
 from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 
@@ -217,6 +218,10 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
             with opener as f:
                 if filepath.endswith(".npy"):
                     return np.load(f)
+                    img = np.load(f)
+                    if img.ndim == 2:
+                        img = img[None, :, :]
+                    return img
                 elif filepath.endswith((".fits", ".fits.gz")):
                     from astropy.io import fits
                     with fits.open(f) as hdul:
@@ -227,6 +232,10 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         
         if filepath.endswith(".npy"):
             return np.load(filepath)
+            img = np.load(filepath)
+            if img.ndim == 2:
+                img = img[None, :, :]
+            return img
         elif filepath.endswith((".fits", ".fits.gz")):
             from astropy.io import fits
             with fits.open(filepath) as hdul:
@@ -272,5 +281,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
 
         if "file_path" in self.df_valid_indices.columns:
             base_dictionary["caiik"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
+            base_dictionary["caiik"] = torch.as_tensor(self.load_image(self.df_valid_indices.iloc[idx]["file_path"]))
 
         return base_dictionary

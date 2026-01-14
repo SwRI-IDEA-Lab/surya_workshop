@@ -36,7 +36,7 @@ model:
   drop_rate: 0.0
   window_size: 2
   dp_rank: 4
-  learned_flow: false # change from false to true, 5:20 pm 1/13/2026 -> did not work for 
+  learned_flow: false
   epochs_to_learn_flow: 0 # Start by training flow model only before freezing
   init_weights: false
   checkpoint_layers: [0,1,2,3,4,5,6,7,8,9]

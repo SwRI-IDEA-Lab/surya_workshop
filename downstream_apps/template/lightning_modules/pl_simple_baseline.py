@@ -42,7 +42,6 @@ LossDict = Mapping[str, torch.Tensor]
 MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
-
 class FlareLightningModule(L.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
@@ -116,6 +115,7 @@ class FlareLightningModule(L.LightningModule):
         torch.Tensor
             Model predictions for the batch.
         """
+
         return self.model(x)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:

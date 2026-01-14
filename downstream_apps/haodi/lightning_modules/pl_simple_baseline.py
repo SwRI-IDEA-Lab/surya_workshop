@@ -126,12 +126,49 @@ class FlareLightningModule(L.LightningModule):
         torch.Tensor
             Model predictions for the batch.
         """
+        
+        # # 1. Create synthetic surya stack from caiik stack
+        # # x['caiik'] shape: (Batch, 1, Height, Width)
+        # # surya_stack shape: (Batch, Channels, Height, Width)
+        # surya_stack = self.caiik_to_surya_layer(x['caiik'])
 
+        # # 2. Add the missing Time dimension (T=1) at index 2
+        # # New shape: (Batch, Channels, 1, Height, Width)
+        # surya_stack = surya_stack.unsqueeze(2)
 
-        # create syn surya stack from caiik stack  ## 1-13-2026
-        x = self.caiik_to_surya_layer(x['caiik'])
+        caiik = x["caiik"]  # could be (1,H,W) or (B,1,H,W) or (B,H,W)
 
-        input_dict = {'ts': x}
+        if caiik.ndim == 2:                # (H,W)
+            caiik = caiik.unsqueeze(0).unsqueeze(0)   # (1,1,H,W)
+        elif caiik.ndim == 3:
+            if caiik.shape[0] == 1 and caiik.shape[1] == 4096:
+                # likely (C,H,W) with C=1
+                caiik = caiik.unsqueeze(0)            # (1,1,H,W)
+            else:
+                # likely (B,H,W)
+                caiik = caiik.unsqueeze(1)            # (B,1,H,W)
+
+        surya_stack = self.caiik_to_surya_layer(caiik)  # (B,13,H,W)
+        surya_stack = surya_stack.unsqueeze(2)          # (B,13,1,H,W)
+
+        td = x["time_delta_input"]
+        # if td is (B,) make it (B,1)
+        if td.ndim == 1:
+            td = td.unsqueeze(1)
+        # if td is (B,T) but you are forcing T=1, slice it
+        if td.ndim >= 2 and td.shape[1] != 1:
+            td = td[:, :1].contiguous()
+
+        input_dict = {"ts": surya_stack, "time_delta_input": td}
+
+        # # 3. Construct the input dictionary for the backbone model.
+        # input_dict = {
+        #     'ts': surya_stack,
+        #     'time_delta_input': x['time_delta_input']
+        # }
+
+        print("ts to surya:", surya_stack.shape, "numel:", surya_stack.numel())
+        print("H,W:", surya_stack.shape[-2], surya_stack.shape[-1])
 
         return self.model(input_dict)
 
@@ -165,7 +202,7 @@ class FlareLightningModule(L.LightningModule):
         torch.Tensor
             The scalar training loss used for backpropagation.
         """
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["eve_13p5"].unsqueeze(1).float()
 
         output = self(batch)
         training_losses, training_loss_weights = self.training_loss(output, target)
@@ -215,7 +252,6 @@ class FlareLightningModule(L.LightningModule):
           a separate callable (e.g., metrics["val_loss"]).
         - No value is returned (Lightning uses logs for validation tracking).
         """
-        # target = batch["forecast"].unsqueeze(1).float()
         target = batch["eve_13p5"].unsqueeze(1).float()
 
         output = self(batch)
