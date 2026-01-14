@@ -49,6 +49,7 @@
               "--devices", "0,1",
               "--batch-size", "2",
               "--max-epochs", "2",
+            //   "--train_baseline"
             ]
         }              
     ]
