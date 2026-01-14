@@ -25,7 +25,7 @@ class ClsFlareBaseLine(nn.Module):
         )
 
     def forward(self, x):
-        return self.model(torch.sigmoid(x))
+        return self.model(x)
 
 
 class RegressionFlareModel(nn.Module):

@@ -94,7 +94,7 @@ class FlareBaseLine(BaseModule):
         batch_size: int = 1,
         eval_threshold: float = 0.5,
         in_channels: int = 52,
-        hidden_channels: list[int] = [52, 26, 1],
+        hidden_channels: list[int] | None = None,
         dropout: float = 0.5,
         # model: torch.nn.Module,
         # metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
@@ -102,10 +102,11 @@ class FlareBaseLine(BaseModule):
         # batch_size: Optional[int] = None,
     ):
         super().__init__(optimizer_dict=optimizer_dict, scheduler_dict=scheduler_dict)
+        self.save_hyperparameters()
+
         self.batch_size = batch_size
         self.eval_threshold = eval_threshold
         self.evaluation_metric = DCM(threshold=0.5)
-        self.save_hyperparameters()
 
         self.model = ClsFlareBaseLine(
             in_channels=in_channels,
@@ -143,8 +144,10 @@ class FlareBaseLine(BaseModule):
         x_min = torch.amin(x, dim=[2, 3, 4])
         x_max = torch.amax(x, dim=[2, 3, 4])
         x_std = x.std(dim=[2, 3, 4])
-        x_feature = torch.cat([x_mean, x_min, x_max, x_std], dim=1)
-        x_feature = x_feature.view(x_feature.shape[0], -1)  # [batch, 52]
+        x_feature = torch.cat(
+            [x_mean, x_min, x_max, x_std], dim=1
+        )  # [batch, channel, 4]
+        x_feature = x_feature.flatten(start_dim=1)  # [batch, 52]
 
         return self.model(x_feature)
 
@@ -229,7 +232,8 @@ class FlareBaseLine(BaseModule):
         loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # evalation metic updates
-        self.evaluation_metric.update(torch.sigmoid(output), target)
+        sigmoid = nn.Sigmoid()
+        self.evaluation_metric.update(sigmoid(output), target)
 
         # Log aggregate loss and component losses.
         self.log(
@@ -244,11 +248,11 @@ class FlareBaseLine(BaseModule):
 
         classifier_result = self.evaluation_metric.compute_and_reset()
 
-        for key in self.evaluation_metric.keys():
+        for key in classifier_result.keys():
             self.log(
                 f"valid/{key}",
                 classifier_result[key],
-                prog_bar=True,
+                prog_bar=False,
                 on_epoch=True,
                 sync_dist=True,
             )
