@@ -44,7 +44,7 @@ model:
   checkpoint_layers: [0,1,2,3,4,5,6,7,8,9]
   ensemble: null
   finetune: true
-  nglo: 0 # change from 1 to 0 for my case.
+  nglo: 1
   global_average_pooling: False
   global_max_pooling: False
   attention_pooling: False

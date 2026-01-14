@@ -63,3 +63,5 @@ Solved
 
 
 FileNotFoundError: [Errno 2] No such file or directory: '/shared/huggingface_data/caiik/20130719.1650.HW.K.P.rdc.fits.gz'
+
+# data samples after 20130429 are missing, 25 files.
