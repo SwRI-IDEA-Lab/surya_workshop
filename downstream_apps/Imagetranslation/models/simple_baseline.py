@@ -93,7 +93,14 @@ class Conv2DImageTranslationModel(nn.Module):
         """
         x = x.clone()
         b, c, t, h, w = x.shape
-        x = x.reshape(b, c * t, h, w)
+        #x = x.reshape(b, c * t, h, w)
 
-        return self.conv(x)
+        # Rearange in preparation for linear layer
+        x = rearrange(x, "b c t h w -> b (c t) h w")
+
+        x = self.conv(x)
+
+        x = rearrange(x, "b c h w -> b c 1 h w")
+
+        return x
 

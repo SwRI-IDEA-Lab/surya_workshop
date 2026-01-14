@@ -56,7 +56,7 @@ class HelioNetCDFDatasetAWS(HelioNetCDFDataset):
         *args,
         s3_storage_options: Optional[dict] = None,
         s3_use_simplecache: bool = False, #True,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str = "./tmp/helio_s3_cache",
         s3fs_kwargs: Optional[dict] = None,
         **kwargs,
     ):
