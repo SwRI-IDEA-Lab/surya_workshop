@@ -1,7 +1,9 @@
+import s3fs
 import h5py
 import numpy as np
 import pandas as pd
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
+# Ensure you import HelioNetCDFDatasetAWS from your module
 
 class DstDataset(HelioNetCDFDatasetAWS):
     def __init__(
@@ -18,18 +20,19 @@ class DstDataset(HelioNetCDFDatasetAWS):
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
-        s3_use_simplecache: bool = True,
+        s3_use_simplecache: bool = False,
         s3_cache_dir: str = "/tmp/helio_s3_cache",
         # --- Dst Specific Args ---
         dst_hdf5_path: str | None = None,
         delay_days: int = 1,
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
-        # --- NEW: Event Selection ---
-        storm_threshold: float | None = None,  # e.g., -50.0
+        # --- Event Selection ---
+        storm_threshold: float | None = None,
     ):
         
-        # 1. Initialize Parent
+        # 1. Initialize Parent with anon=True
+        # We explicitly tell the parent class to use anonymous mode
         super().__init__(
             index_path=index_path,
             time_delta_input_minutes=time_delta_input_minutes,
@@ -44,6 +47,11 @@ class DstDataset(HelioNetCDFDatasetAWS):
             phase=phase,
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
+            
+            # CRITICAL: Tell the parent to use anonymous access!
+            # storage_options={"anon": True} 
+            # Use "s3fs_kwargs" instead:
+            s3fs_kwargs={"anon": True}
         )
 
         self.return_surya_stack = return_surya_stack
@@ -54,14 +62,30 @@ class DstDataset(HelioNetCDFDatasetAWS):
         # 2. Load Dst Data
         print(f"Loading Dst data from {dst_hdf5_path}...")
         try:
-            with h5py.File(dst_hdf5_path, 'r') as f:
-                gong_time_data = np.array(f['Time'])
+            # Handle S3 vs Local Dst file
+            if dst_hdf5_path.startswith("s3://"):
+                # Use anon=True here too
+                if not hasattr(self, 'fs') or self.fs is None:
+                    self.fs = s3fs.S3FileSystem(anon=True, client_kwargs={'region_name': 'us-west-2'})
                 
-                pred_key = f'Dst_pred{delay_days}'
-                per_key = f'Dst_per{delay_days}'
+                # Open S3 file
+                f_obj = self.fs.open(dst_hdf5_path, 'rb') 
                 
-                self.dst_history_data = np.array(f[pred_key])
-                self.dst_target_data = np.array(f[per_key])
+                # Read data
+                with h5py.File(f_obj, 'r') as f:
+                    gong_time_data = np.array(f['Time'])
+                    pred_key = f'Dst_pred{delay_days}'
+                    per_key = f'Dst_per{delay_days}'
+                    self.dst_history_data = np.array(f[pred_key])
+                    self.dst_target_data = np.array(f[per_key])
+            else:
+                # Local File
+                with h5py.File(dst_hdf5_path, 'r') as f:
+                    gong_time_data = np.array(f['Time'])
+                    pred_key = f'Dst_pred{delay_days}'
+                    per_key = f'Dst_per{delay_days}'
+                    self.dst_history_data = np.array(f[pred_key])
+                    self.dst_target_data = np.array(f[per_key])
 
         except Exception as e:
             raise RuntimeError(f"Failed to load Dst HDF5 file: {e}")
@@ -71,28 +95,25 @@ class DstDataset(HelioNetCDFDatasetAWS):
                                                 columns=['Year', 'Month', 'Day', 'Hour', 'Minute']))
         self.dst_lookup = pd.Series(index=dst_times, data=np.arange(len(dst_times)))
 
-        # 4. Filter Valid Indices (Intersection)
+        # 4. Filter Valid Indices
         valid_timestamps_set = set(self.valid_indices)
         dst_timestamps_set = set(dst_times)
         common_timestamps = sorted(list(valid_timestamps_set.intersection(dst_timestamps_set)))
         
-        # --- 5. EVENT SELECTION LOGIC ---
+        # 5. Event Selection Logic
         if storm_threshold is not None:
             print(f"Applying storm filter: Dst <= {storm_threshold} nT ...")
             storm_indices = []
             
             for ts in common_timestamps:
-                # Get the Dst target vector for this timestamp
                 hdf5_idx = self.dst_lookup.loc[ts]
                 target_vector = self.dst_target_data[hdf5_idx]
                 
-                # Handle [Variables, Time] vs [Time] shape
                 if target_vector.ndim == 2:
-                    dst_vals = target_vector[0, :] # Assume Dst is index 0
+                    dst_vals = target_vector[0, :]
                 else:
                     dst_vals = target_vector
                 
-                # Check if ANY point in the future window is a storm
                 if np.min(dst_vals) <= storm_threshold:
                     storm_indices.append(ts)
             
@@ -112,13 +133,18 @@ class DstDataset(HelioNetCDFDatasetAWS):
 
     def __getitem__(self, idx: int) -> dict:
         base_dictionary = {}
+        
+        # 1. Get Image Stack from Parent
+        # The parent (HelioNetCDFDatasetAWS) will use anon=True (from __init__)
+        # and the correct path (from the CSV index).
         if self.return_surya_stack:
             base_dictionary = super().__getitem__(idx=idx)
 
+        # 2. Get Dst Data
         sample_timestamp = self.valid_indices[idx]
         hdf5_idx = self.dst_lookup.loc[sample_timestamp]
 
-        # Extract Target (Force 1D Dst)
+        # Extract Target
         raw_target = self.dst_target_data[hdf5_idx]
         if raw_target.ndim == 2:
             dst_target = raw_target[0, :].astype(np.float32)
@@ -132,12 +158,8 @@ class DstDataset(HelioNetCDFDatasetAWS):
         else:
             dst_history = raw_history.astype(np.float32)
 
-        # --- NEW: NORMALIZE TARGET ---
-        # Dst usually ranges from +50 to -400. 
-        # Dividing by 100.0 puts it in a range of roughly [0.5, -4.0], which is much easier for the model.
+        # Normalize (Dst / 100.0)
         dst_target = dst_target / 100.0 
-        
-        # Apply the same scaling to the history input if you use it!
         dst_history = dst_history / 100.0
             
         base_dictionary["dst_history"] = dst_history
