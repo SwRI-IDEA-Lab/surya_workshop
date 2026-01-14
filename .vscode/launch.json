@@ -37,7 +37,7 @@
             ]
         },
         {
-            "name": "Run baseline script",
+            "name": "Finetune script",
             "type": "debugpy",
             "request": "launch",
             "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
@@ -45,12 +45,10 @@
             "cwd":"${workspaceFolder}",
             "justMyCode": false,
             "args": [
-              "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config.yaml",
-              "--ds_flare_index_path", "./data/hek_flare_catalog.csv",
-              "--batch_size", "2",
-              "--max_epochs", "2",
-              "--cuda_visible_devices", "0",
-              "--use_wandb"
+              "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml",
+              "--devices", "0,1",
+              "--batch-size", "2",
+              "--max-epochs", "2",
             ]
         }              
     ]
