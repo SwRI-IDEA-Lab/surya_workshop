@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 
 
@@ -147,7 +147,6 @@ class RibbonLightningModule(pl.LightningModule):
         torch.Tensor
             The scalar training loss used for backpropagation.
         """
-        x = batch["ts"]
         target = batch["ribbon_mask"]
 
         # Ensure target has the right shape [B, 1, H, W] if it comes as [B, H, W]
@@ -155,7 +154,7 @@ class RibbonLightningModule(pl.LightningModule):
             target = target.unsqueeze(1)
 
         # Remove singleton channel dimension for model output if present
-        output = self(x)
+        output = self(batch)
         if output.shape[1] == 1:
             output = output.squeeze(1)
         if target.shape[1] == 1:
@@ -207,7 +206,6 @@ class RibbonLightningModule(pl.LightningModule):
           a separate callable (e.g., metrics["val_loss"]).
         - No value is returned (Lightning uses logs for validation tracking).
         """
-        x = batch["ts"]
         target = batch["ribbon_mask"]
 
         # Ensure target has the right shape [B, 1, H, W] if it comes as [B, H, W]
@@ -215,7 +213,7 @@ class RibbonLightningModule(pl.LightningModule):
             target = target.unsqueeze(1)
 
         # Remove singleton channel dimension for model output if present
-        output = self(x)
+        output = self(batch)
         if output.shape[1] == 1:
             output = output.squeeze(1)
         if target.shape[1] == 1:
