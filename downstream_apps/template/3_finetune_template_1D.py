@@ -136,7 +136,7 @@ def main() -> None:
         drop_hmi_probability=config["drop_hmi_probability"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
-        s3_use_simplecache=True,
+        s3_use_simplecache=False,
         s3_cache_dir="/tmp/helio_s3_cache",
         # Downstream-specific
         return_surya_stack=True,
