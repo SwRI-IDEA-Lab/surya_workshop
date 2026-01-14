@@ -132,14 +132,14 @@ class RibbonSegmentationMetrics:
 
         self._ensure_device(preds)
 
-        # Apply sigmoid to convert logits to probabilities if needed
-        if preds.min() < 0 or preds.max() > 1:
-            preds = torch.sigmoid(preds)
-
-        # Binary Cross Entropy Loss
+        # Binary Cross Entropy Loss (using logits version for autocast compatibility)
         # Convert target to float if it's not already (e.g., if it's uint8/Byte)
         target = target.float()
-        output_metrics["bce"] = torch.nn.functional.binary_cross_entropy(preds, target)
+        output_metrics["bce"] = torch.nn.functional.binary_cross_entropy_with_logits(preds, target)
+
+        # Apply sigmoid to convert logits to probabilities for other metrics
+        if preds.min() < 0 or preds.max() > 1:
+            preds = torch.sigmoid(preds)
         output_weights.append(1)
 
         # IoU (Intersection over Union) - most common segmentation metric
