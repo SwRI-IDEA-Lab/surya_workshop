@@ -29,17 +29,6 @@ class FlareMetrics:
         if self._rrse.device != preds.device:
             self._rrse = self._rrse.to(preds.device)        
 
-    #added forRuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
-    def _reduce_preds(self, preds: torch.Tensor) -> torch.Tensor:
-        # Convert to (B,1) if model returns sequences
-        if preds.ndim == 3:
-            preds = preds.mean(dim=1)  # (B,L,D)->(B,D)
-        if preds.ndim == 2 and preds.shape[1] != 1:
-            preds = preds.mean(dim=1, keepdim=True)  # (B,L)->(B,1)
-        elif preds.ndim == 1:
-            preds = preds.unsqueeze(1)
-        return preds
-
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
@@ -57,8 +46,6 @@ class FlareMetrics:
                                         corresponding torch.Tensor values.
                 - list[float]: List of weights for each calculated metric.
         """
-        #added forRuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
-        preds = self._reduce_preds(preds)
 
         output_metrics = {}
         output_weights = []
@@ -87,9 +74,6 @@ class FlareMetrics:
                                         Keys are metric names, and values are the corresponding torch.Tensor values.
                 - list[float]: List of weights for each calculated metric.
         """
-        #added forRuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
-        preds = self._reduce_preds(preds)
-
         output_metrics = {}
         output_weights = []
 
@@ -117,8 +101,6 @@ class FlareMetrics:
                                         corresponding torch.Tensor values.
                 - list[float]: List of weights for each calculated metric.
         """
-        #added forRuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
-        preds = self._reduce_preds(preds)
 
         output_metrics = {}
         output_weights = []

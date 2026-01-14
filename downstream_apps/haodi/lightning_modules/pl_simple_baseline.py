@@ -161,16 +161,41 @@ class FlareLightningModule(L.LightningModule):
 
         input_dict = {"ts": surya_stack, "time_delta_input": td}
 
-        # # 3. Construct the input dictionary for the backbone model.
-        # input_dict = {
-        #     'ts': surya_stack,
-        #     'time_delta_input': x['time_delta_input']
-        # }
+        output = self.model(input_dict)
 
-        print("ts to surya:", surya_stack.shape, "numel:", surya_stack.numel())
-        print("H,W:", surya_stack.shape[-2], surya_stack.shape[-1])
+        # before RuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
+        # # Aggregation: If model returns a sequence (B, L, 1) or (B, L), reduce to (B, 1)  
+        # if output.ndim == 3:
+        #     output = output.mean(dim=1)
+        # elif output.ndim == 2 and output.shape[1] > 1:
+        #     output = output.mean(dim=1, keepdim=True)
 
-        return self.model(input_dict)
+        # after:
+        # If the backbone returns a dict, pick the main prediction tensor, 8pm, 1/13/2026
+        if isinstance(output, dict):
+            # common keys; adjust if your model uses a different one
+            for k in ["pred", "prediction", "forecast", "y_hat", "output", "logits"]:
+                if k in output and torch.is_tensor(output[k]):
+                    output = output[k]
+                    break
+            else:
+                # fallback: first tensor value in dict
+                for v in output.values():
+                    if torch.is_tensor(v):
+                        output = v
+                        break
+
+        # Now enforce a scalar prediction per sample: (B, 1)
+        if output.ndim == 3:
+            # (B, L, D) -> average over L, keep D
+            output = output.mean(dim=1)
+        if output.ndim == 2 and output.shape[1] != 1:
+            # (B, L) -> average L, keep (B,1)
+            output = output.mean(dim=1, keepdim=True)
+        elif output.ndim == 1:
+            output = output.unsqueeze(1)
+
+        return output
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """

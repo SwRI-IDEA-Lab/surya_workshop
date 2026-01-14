@@ -3,3 +3,58 @@
     257     y_hat_flow = self.learned_flow_model(batch)  # B, C, H, W
 
 ValueError: not enough values to unpack (expected 5, got 4)
+
+# edited  def forward
+
+File /opt/anaconda3/envs/surya_ws/lib/python3.12/site-packages/torch/nn/modules/module.py:1786, in Module._call_impl(self, *args, **kwargs)
+   1781 # If we don't have any hooks, we want to skip the rest of the logic in
+   1782 # this function, and just call forward.
+   1783 if not (self._backward_hooks or self._backward_pre_hooks or self._forward_hooks or self._forward_pre_hooks
+   1784         or _global_backward_pre_hooks or _global_backward_hooks
+   1785         or _global_forward_hooks or _global_forward_pre_hooks):
+-> 1786     return forward_call(*args, **kwargs)
+   1788 result = None
+...
+    359     b, h, n_group, n_group, self.window_size * self.window_size, -1
+    360 )
+    361 return dots
+
+RuntimeError: shape '[2, 16, 128, 2, 128, 2, -1]' is invalid for input of size 8388480
+    
+# Solved by changing nglo = 0, passed at 
+    # batch = next(iter(train_data_loader))
+    # output = model.forward(batch)  # Get rid of singleton dimension
+    # output
+# But getting following error now at trainer.fit.
+
+---------------------------------------------------------------------------
+RuntimeError                              Traceback (most recent call last)
+Cell In[25], line 1
+----> 1 trainer.fit(lit_model, train_data_loader, val_data_loader) #hj78@njit.edu 
+
+File /opt/anaconda3/envs/surya_ws/lib/python3.12/site-packages/lightning/pytorch/trainer/trainer.py:584, in Trainer.fit(self, model, train_dataloaders, val_dataloaders, datamodule, ckpt_path, weights_only)
+    582 self.training = True
+    583 self.should_stop = False
+--> 584 call._call_and_handle_interrupt(
+    585     self,
+    586     self._fit_impl,
+    587     model,
+    588     train_dataloaders,
+    589     val_dataloaders,
+    590     datamodule,
+    591     ckpt_path,
+    592     weights_only,
+    593 )
+
+File /opt/anaconda3/envs/surya_ws/lib/python3.12/site-packages/lightning/pytorch/trainer/call.py:49, in _call_and_handle_interrupt(trainer, trainer_fn, *args, **kwargs)
+     47     if trainer.strategy.launcher is not None:
+     48         return trainer.strategy.launcher.launch(trainer_fn, *args, trainer=trainer, **kwargs)
+---> 49     return trainer_fn(*args, **kwargs)
+     51 except _TunerExitException:
+     52     _call_teardown_hook(trainer)
+...
+     75 if has_torch_function(tensors):
+     76     return handle_torch_function(broadcast_tensors, tensors, *tensors)
+---> 77 return _VF.broadcast_tensors(tensors)
+
+RuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 2

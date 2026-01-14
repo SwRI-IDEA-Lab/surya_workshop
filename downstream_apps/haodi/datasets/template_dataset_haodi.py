@@ -217,7 +217,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
 
             with opener as f:
                 if filepath.endswith(".npy"):
-                    return np.load(f)
                     img = np.load(f)
                     if img.ndim == 2:
                         img = img[None, :, :]
@@ -231,7 +230,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
                     return ds.to_array().load().to_numpy()
         
         if filepath.endswith(".npy"):
-            return np.load(filepath)
             img = np.load(filepath)
             if img.ndim == 2:
                 img = img[None, :, :]
@@ -280,7 +278,6 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
 
         if "file_path" in self.df_valid_indices.columns:
-            base_dictionary["caiik"] = self.load_image(self.df_valid_indices.iloc[idx]["file_path"])
             base_dictionary["caiik"] = torch.as_tensor(self.load_image(self.df_valid_indices.iloc[idx]["file_path"]))
 
         return base_dictionary
