@@ -5,22 +5,6 @@ from einops import rearrange
 """
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
-
-class EUV2MagBaselineModel(nn.Module):
-    def __init__(self, input_dim):
-        """
-        Initializes the EUV2MagBaselineModel.
-
-        Args:
-            input_dim (int): The size of the input vector after channel and time dimensions are flattened.
-        """
-        super().__init__()
-        self.linear = nn.Linear(input_dim, 1)
-
-
-
-
-
 class RegressionFlareModel(nn.Module):
     def __init__(self, input_dim, channel_order, scalers):
         """
@@ -71,3 +55,45 @@ class RegressionFlareModel(nn.Module):
 
         out = self.linear(x)
         return out
+
+
+class Conv2DImageTranslationModel(nn.Module):
+    """
+    Simple image translation baseline.
+    Flattens time into channels and applies a 1x1 conv (per-pixel linear map).
+    """
+
+    def __init__(self, input_channels, target_channels, n_input_timestamps):
+        """
+        Args:
+            input_channels (list[str]): Ordered list of input channels.
+            target_channels (list[str]): Ordered list of target channels.
+            n_input_timestamps (int): Number of input timesteps.
+        """
+        super().__init__()
+        self.input_channels = input_channels
+        self.target_channels = target_channels
+        self.n_input_timestamps = n_input_timestamps
+
+        in_channels = len(input_channels) * n_input_timestamps
+        out_channels = len(target_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Performs a forward pass through the model.
+        Args:
+            x (torch.Tensor): Input tensor of shape (b, c, t, h, w).
+
+        b - Batch size
+        c - Channels
+        t - Time steps
+        h - Height
+        w - Width
+        """
+        x = x.clone()
+        b, c, t, h, w = x.shape
+        x = x.reshape(b, c * t, h, w)
+
+        return self.conv(x)
+
