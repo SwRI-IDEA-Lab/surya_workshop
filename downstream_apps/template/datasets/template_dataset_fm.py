@@ -131,7 +131,9 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
             mask = hdul[0].data
 
         # Ensure mask is float32 and binary
-        self.mask = (mask > 0).astype(np.float32)
+        #self.mask = (mask > 0).astype(np.float32)
+        self.mask = np.flipud((mask > 0).astype(np.float32))
+
         # Optional sanity check
         assert self.mask.ndim == 2, "Mask must be 2D (H, W)"
 
@@ -199,7 +201,8 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         row = self.ds_index.iloc[idx]
 
     # 
-        #base_dictionary["forecast"] = np.float32(row["present"])
+       # base_dictionary["forecast"] = np.float32(row["present"])
+        #base_dictionary["ds_index"] = row[self.ds_time_column].isoformat()
 
         # And the timestamp of the auxiliary index
        # base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()
