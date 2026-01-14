@@ -37,7 +37,7 @@ class HelioSpectformer1D(HelioSpectFormer):
         dtype: torch.dtype = torch.bfloat16,
         # Put finetuning additions below this line
         dropout: float = 0.1,
-        num_outputs: int = 1,
+        num_outputs: int = 4,
         num_penultimate_transformer_layers: int = 1,
         num_penultimate_heads: int = 8,
         config=None,
