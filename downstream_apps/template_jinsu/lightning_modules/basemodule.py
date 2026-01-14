@@ -1,7 +1,8 @@
 import torch
 import pytorch_lightning as pl
-from transfomer import get_cosine_schedule_with_warmup
-from loguru import logger as lgr_logger
+from transformers import get_cosine_schedule_with_warmup
+
+# from loguru import logger as lgr_logger
 
 
 class BaseModule(pl.LightningModule):
@@ -18,7 +19,7 @@ class BaseModule(pl.LightningModule):
     def configure_optimizers(self):
 
         self.total_steps = self.trainer.estimated_stepping_batches
-        lgr_logger.info(f"total_steps: {self.total_steps}")
+        # lgr_logger.info(f"total_steps: {self.total_steps}")
 
         match self.optimizer_dict.optimizer_type:
             case "adam":
