@@ -9,13 +9,11 @@ Design goals
 
 Assumptions
 - You have already downloaded `scalers.yaml` + model weights (the notebook ran `download_scalers_and_weights.sh`).
-- You run this script from the downstream app template directory (so relative paths like ./configs/config.yaml work).
-- Repo layout matches the notebook (../../ and ../../Surya exist).
+- You run this script from the main path and specify your devices in the command line along the python call
+    (e.g., `CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D ...`).
 
 Usage
-  python finetune_template_1d_minargs.py
-  python finetune_template_1d_minargs.py --devices 2
-  python finetune_template_1d_minargs.py --config ./configs/config.yaml --batch-size 2 --max-epochs 10
+  CUDA_VISIBLE_DEVICES=6,7 python -m downstream_apps.template.3_finetune_template_1D --config /home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml --batch-size 2 --max-epochs 2
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Union, List
+from typing import Any, Dict, Union
 
 import torch
 import yaml
@@ -33,77 +31,20 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-
-# Determine the absolute path to the script's directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Determine the absolute path to the main project root
-# (assuming template_tune_spectformer.py is in downstream_apps/your_downstream/)
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
-
-# Construct absolute paths to Surya and hfmds directories
-SURYA_DIR = os.path.join(PROJECT_ROOT, "Surya")
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-if SURYA_DIR not in sys.path:
-    sys.path.insert(0, SURYA_DIR)
-
 def load_yaml(path: Union[str, Path]) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-def ensure_wandb_dirs() -> None:
-    # Same as notebook: keep wandb outputs in a writable local directory
-    os.environ.setdefault("WANDB_DIR", "./wandb/wandb_logs")
-    os.environ.setdefault("WANDB_CACHE_DIR", "./wandb/wandb_cache")
-    os.environ.setdefault("WANDB_CONFIG_DIR", "./wandb/wandb_config")
-    os.environ.setdefault("TMPDIR", "./wandb/wandb_tmp")
-
-    for k in ("WANDB_DIR", "WANDB_CACHE_DIR", "WANDB_CONFIG_DIR", "TMPDIR"):
-        Path(os.environ[k]).mkdir(parents=True, exist_ok=True)
-
-
-def parse_devices_arg(dev: str):
-    """
-    Accept:
-      --devices auto
-      --devices 1
-      --devices 2
-      --devices 0,1,2,3
-    """
-    if dev == "auto":
-        return "auto"
-    if "," in dev:
-        return [int(x.strip()) for x in dev.split(",") if x.strip()]
-    return int(dev)
-
-
-def infer_strategy(devices) -> str:
-    # If user asks for multiple devices, default to DDP in script mode.
-    if devices == "auto":
-        # Could be 1 or many depending on environment; Lightning will choose.
-        return "auto"
-    if isinstance(devices, int):
-        return "ddp" if devices > 1 else "auto"
-    if isinstance(devices, list):
-        return "ddp" if len(devices) > 1 else "auto"
-    return "auto"
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="./configs/config.yaml")
     parser.add_argument("--max-epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size under DDP.")
-    parser.add_argument("--devices", type=str, default="0", help='e.g. "auto", "1", "2", "0,1"')
     parser.add_argument("--no-wandb", action="store_true")    
     parser.add_argument("--train_baseline", action="store_true")
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("medium")
-    ensure_wandb_dirs()
 
     # Mirror notebook sys.path adjustments
     script_dir = Path(__file__).resolve().parent
@@ -166,6 +107,7 @@ def main() -> None:
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -175,6 +117,7 @@ def main() -> None:
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
+        drop_last=True,
     )
 
     # ---------------------------------------------------------------------
@@ -240,8 +183,7 @@ def main() -> None:
             model.load_state_dict(model_state, strict=True)
 
         # Optional: apply LoRA via config (mirrors notebook intent)
-        if config.get("use_lora", False):
-            model = apply_peft_lora(model, config)
+        model = apply_peft_lora(model, config)
 
 
     # Metrics + LightningModule
@@ -276,19 +218,16 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Trainer (multi-GPU ready)
     # ---------------------------------------------------------------------
-    devices = parse_devices_arg(args.devices)
-    strategy = infer_strategy(devices)
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=devices,
-        strategy=strategy,
+        devices="auto",
+        strategy="auto",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
         logger=loggers,
         callbacks=[ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1)],
         log_every_n_steps=2,
-        num_sanity_val_steps=0,
     )
 
     trainer.fit(lit_model, train_loader, val_loader)
