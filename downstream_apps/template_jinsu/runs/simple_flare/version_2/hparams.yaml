@@ -1,0 +1,17 @@
+batch_size: 2
+dropout: 0.5
+eval_threshold: 0.5
+hidden_channels:
+- 52
+- 26
+- 1
+in_channels: 52
+optimizer_dict: !!python/object/apply:types.SimpleNamespace
+  state:
+    lr: 0.0001
+    optimizer_type: adamw
+    weight_decay: 1.0e-05
+scheduler_dict: !!python/object/apply:types.SimpleNamespace
+  state:
+    anneal_strategy: cos
+    scheduler_type: onecyclelr

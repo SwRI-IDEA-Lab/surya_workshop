@@ -1,6 +1,6 @@
 import torch
 import pytorch_lightning as pl
-from transfomer import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 from loguru import logger as lgr_logger
 
 
@@ -39,8 +39,8 @@ class BaseModule(pl.LightningModule):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
                     mode="min",
-                    factor=self.scheduler_params.factor,
-                    patience=self.scheduler_params.patience,
+                    factor=self.scheduler_dict.factor,
+                    patience=self.scheduler_dict.patience,
                 )
 
                 return {
@@ -75,7 +75,7 @@ class BaseModule(pl.LightningModule):
                     # steps_per_epoch=self.optimizer_params.steps_per_epoch,
                     # epochs=self.optimizer_params.epochs,
                     # pct_start=self.scheduler_params.pct_start,
-                    anneal_strategy=self.scheduler_params.anneal_strategy,
+                    anneal_strategy=self.scheduler_dict.anneal_strategy,
                 )
 
                 return {

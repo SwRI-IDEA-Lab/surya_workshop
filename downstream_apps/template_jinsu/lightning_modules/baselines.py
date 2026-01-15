@@ -244,7 +244,7 @@ class FlareBaseLine(BaseModule):
             sync_dist=True,
         )
 
-    def validation_epoch_end(self) -> None:
+    def on_validation_epoch_end(self) -> None:
 
         classifier_result = self.evaluation_metric.compute_and_reset()
 
