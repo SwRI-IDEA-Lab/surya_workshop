@@ -24,10 +24,17 @@ class FlareMetrics:
         # Cache torchmetrics instances once (instead of recreating each call)
         self._rrse = tm.RelativeSquaredError(squared=False)
 
+        # MRE via TorchMetrics: MeanAbsolutePercentageError
+        # NOTE: returns a fraction (0.08 means 8%), not multiplied by 100.
+        self._mape = tm.MeanAbsolutePercentageError()
+
     def _ensure_device(self, preds: torch.Tensor):
         # Move metric module to the same device as preds, but only when needed
         if self._rrse.device != preds.device:
-            self._rrse = self._rrse.to(preds.device)        
+            self._rrse = self._rrse.to(preds.device)    
+             # MRE via TorchMetrics: MeanAbsolutePercentageError
+            self._mape = self._mape.to(preds.device) 
+                
 
     #added forRuntimeError: The size of tensor a (1280) must match the size of tensor b (2) at non-singleton dimension 1, 8pm
     def _reduce_preds(self, preds: torch.Tensor) -> torch.Tensor:
@@ -39,6 +46,24 @@ class FlareMetrics:
         elif preds.ndim == 1:
             preds = preds.unsqueeze(1)
         return preds
+    
+
+    def _maybe_mask_zeros(
+        self,
+        preds_1d: torch.Tensor,
+        target_1d: torch.Tensor,
+        eps: float = 1e-8
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        MAPE/MRE can blow up if targets contain zeros or near-zeros.
+        This masks those entries for stability.
+        """
+        mask = torch.abs(target_1d) > eps
+        # If everything is masked (all targets ~0), fall back to original tensors
+        if mask.any():
+            return preds_1d[mask], target_1d[mask]
+        return preds_1d, target_1d
+
 
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
@@ -128,7 +153,14 @@ class FlareMetrics:
 
         self._ensure_device(preds)
         output_metrics["rrse"] = self._rrse(preds.squeeze(-1), target.squeeze(-1))
-        output_weights.append(1)            
+        output_weights.append(1)  
+
+        # # MRE implemented via TorchMetrics MeanAbsolutePercentageError (fraction)
+        # p_mre, t_mre = self._maybe_mask_zeros(preds_, target_)
+        # output_metrics["MAPE"] = self._mre(p_mre, t_mre)
+        # output_weights.append(1)          
+        # output_metrics["mape"] = self._mape(preds.squeeze(-1), target.squeeze(-1))
+        # output_weights.append(1)
 
         return output_metrics, output_weights
 

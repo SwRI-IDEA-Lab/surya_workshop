@@ -135,16 +135,34 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         # ] / (2 * np.std(self.ds_index["normalized_intensity"]))
 
         # --- NORMALIZATION FOR EVE 13.5 nm ---
+
+        # keep physical target for later evaluation
+        self.ds_index["eve_13_5_raw"] = self.ds_index["eve_13_5"].astype(np.float64)
+
+        # log space
+        self.ds_index["eve_log10"] = np.log10(self.ds_index["eve_13_5_raw"])
+
+        # store constants for inverse transform (match your current normalization)
+        self.eve_log10_min = float(self.ds_index["eve_log10"].min())
+        self.eve_log10_scale = float(2.0 * np.std(self.ds_index["eve_log10"]))
+
+        # normalized target (same behavior as your current code)
+        self.ds_index["normalized_eve"] = (self.ds_index["eve_log10"] - self.eve_log10_min) / self.eve_log10_scale
+
+
+        # the following work fine. before 1/15/2026
         # 1. Log Transformation: Compresses the dynamic range.
         #    Note: Ensure your data does not contain <= 0 values (common with fill values like -1).
         #    You might need: self.ds_index = self.ds_index[self.ds_index["eve_13_5"] > 0]
-        self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
+        # self.ds_index["normalized_eve"] = np.log10(self.ds_index["eve_13_5"])
 
-        # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
-        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
+        # # 2. Zero-Shifting: Shifts the distribution so the minimum value is 0.
+        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] - np.min(self.ds_index["normalized_eve"])
 
-        # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
-        self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
+        # # 3. Scaling: Divides by 2*std to keep values in a small numerical range (e.g., 0 to ~3).
+        # self.ds_index["normalized_eve"] = self.ds_index["normalized_eve"] / (2 * np.std(self.ds_index["normalized_eve"]))
+
+
 
         # self.ds_index["normalized_eve"] = self.ds_index["eve_13_5"] * 1000000
 
@@ -269,10 +287,17 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         #     "normalized_intensity"
         # ].astype(np.float32)
 
-        # Update the key to point to your normalized EVE column
-        base_dictionary["eve_13p5"] = self.df_valid_indices.iloc[idx][
-            "normalized_eve"
-        ].astype(np.float32)
+        # normalized target (used for loss/metrics in normalized space)
+        base_dictionary["eve_13p5"] = self.df_valid_indices.iloc[idx]["normalized_eve"].astype(np.float32)
+
+        # physical target (used ONLY for physical-space MAPE during validation)
+        base_dictionary["eve_13p5_raw"] = self.df_valid_indices.iloc[idx]["eve_13_5_raw"].astype(np.float32)
+
+        # the following work fine. before 1/15/2026
+        # # Update the key to point to your normalized EVE column
+        # base_dictionary["eve_13p5"] = self.df_valid_indices.iloc[idx][
+        #     "normalized_eve"
+        # ].astype(np.float32)
 
         # And the timestamp of the auxiliary index
         base_dictionary["ds_index"] = self.df_valid_indices["ds_index"].iloc[idx].isoformat()

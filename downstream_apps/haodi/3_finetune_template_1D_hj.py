@@ -16,6 +16,8 @@ Usage
   python finetune_template_1d_minargs.py
   python finetune_template_1d_minargs.py --devices 2
   python finetune_template_1d_minargs.py --config ./configs/config.yaml --batch-size 2 --max-epochs 10
+  python 3_finetune_template_1D_hj.py --config ./configs/config.yaml --batch-size 2 --max-epochs 50 --devices 6
+  python 3_finetune_template_1D_hj.py --config ./configs/config.yaml --batch-size 2 --max-epochs 50 --devices 7
 """
 
 from __future__ import annotations
@@ -125,7 +127,9 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Dataset + loaders
     # ---------------------------------------------------------------------
-    from downstream_apps.template.datasets.template_dataset import FlareDSDataset
+    # from downstream_apps.template.datasets.template_dataset import FlareDSDataset
+    from downstream_apps.haodi.datasets.template_dataset_haodi import FlareDSDataset
+
 
     common_ds_kwargs = dict(
         time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
@@ -136,15 +140,20 @@ def main() -> None:
         drop_hmi_probability=config["drop_hmi_probability"],
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
-        s3_use_simplecache=False,
+        s3_us
+        e_simplecache=False,
         s3_cache_dir="/tmp/helio_s3_cache",
         # Downstream-specific
         return_surya_stack=True,
-        max_number_of_samples=10,
-        ds_flare_index_path=config["data"]["flare_index_path"],
-        ds_time_column="start_time",
-        ds_time_tolerance="4d",
-        ds_match_direction="forward",
+        max_number_of_samples=30,
+        # ds_flare_index_path=config["data"]["flare_index_path"],
+        # ds_time_column="start_time",
+        # ds_time_tolerance="4d",
+        # ds_match_direction="forward",
+        ds_flare_index_path="./data/caiik_2011_2013_EVE_13.5_sample_75_aws.csv",
+        ds_time_column="timestep",
+        ds_time_tolerance = "6h",
+        ds_match_direction = "nearest"
     )
 
     train_dataset = FlareDSDataset(
@@ -162,7 +171,7 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=28,
+        num_workers=8,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -171,7 +180,7 @@ def main() -> None:
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=28,
+        num_workers=8,
         multiprocessing_context="spawn",
         persistent_workers=True,
         pin_memory=True,
@@ -180,8 +189,10 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Model + PEFT (as in notebook)
     # ---------------------------------------------------------------------
-    from downstream_apps.template.metrics.template_metrics import FlareMetrics
-    from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
+    # from downstream_apps.template.metrics.template_metrics import FlareMetrics
+    # from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
+    from downstream_apps.haodi.metrics.template_metrics import FlareMetrics
+    from downstream_apps.haodi.lightning_modules.pl_simple_baseline import FlareLightningModule
 
     if args.train_baseline:
         from downstream_apps.template.models.simple_baseline import RegressionFlareModel
@@ -197,7 +208,7 @@ def main() -> None:
         from surya.models.helio_spectformer import HelioSpectFormer
 
         # model = HelioSpectformer1D(
-        model = HelioSpectformer(
+        model = HelioSpectFormer(
             img_size=config["model"]["img_size"],
             patch_size=config["model"]["patch_size"],
             in_chans=config["model"]["in_channels"],
@@ -262,8 +273,10 @@ def main() -> None:
     loggers = []
     if not args.no_wandb:
         # Notebook values
-        project_name = "template_flare_regression"
-        run_name = "baseline_experiment_1"
+        # project_name = "template_flare_regression"
+        project_name = "template_EVE_13.5_regression"
+        # run_name = "baseline_experiment_1"
+        run_name = "HJ_surya_finetune_experiment_train_30_max"
         wandb_logger = WandbLogger(
             entity="surya_handson",
             project=project_name,
@@ -273,7 +286,7 @@ def main() -> None:
         )
         loggers.append(wandb_logger)
 
-    loggers.append(CSVLogger("runs", name="simple_flare"))
+    loggers.append(CSVLogger("runs", name="simple_EVE"))
 
     # ---------------------------------------------------------------------
     # Trainer (multi-GPU ready)

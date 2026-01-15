@@ -89,10 +89,17 @@ class FlareLightningModule(L.LightningModule):
         metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
         lr: float,
         batch_size: Optional[int] = None,
+        # the above work fine. add after 1/15/2026
+        eve_log10_min: Optional[float] = None,
+        eve_log10_scale: Optional[float] = None,
     ):
         super().__init__()
         self.batch_size = batch_size
         self.model = model
+        # the above work fine. add after 1/15/2026
+        self.eve_log10_min = eve_log10_min
+        self.eve_log10_scale = eve_log10_scale
+        ############################
 
         # create a conv layer converting input caiik to 13 channel ## 1-13-2026
         self.caiik_to_surya_layer = torch.nn.Conv2d(
@@ -111,6 +118,16 @@ class FlareLightningModule(L.LightningModule):
         self.validation_evaluation = metrics["val_metrics"]
 
         self.lr = lr
+
+    # add after 1/15/2026
+    def _inv_norm_to_phys(self, y_norm: torch.Tensor) -> torch.Tensor:
+        if self.eve_log10_min is None or self.eve_log10_scale is None:
+            raise ValueError("Physical inverse transform constants not set (eve_log10_min/eve_log10_scale).")
+
+        y_norm = y_norm.squeeze(-1)
+        log10_y = y_norm * self.eve_log10_scale + self.eve_log10_min
+        return torch.pow(torch.tensor(10.0, device=log10_y.device, dtype=log10_y.dtype), log10_y)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -288,6 +305,19 @@ class FlareLightningModule(L.LightningModule):
             component = val_losses[key] * val_loss_weights[n]
             loss = component if loss is None else (loss + component)
 
+        # add after 1/15/2026
+        # --- Physical-space MAPE (for reporting only) ---
+        if "eve_13p5_raw" in batch:
+            pred_norm = output.squeeze(-1)
+            pred_phys = self._inv_norm_to_phys(pred_norm)
+
+            tgt_phys = batch["eve_13p5_raw"].float().squeeze(-1)
+
+            # MAPE as fraction (0.08 = 8%). Multiply by 100 if you want percent.
+            mape_phys = ((pred_phys - tgt_phys).abs() / tgt_phys.abs().clamp_min(1e-12)).mean()
+            self.log("val_metric_mape_phys", mape_phys, prog_bar=False, batch_size=self.batch_size)
+
+
         if loss is None:
             raise ValueError("training_loss returned an empty loss dict; cannot compute scalar val loss.")
 
@@ -301,6 +331,7 @@ class FlareLightningModule(L.LightningModule):
         if len(val_evaluation_weights) > 0:
             for key in val_evaluation_metrics.keys():
                 self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
+
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
