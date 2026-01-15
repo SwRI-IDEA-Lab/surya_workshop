@@ -35,3 +35,4 @@ dependencies:
     - datasets
     - hf_transfer
     - timm
+    - boto3
