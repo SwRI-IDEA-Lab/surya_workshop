@@ -311,6 +311,11 @@ class ImageTranslationLightningModule(pl.LightningModule):
             Model predictions for the batch.
         """
         return self.model(x)
+    
+    def forward(self, batch: Dict[str, Any]) -> torch.Tensor:
+        
+        return self.model(batch)
+
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
@@ -341,10 +346,12 @@ class ImageTranslationLightningModule(pl.LightningModule):
         torch.Tensor
             The scalar training loss used for backpropagation.
         """
-        x = batch["ts"]
-        target = batch["forecast"].float()
+        #x = batch["ts"]
+        #target = batch["forecast"].float()
+        target = batch["forecast"].squeeze(2).float()
 
-        output = self(x)
+
+        output = self(batch)
         training_losses, training_loss_weights = self.training_loss(output, target)
 
         # Combine losses according to their weights.
@@ -392,10 +399,12 @@ class ImageTranslationLightningModule(pl.LightningModule):
           a separate callable (e.g., metrics["val_loss"]).
         - No value is returned (Lightning uses logs for validation tracking).
         """
-        x = batch["ts"]
-        target = batch["forecast"].float()
+        #x = batch["ts"]
+        #target = batch["forecast"].float()
+        target = batch["forecast"].squeeze(2).float()
 
-        output = self(x)
+
+        output = self(batch)
         val_losses, val_loss_weights = self.training_loss(output, target)
 
         # Combine losses according to their weights.

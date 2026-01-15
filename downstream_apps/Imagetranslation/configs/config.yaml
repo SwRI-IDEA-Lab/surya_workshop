@@ -39,7 +39,7 @@ model:
   learned_flow: false
   epochs_to_learn_flow: 0 # Start by training flow model only before freezing
   init_weights: false
-  checkpoint_layers: []
+  checkpoint_layers: [2,4,6,8]
   ensemble: null # Set to integer or null
   unet_embed_dim: 128 # For unet
   unet_blocks: 3 # For unet
@@ -49,7 +49,7 @@ model:
   ft_out_chans: 1
   use_lora: true
   lora_config:
-    r: 32  # LoRA rank
+    r: 8 #32  # LoRA rank
     lora_alpha: 64  # LoRA alpha parameter
     target_modules: ['q_proj', 'v_proj', 'k_proj', 'out_proj', 'fc1', 'fc2']  # Target modules for LoRA
     lora_dropout: 0.1
@@ -92,5 +92,5 @@ dtype: bfloat16
 parallelism: "ddp" # Valid options: "ddp" and "fsdp"
 
 # Finetuning config fields
-pretrained_path: ../../data/Surya-1.0/surya.366m.v1.pt
-freeze_backbone: False
+pretrained_path: "/home/dineshahegde/surya_workshop/downstream_apps/Imagetranslation/assets/surya.366m.v1.pt"
+freeze_backbone: Falsem
