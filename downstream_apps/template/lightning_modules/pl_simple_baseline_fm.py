@@ -34,8 +34,16 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 #import lightning as L
-import pytorch_lightning as pl
-from pytorch_lightning import LightningModule, Trainer
+#works for baseline
+#############
+##################
+#import pytorch_lightning as pl
+#from pytorch_lightning import LightningModule, Trainer
+#############
+##############
+import lightning.pytorch as pl
+from lightning.pytorch import LightningModule
+###############
 import torch
 
 
@@ -45,7 +53,8 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class FilamentLightningModule(LightningModule):
+#class FilamentLightningModule(LightningModule):
+class FilamentLightningModule(pl.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
 
