@@ -149,7 +149,7 @@ class FlareLightningModule(pl.LightningModule):
             The scalar training loss used for backpropagation.
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["label"]
 
         output = self(x)
         training_losses, training_loss_weights = self.training_loss(output, target)
@@ -200,7 +200,7 @@ class FlareLightningModule(pl.LightningModule):
         - No value is returned (Lightning uses logs for validation tracking).
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["label"]
 
         output = self(x)
         val_losses, val_loss_weights = self.training_loss(output, target)

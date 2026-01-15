@@ -1,5 +1,6 @@
 import torch
-import torchmetrics as tm  # Lots of possible metrics in here https://lightning.ai/docs/torchmetrics/stable/all-metrics.html
+# import torchmetrics as tm  # Lots of possible metrics in here https://lightning.ai/docs/torchmetrics/stable/all-metrics.html
+import torch.nn.functional as F
 
 """
 Template metrics to be used for flare forecasting.  Within the FlareMetrics class,
@@ -12,132 +13,63 @@ The loss names used in the dictionary keys are propagated during the logging.
 
 class FlareMetrics:
     def __init__(self, mode: str):
-        """
-        Initialize FlareMetrics class.
-
-        Args:
-            mode (str): Mode to use for metric evaluation. Can be "train_loss",
-                        "train_metrics", or "val_metrics".
-        """
         self.mode = mode
-
-        # Cache torchmetrics instances once (instead of recreating each call)
-        self._rrse = tm.RelativeSquaredError(squared=False)
-
-    def _ensure_device(self, preds: torch.Tensor):
-        # Move metric module to the same device as preds, but only when needed
-        if self._rrse.device != preds.device:
-            self._rrse = self._rrse.to(preds.device)        
-
+ 
+    # CROSS METRICS
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
-        """
-        Calculate loss metrics for training.
+        
+        ce = F.cross_entropy(preds, target)
 
-        Args:
-            preds (torch.Tensor): Model predictions.
-            target (torch.Tensor): Ground truth labels.
-
-        Returns:
-            tuple[dict[str, torch.Tensor], list[float]]:
-                - dict[str, torch.Tensor]: Dictionary containing the calculated loss metrics.
-                                        Keys are metric names (e.g., "mse"), and values are the
-                                        corresponding torch.Tensor values.
-                - list[float]: List of weights for each calculated metric.
-        """
-
-        output_metrics = {}
-        output_weights = []
-
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
-        output_weights.append(1)
+        output_metrics = {"cross_entropy": ce}
+        output_weights = [1]
 
         return output_metrics, output_weights
+
+    # METRICS micro F1
 
     def train_metrics(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
-        """
-        Calculate evaluation metrics for training.
-        IMPORTANT:  These metrics are only for reporting purposes and do not
-                    contribute to the training loss. Use only if you want to
-                    monitor additional metrics during training.
+        
+        pred_classes = preds.argmax(dim=1)
 
-        Args:
-            preds (torch.Tensor): Model predictions.
-            target (torch.Tensor): Ground truth labels.
+        accuracy = (pred_classes == target).float().mean()
 
-        Returns:
-            tuple[dict[str, torch.Tensor], list[float]]:
-                - dict[str, torch.Tensor]: Dictionary containing the calculated evaluation metrics.
-                                        Keys are metric names, and values are the corresponding torch.Tensor values.
-                - list[float]: List of weights for each calculated metric.
-        """
-        output_metrics = {}
-        output_weights = []
+        tp = (pred_classes * target).sum()
+        fp = (pred_classes != target).sum() 
+        fn = fp      
 
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
-        output_weights.append(1)        
+        # Micro precision, recall, F1
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        micro_f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
+        output_metrics = {
+            "accuracy": accuracy,
+            "micro_f1": micro_f1
+        }
+        output_weights = [1, 1]
 
         return output_metrics, output_weights
 
     def val_metrics(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
-        """
-        Calculate metrics for validation.
+        
+        output_metrics, output_weights = self.train_metrics(preds, target)
 
-        Args:
-            preds (torch.Tensor): Model predictions.
-            target (torch.Tensor): Ground truth labels.
-
-        Returns:
-            tuple[dict[str, torch.Tensor], list[float]]:
-                - dict[str, torch.Tensor]: Dictionary containing the calculated metrics.
-                                        Keys are metric names (e.g., "mse"), and values are the
-                                        corresponding torch.Tensor values.
-                - list[float]: List of weights for each calculated metric.
-        """
-
-        output_metrics = {}
-        output_weights = []
-
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
+        ce = F.cross_entropy(preds, target)
+        output_metrics["cross_entropy"] = ce
         output_weights.append(1)
-
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
-        output_weights.append(1)            
 
         return output_metrics, output_weights
 
     def __call__(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
-        """
-        Default method to evaluated all metrics.
-
-        Parameters
-        ----------
-        preds : torch.Tensor
-            Output target of the AI model. Shape depends on the application.
-        target : torch.Tensor
-            Ground truth to compare AI model output against
-
-        Returns
-        -------
-        dict
-            Dictionary with all metrics. Metrics aggregate over the batch. So the
-            dicationary takes the shape [str, torch.Tensor] with the tensors having
-            shape [].
-        list
-            List of weights for each calculated metric to enable giving a different
-            weight to each loss term.
-        """
-
+        
         match self.mode.lower():
 
             case "train_loss":
