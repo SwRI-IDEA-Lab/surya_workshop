@@ -55,7 +55,7 @@ class HelioNetCDFDatasetAWS(HelioNetCDFDataset):
     def __init__(
         self,
         *args,
-        s3_storage_options: Optional[dict] = None,
+        s3_storage_options: Optional[dict] = {'anon': True},
         s3_use_simplecache: bool = False,
         s3_cache_dir: str = "/tmp/helio_s3_cache",
         s3fs_kwargs: Optional[dict] = None,
