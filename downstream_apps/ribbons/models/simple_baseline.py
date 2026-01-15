@@ -40,7 +40,7 @@ class SegmentationRibbonModel(nn.Module):
         Performs a forward pass through the model.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (b, c, t, h, w).
+            x (torch.Tensor or dict): Input tensor of shape (b, c, t, h, w), or a batch dict with key "ts".
 
         b - Batch size
         c - Channels
@@ -51,6 +51,10 @@ class SegmentationRibbonModel(nn.Module):
         Returns:
             torch.Tensor: Segmentation mask of shape (b, 1, h, w) with values in [0, 1].
         """
+
+        # Handle dict input (for compatibility with Lightning module)
+        if isinstance(x, dict):
+            x = x["ts"]
 
         # Avoid mutating the caller's tensor
         x = x.clone()
