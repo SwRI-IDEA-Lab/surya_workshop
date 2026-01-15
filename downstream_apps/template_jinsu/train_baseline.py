@@ -11,14 +11,18 @@ import os
 import yaml
 import argparse
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import torch
 from torch.utils.data import DataLoader
 
 # import torch.multiprocessing as mp
 # mp.set_sharing_strategy("file_system")
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    # RichProgressBar,
+)
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from downstream_apps.template_jinsu.datasets.dataset_flare import SolarFlareDataset
@@ -107,32 +111,32 @@ def train(config):
     )
 
     # load pretrained Surya weights
-    model_state = model.state_dict()
-    checkpoint_state = torch.load(
-        config["pretrained_path"], weights_only=True, map_location="cpu"
-    )
-    filtered_checkpoint_state = {
-        k: v
-        for k, v in checkpoint_state.items()
-        if k in model_state and v.shape == model_state[k].shape
-    }
+    # model_state = model.state_dict()
+    # checkpoint_state = torch.load(
+    #     config["pretrained_path"], weights_only=True, map_location="cpu"
+    # )
+    # filtered_checkpoint_state = {
+    #     k: v
+    #     for k, v in checkpoint_state.items()
+    #     if k in model_state and v.shape == model_state[k].shape
+    # }
 
-    model_state.update(filtered_checkpoint_state)
-    model.load_state_dict(model_state, strict=True)
+    # model_state.update(filtered_checkpoint_state)
+    # model.load_state_dict(model_state, strict=True)
 
-    if config["model"]["use_lora"]:
-        model = apply_peft_lora(model, config)
-    else:
-        for name, param in model.named_parameters():
-            if "embedding" in name or "backbone" in name:
-                param.requires_grad = False
-        parameters_with_grads = []
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                parameters_with_grads.append(name)
-        print(
-            f"{len(parameters_with_grads)} parameters require gradients: {', '.join(parameters_with_grads)}."
-        )
+    # if config["model"]["use_lora"]:
+    #     model = apply_peft_lora(model, config)
+    # else:
+    #     for name, param in model.named_parameters():
+    #         if "embedding" in name or "backbone" in name:
+    #             param.requires_grad = False
+    #     parameters_with_grads = []
+    #     for name, param in model.named_parameters():
+    #         if param.requires_grad:
+    #             parameters_with_grads.append(name)
+    #     print(
+    #         f"{len(parameters_with_grads)} parameters require gradients: {', '.join(parameters_with_grads)}."
+    #     )
 
     # define wandb
     wandb_logger = WandbLogger(
@@ -155,6 +159,7 @@ def train(config):
             enable_version_counter=True,
         ),
         LearningRateMonitor(logging_interval="step"),
+        # RichProgressBar(),
     ]
 
     trainer = L.Trainer(

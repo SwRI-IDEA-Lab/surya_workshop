@@ -3,7 +3,7 @@ import torch.nn as nn
 from torchvision.ops import MLP
 
 
-class MLPHead(nn.module):
+class MLPHead(nn.Module):
     def __init__(
         self,
         in_channels,

@@ -77,13 +77,13 @@ downstream_model:
   resume: false
   load_weight_only: false
   in_channels: 52
-  hidden_channels: [1280, 640, 1] # head: [1280, 640, 1] # simple_baseline: [52, 26, 1]
+  hidden_channels: [52, 26, 1] # head: [1280, 640, 1] # simple_baseline: [52, 26, 1]
   threshold: 0.5
   dropout: 0.1
 
 wandb:
   project_name: template_flare_classification
-  run_name: simple_mlp_surya_backbone
+  run_name: simple_baseline
   save_dir: ./wandb/wandb_tmp
 
 trainer:

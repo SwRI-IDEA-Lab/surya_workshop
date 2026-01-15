@@ -11,19 +11,24 @@ import os
 import yaml
 import argparse
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import torch
 from torch.utils.data import DataLoader
 
 # import torch.multiprocessing as mp
 # mp.set_sharing_strategy("file_system")
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    # RichProgressBar,
+)
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from downstream_apps.template_jinsu.datasets.dataset_flare import SolarFlareDataset
 from downstream_apps.template_jinsu.lightning_modules.headmodule import FlareDSModel
-from surya.models.helio_spectformers import HelioSpectFormer
+
+from surya.models.helio_spectformer import HelioSpectFormer
 from surya.utils.data import build_scalers  # Data scaling utilities for Surya stacks
 from workshop_infrastructure.utils import apply_peft_lora
 
@@ -181,6 +186,7 @@ def train(config):
             enable_version_counter=True,
         ),
         LearningRateMonitor(logging_interval="step"),
+        # RichProgressBar(),
     ]
 
     trainer = L.Trainer(

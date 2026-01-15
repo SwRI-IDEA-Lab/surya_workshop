@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from .basemodule import BaseModule
 from ..models.head import MLPHead
 from Surya.downstream_examples.solar_flare_forcasting.metrics import (
@@ -26,6 +26,7 @@ class FlareDSModel(BaseModule):
         self.save_hyperparameters()
         self.backbone = backbone  # Just assign it
         self.evaluation_metric = DCM(threshold=eval_threshold)
+        self.sigmoid = nn.Sigmoid()
 
         in_channels = backbone.embed_dim
         self.model = MLPHead(
@@ -34,11 +35,16 @@ class FlareDSModel(BaseModule):
             dropout=dropout,
         )
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        token = self.backbone(x)
+        output = self.model(token)
+        return output
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
 
-        x = batch["ts"]
+        # x = batch["ts"]
         target = batch["label"].unsqueeze(1).float()
-        output = self(x)
+        output = self(batch)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # Log aggregate loss and component losses.
@@ -60,8 +66,7 @@ class FlareDSModel(BaseModule):
         loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # evalation metic updates
-        sigmoid = nn.Sigmoid()
-        self.evaluation_metric.update(sigmoid(output), target)
+        self.evaluation_metric.update(self.sigmoid(output), target)
 
         # Log aggregate loss and component losses.
         self.log(

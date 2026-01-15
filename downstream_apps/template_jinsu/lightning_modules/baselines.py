@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from Surya.downstream_examples.solar_flare_forcasting.metrics import (
+from ..metrics.classification_metrics import (
     DistributedClassificationMetrics as DCM,
 )
 from downstream_apps.template_jinsu.models.simple_baseline import ClsFlareBaseLine
@@ -250,7 +250,7 @@ class FlareBaseLine(BaseModule):
 
         for key in classifier_result.keys():
             self.log(
-                f"valid/{key}",
+                f"evaluation/val_{key}",
                 classifier_result[key],
                 prog_bar=False,
                 on_epoch=True,
