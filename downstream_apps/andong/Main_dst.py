@@ -118,7 +118,7 @@ def main():
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="train",
-        s3_use_simplecache=True,
+        s3_use_simplecache=False,
         s3_cache_dir=CACHE_DIR,
         
         # Dst Specifics
@@ -140,7 +140,7 @@ def main():
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="val",
-        s3_use_simplecache=True,
+        s3_use_simplecache=False,
         s3_cache_dir=CACHE_DIR,
         
         # Dst Specifics
