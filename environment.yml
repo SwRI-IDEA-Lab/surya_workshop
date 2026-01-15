@@ -27,7 +27,11 @@ dependencies:
     - torch
     - torchvision
     - lightning
+    - peft
     - torchmetrics
     - s3fs
     - einops
     - huggingface_hub
+    - datasets
+    - hf_transfer
+    - timm
