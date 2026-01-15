@@ -43,7 +43,7 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class FlareLightningModule(L.LightningModule):
+class LightningModule(L.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
 

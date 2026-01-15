@@ -19,7 +19,7 @@ class RegressionFlareModel(nn.Module):
             scalers (dict): A dictionary of scalers, one for each channel, used for inverse transforming the data to physical space.
         """
         super().__init__()
-        self.linear = nn.Linear(input_dim, 1)
+        self.linear = nn.Linear(input_dim, input_dim)
         self.channel_order = channel_order
         self.scalers = scalers
 
@@ -37,9 +37,13 @@ class RegressionFlareModel(nn.Module):
         """
 
         # Avoid mutating the caller's tensor
-        x = x['ts'].clone()
+        #print("x:",x)
+        #print("x['ts']:",x['ts'])
+        #print("type of x['ts']:",type(x['ts']))
+        #x = x['ts'].clone()
 
         # Get dimensions
+        x = x[:, :, :, ::32, ::32]
         b, c, t, w, h = x.shape
 
         # Invert normalization to work in physical logarithmic space
@@ -50,10 +54,12 @@ class RegressionFlareModel(nn.Module):
                 )
 
         # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
-        x = x.abs().mean(dim=[3,4])
+        #x = x.abs().mean(dim=[3,4])
 
         # Rearange in preparation for linear layer
-        x = rearrange(x, "b c t -> b (c t)")
+        x = rearrange(x, "b c t w h -> b (c t w h)")
 
-        out = self.linear(x)
-        return out
+        x = self.linear(x)
+        x = rearrange(x, "b (c t w h) -> b c t w h", c=13, t=1, w=128, h=128)
+
+        return x
