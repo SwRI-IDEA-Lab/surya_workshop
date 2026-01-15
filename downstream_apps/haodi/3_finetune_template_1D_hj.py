@@ -145,7 +145,7 @@ def main() -> None:
         s3_cache_dir="/tmp/helio_s3_cache",
         # Downstream-specific
         return_surya_stack=True,
-        max_number_of_samples=30,
+        max_number_of_samples=30, # Feb validation
         # ds_flare_index_path=config["data"]["flare_index_path"],
         # ds_time_column="start_time",
         # ds_time_tolerance="4d",
@@ -301,7 +301,7 @@ def main() -> None:
         strategy=strategy,
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
         logger=loggers,
-        callbacks=[ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1)],
+        callbacks=[ModelCheckpoint(dirpath="/home/haodijiang/checkpoints", monitor="val_loss", mode="min", save_top_k=1)],
         log_every_n_steps=2,
     )
 
