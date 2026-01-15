@@ -278,7 +278,7 @@ class HelioNetCDFDataset(Dataset):
         s3_download_to_temp: bool = True,
         s3_temp_dir: str | None = "/tmp/helio_s3_cache",
         # boto3 transfer tuning (used only when boto3 is available; otherwise falls back to s3fs/fsspec)
-        s3_boto3_max_concurrency: int = 2,
+        s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
     ):
         self.scalers = scalers
