@@ -208,6 +208,7 @@ __marimo__/
 
 # Files
 scalers.yaml
+*.pt
 
 # wandb directories
 wandb/
@@ -218,3 +219,4 @@ wandb/
 *.jpeg
 *.png
 *.ckpt
+*.npy

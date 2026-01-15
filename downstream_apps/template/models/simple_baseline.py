@@ -37,7 +37,7 @@ class RegressionFlareModel(nn.Module):
         """
 
         # Avoid mutating the caller's tensor
-        x = x.clone()
+        x = x['ts'].clone()
 
         # Get dimensions
         b, c, t, w, h = x.shape

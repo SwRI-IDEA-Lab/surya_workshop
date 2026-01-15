@@ -49,11 +49,8 @@ class FlareMetrics:
 
         output_metrics = {}
         output_weights = []
-        print('printing preds:')
-        print(preds)
-        print('printing target:')
-        print(target)
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
+
+        output_metrics["mse"] = torch.nn.functional.mse_loss(preds.squeeze(-1), target.squeeze(-1))
         output_weights.append(1)
 
         return output_metrics, output_weights
@@ -81,7 +78,7 @@ class FlareMetrics:
         output_weights = []
 
         self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
+        output_metrics["rrse"] = self._rrse(preds.squeeze(-1), target.squeeze(-1))
         output_weights.append(1)        
 
 
@@ -108,11 +105,11 @@ class FlareMetrics:
         output_metrics = {}
         output_weights = []
 
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
+        output_metrics["mse"] = torch.nn.functional.mse_loss(preds.squeeze(-1), target.squeeze(-1))
         output_weights.append(1)
 
         self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
+        output_metrics["rrse"] = self._rrse(preds.squeeze(-1), target.squeeze(-1))
         output_weights.append(1)            
 
         return output_metrics, output_weights
