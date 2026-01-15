@@ -4,6 +4,7 @@ from typing import Literal, Optional
 from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
 from astropy.io import fits
 from datetime import datetime
+from glob import glob
 
 
 class FlareDSDataset(HelioNetCDFDatasetAWS):
@@ -177,7 +178,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         fits_time = datetime.strptime(fits_time, "%Y-%m-%d %H:%M:%S")
         mask_fits_path = f"/shared/huggingface_data/filaments/AIA171_masked_{fits_time.strftime('%Y%m%d_%H')}00*.fits"
 
-        with fits.open(mask_fits_path) as hdul:
+        with fits.open(glob(mask_fits_path)[0]) as hdul:
             mask = np.array(hdul[0].data)
 
         # Ensure mask is float32 and binary
