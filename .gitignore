@@ -219,3 +219,5 @@ wandb/
 *.jpeg
 *.png
 *.ckpt
+
+cache/  
