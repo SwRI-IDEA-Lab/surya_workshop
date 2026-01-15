@@ -43,10 +43,13 @@
             "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
             "console": "integratedTerminal",
             "cwd":"${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "7"
+              },            
             "justMyCode": false,
             "args": [
               "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml",
-              "--devices", "0,1",
+              "--devices", "6,7",
               "--batch-size", "2",
               "--max-epochs", "2",
             //   "--train_baseline"
