@@ -49,7 +49,10 @@ class FlareMetrics:
 
         output_metrics = {}
         output_weights = []
-
+        print('printing preds:')
+        print(preds)
+        print('printing target:')
+        print(target)
         output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
         output_weights.append(1)
 
