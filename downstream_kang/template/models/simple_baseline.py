@@ -1,59 +1,50 @@
+# models/simple_baseline.py
 import torch
 import torch.nn as nn
-from einops import rearrange
-
-"""
-A simple linear regression model to be used as a baseline for flare forecasting.
-"""
+from torchvision.ops import MLP
 
 
-class RegressionFlareModel(nn.Module):
-    def __init__(self, input_dim, channel_order, scalers):
-        """
-        Initializes the RegressionFlareModel.
-
-        Args:
-            input_dim (int): The size of the input vector after channel and time dimensions are flattened.
-            channel_order (list[str]): List of channel names, defining the order in which channels appear in the input data.
-                                       This is used to ensure the inverse transform uses the correct scaler for each channel.
-            scalers (dict): A dictionary of scalers, one for each channel, used for inverse transforming the data to physical space.
-        """
+class ClsFlareBaseLine(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 13,
+        n_statistics: int = 4,
+        hidden_channels: list[int] = None,
+        dropout: float = 0.5,
+    ):
         super().__init__()
-        self.linear = nn.Linear(input_dim, 1)
-        self.channel_order = channel_order
-        self.scalers = scalers
 
-    def forward(self, x):
-        """
-        Performs a forward pass through the model.
-        Args:
-            x (torch.Tensor): Input tensor of shape (b, c, t, w, h).
+        if hidden_channels is None:
+            hidden_channels = [52, 26, 1],
 
-        b - Batch size
-        c - Channels
-        t - Time steps
-        w - Width
-        h - Height
-        """
+        feature_dim = in_channels * n_statistics  # 13 * 4 = 52
 
-        # Avoid mutating the caller's tensor
-        x = x.clone()
+        # MLP
+        self.classifier = MLP(
+            in_channels=feature_dim,        # 52
+            hidden_channels=hidden_channels,  # [128, 64, 1]
+            activation_layer=nn.ReLU,
+            norm_layer=nn.BatchNorm1d,
+            dropout=dropout,
+        )
 
-        # Get dimensions
-        b, c, t, w, h = x.shape
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        x_mean = x.mean(dim=[2, 3, 4])      # [B, C]
+        x_min = torch.amin(x, dim=[2, 3, 4])  # [B, C]
+        x_max = torch.amax(x, dim=[2, 3, 4])  # [B, C]
+        x_std = x.std(dim=[2, 3, 4])        # [B, C]
 
-        # Invert normalization to work in physical logarithmic space
-        with torch.no_grad():
-            for channel_index, channel in enumerate(self.channel_order):
-                x[:, channel_index, ...] = self.scalers[channel].inverse_transform(
-                    x[:, channel_index, ...]
-                )
+        features = torch.cat([x_mean, x_min, x_max, x_std], dim=1)  # [B, C*4]
 
-        # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
-        x = x.abs().mean(dim=[3,4])
+        return features
 
-        # Rearange in preparation for linear layer
-        x = rearrange(x, "b c t -> b (c t)")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 5:  # [B, C, T, H, W]
+            x = self.extract_features(x)  # [B, C*4]
+        elif x.dim() == 2:  # [B, C*4]
+            pass
+        else:
+            raise ValueError(
+                f"Expected input with 5 or 2 dimensions, got {x.dim()}")
 
-        out = self.linear(x)
-        return out
+        return self.classifier(x)

@@ -35,11 +35,12 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
-from .basemodule import BaseModule
+import torch.nn as nn
 from Surya.downstream_examples.solar_flare_forcasting.metrics import (
     DistributedClassificationMetrics as DCM,
 )
-
+from downstream_apps.template_jinsu.models.simple_baseline import ClsFlareBaseLine
+from .basemodule import BaseModule
 
 # Type aliases for clarity in documentation / teaching.
 LossDict = Mapping[str, torch.Tensor]
@@ -88,17 +89,42 @@ class FlareBaseLine(BaseModule):
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        optimizer_dict,          # BaseModule
-        scheduler_dict,          # 用 BaseModule
-        batch_size: int = 32,
+        optimizer_dict=None,
+        scheduler_dict=None,
+        batch_size: int = 1,
+        eval_threshold: float = 0.5,
+        in_channels: int = 52,
+        hidden_channels: list[int] | None = None,
+        dropout: float = 0.5,
+        # model: torch.nn.Module,
+        # metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
+        # lr: float,
+        # batch_size: Optional[int] = None,
     ):
-        super().__init__(optimizer_dict, scheduler_dict)  # BaseModule
-        self.save_hyperparameters(ignore=['model'])  # 保存超参数
+        super().__init__(optimizer_dict=optimizer_dict, scheduler_dict=scheduler_dict)
+        self.save_hyperparameters()
 
-        self.model = model
         self.batch_size = batch_size
+        self.eval_threshold = eval_threshold
         self.evaluation_metric = DCM(threshold=0.5)
+
+        self.model = ClsFlareBaseLine(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            dropout=dropout,
+        )
+
+        # self.batch_size = batch_size
+        # self.model = model
+
+        # # Loss callable: returns (loss_dict, weight_list)
+        # self.training_loss = metrics["train_loss"]
+
+        # # Metric callables: return (metric_dict, weight_list)
+        # self.training_evaluation = metrics["train_metrics"]
+        # self.validation_evaluation = metrics["val_metrics"]
+
+        # self.lr = lr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -114,7 +140,16 @@ class FlareBaseLine(BaseModule):
         torch.Tensor
             Model predictions for the batch.
         """
-        return self.model(x)
+        x_mean = x.mean(dim=[2, 3, 4])
+        x_min = torch.amin(x, dim=[2, 3, 4])
+        x_max = torch.amax(x, dim=[2, 3, 4])
+        x_std = x.std(dim=[2, 3, 4])
+        x_feature = torch.cat(
+            [x_mean, x_min, x_max, x_std], dim=1
+        )  # [batch, channel, 4]
+        x_feature = x_feature.flatten(start_dim=1)  # [batch, 52]
+
+        return self.model(x_feature)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
@@ -147,38 +182,26 @@ class FlareBaseLine(BaseModule):
             The scalar training loss used for backpropagation.
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["label"].unsqueeze(1).float()
+
+        # [batch, channel: 13, timestamps: 1, height: 4096, width: 4096]
+        # compute statics from each channel, such as min, max, mean, std.
+        # 13 channels x 4 statics = 52 features
+        # [batch, channel, timetstamps, h, w] --> [batch, 13, 4]
+        # flatten tensor [batch, 13, 4] --> [batch, 52]
+        # feed [batch, 52] into baseline model!
 
         output = self(x)
-        training_losses, training_loss_weights = self.training_loss(
-            output, target)
-
-        # Combine losses according to their weights.
-        # Assumes training_loss_weights aligns with iteration order of training_losses.keys().
-        loss = None
-        for n, key in enumerate(training_losses.keys()):
-            component = training_losses[key] * training_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        # Safety: if no losses returned, raise a clear error.
-        if loss is None:
-            raise ValueError(
-                "training_loss returned an empty loss dict; cannot compute scalar loss.")
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
         # Log aggregate loss and component losses.
-        self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size)
-        for key in training_losses.keys():
-            self.log(
-                f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size)
-
-        # Log evaluation metrics (optional).
-        training_evaluation_metrics, training_evaluation_weights = self.training_evaluation(
-            output, target)
-        if len(training_evaluation_weights) > 0:
-            for key in training_evaluation_metrics.keys():
-                self.log(
-                    f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
-
+        self.log(
+            "train_loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            sync_dist=True,
+        )
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
@@ -203,42 +226,33 @@ class FlareBaseLine(BaseModule):
         - No value is returned (Lightning uses logs for validation tracking).
         """
         x = batch["ts"]
-        target = batch["forecast"].unsqueeze(1).float()
+        target = batch["label"].unsqueeze(1).float()
 
         output = self(x)
-        val_losses, val_loss_weights = self.training_loss(output, target)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(output, target)
 
-        # Combine losses according to their weights.
-        loss = None
-        for n, key in enumerate(val_losses.keys()):
-            component = val_losses[key] * val_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        if loss is None:
-            raise ValueError(
-                "training_loss returned an empty loss dict; cannot compute scalar val loss.")
+        # evalation metic updates
+        sigmoid = nn.Sigmoid()
+        self.evaluation_metric.update(sigmoid(output), target)
 
         # Log aggregate loss and component losses.
-        self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size)
-        for key in val_losses.keys():
+        self.log(
+            "val_loss",
+            loss,
+            prog_bar=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+    def validation_epoch_end(self) -> None:
+
+        classifier_result = self.evaluation_metric.compute_and_reset()
+
+        for key in classifier_result.keys():
             self.log(
-                f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size)
-
-        # Log evaluation metrics (optional).
-        val_evaluation_metrics, val_evaluation_weights = self.validation_evaluation(
-            output, target)
-        if len(val_evaluation_weights) > 0:
-            for key in val_evaluation_metrics.keys():
-                self.log(
-                    f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """
-        Configure the optimizer used by Lightning.
-
-        Returns
-        -------
-        torch.optim.Optimizer
-            Adam optimizer over all module parameters with learning rate `self.lr`.
-        """
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+                f"valid/{key}",
+                classifier_result[key],
+                prog_bar=False,
+                on_epoch=True,
+                sync_dist=True,
+            )

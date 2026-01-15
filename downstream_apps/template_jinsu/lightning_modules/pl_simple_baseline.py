@@ -35,10 +35,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
-from .basemodule import BaseModule
-from Surya.downstream_examples.solar_flare_forcasting.metrics import (
-    DistributedClassificationMetrics as DCM,
-)
 
 
 # Type aliases for clarity in documentation / teaching.
@@ -47,7 +43,7 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class FlareBaseLine(BaseModule):
+class FlareLightningModule(pl.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
 
@@ -89,16 +85,22 @@ class FlareBaseLine(BaseModule):
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizer_dict,          # BaseModule
-        scheduler_dict,          # 用 BaseModule
-        batch_size: int = 32,
+        metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
+        lr: float,
+        batch_size: Optional[int] = None,
     ):
-        super().__init__(optimizer_dict, scheduler_dict)  # BaseModule
-        self.save_hyperparameters(ignore=['model'])  # 保存超参数
-
-        self.model = model
+        super().__init__()
         self.batch_size = batch_size
-        self.evaluation_metric = DCM(threshold=0.5)
+        self.model = model
+
+        # Loss callable: returns (loss_dict, weight_list)
+        self.training_loss = metrics["train_loss"]
+
+        # Metric callables: return (metric_dict, weight_list)
+        self.training_evaluation = metrics["train_metrics"]
+        self.validation_evaluation = metrics["val_metrics"]
+
+        self.lr = lr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -150,8 +152,7 @@ class FlareBaseLine(BaseModule):
         target = batch["forecast"].unsqueeze(1).float()
 
         output = self(x)
-        training_losses, training_loss_weights = self.training_loss(
-            output, target)
+        training_losses, training_loss_weights = self.training_loss(output, target)
 
         # Combine losses according to their weights.
         # Assumes training_loss_weights aligns with iteration order of training_losses.keys().
@@ -162,22 +163,18 @@ class FlareBaseLine(BaseModule):
 
         # Safety: if no losses returned, raise a clear error.
         if loss is None:
-            raise ValueError(
-                "training_loss returned an empty loss dict; cannot compute scalar loss.")
+            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar loss.")
 
         # Log aggregate loss and component losses.
         self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size)
         for key in training_losses.keys():
-            self.log(
-                f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size)
+            self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size)
 
         # Log evaluation metrics (optional).
-        training_evaluation_metrics, training_evaluation_weights = self.training_evaluation(
-            output, target)
+        training_evaluation_metrics, training_evaluation_weights = self.training_evaluation(output, target)
         if len(training_evaluation_weights) > 0:
             for key in training_evaluation_metrics.keys():
-                self.log(
-                    f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
+                self.log(f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
 
         return loss
 
@@ -215,22 +212,18 @@ class FlareBaseLine(BaseModule):
             loss = component if loss is None else (loss + component)
 
         if loss is None:
-            raise ValueError(
-                "training_loss returned an empty loss dict; cannot compute scalar val loss.")
+            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar val loss.")
 
         # Log aggregate loss and component losses.
         self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size)
         for key in val_losses.keys():
-            self.log(
-                f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size)
+            self.log(f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size)
 
         # Log evaluation metrics (optional).
-        val_evaluation_metrics, val_evaluation_weights = self.validation_evaluation(
-            output, target)
+        val_evaluation_metrics, val_evaluation_weights = self.validation_evaluation(output, target)
         if len(val_evaluation_weights) > 0:
             for key in val_evaluation_metrics.keys():
-                self.log(
-                    f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
+                self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
