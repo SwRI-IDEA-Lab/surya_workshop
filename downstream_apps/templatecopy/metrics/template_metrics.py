@@ -21,13 +21,6 @@ class FlareMetrics:
         """
         self.mode = mode
 
-        # Cache torchmetrics instances once (instead of recreating each call)
-        self._rrse = tm.RelativeSquaredError(squared=False)
-
-    def _ensure_device(self, preds: torch.Tensor):
-        # Move metric module to the same device as preds, but only when needed
-        if self._rrse.device != preds.device:
-            self._rrse = self._rrse.to(preds.device)        
 
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
@@ -50,7 +43,11 @@ class FlareMetrics:
         output_metrics = {}
         output_weights = []
 
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
+        # Ensure target matches preds shape (e.g. [B] -> [B, 1]) and is float
+        if target.shape != preds.shape:
+            target = target.view_as(preds)
+        
+        output_metrics["bce"] = torch.nn.functional.binary_cross_entropy_with_logits(preds, target.float())
         output_weights.append(1)
 
         return output_metrics, output_weights
@@ -77,11 +74,6 @@ class FlareMetrics:
         output_metrics = {}
         output_weights = []
 
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
-        output_weights.append(1)        
-
-
         return output_metrics, output_weights
 
     def val_metrics(
@@ -105,12 +97,12 @@ class FlareMetrics:
         output_metrics = {}
         output_weights = []
 
-        output_metrics["mse"] = torch.nn.functional.mse_loss(preds, target)
-        output_weights.append(1)
+        # Ensure target matches preds shape (e.g. [B] -> [B, 1]) and is float
+        if target.shape != preds.shape:
+            target = target.view_as(preds)
 
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds, target)
-        output_weights.append(1)            
+        output_metrics["bce"] = torch.nn.functional.binary_cross_entropy_with_logits(preds, target.float())
+        output_weights.append(1)
 
         return output_metrics, output_weights
 

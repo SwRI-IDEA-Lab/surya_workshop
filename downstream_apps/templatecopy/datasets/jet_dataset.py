@@ -100,6 +100,7 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
         ds_time_tolerance: str | None = None,
         ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
         ds_fov_size_pix: float | None = None,
+        s3_temp_dir: str = '/tmp/helio_s3_cache',
     ):
 
         if ds_match_direction not in ["forward", "backward", "nearest"]:
@@ -120,6 +121,7 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
             phase=phase,
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
+            s3_temp_dir=s3_temp_dir,
         )
 
         self.return_surya_stack = return_surya_stack
@@ -135,39 +137,45 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
             pd.to_datetime(self.ds_index[ds_time_column]) + pd.Timedelta(minutes=2))
         self.ds_index.sort_values("ds_index", inplace=True)
 
-        if ds_fov_size_pix is None:
-            raise ValueError("ds_fov_size_pix must be provided for SolarJetDataset")
-
-        # Compute center coordinates of the bounding box (in arcsec)
-        self.ds_index["bbox_center_x_arcsec"] = (self.ds_index["jet_bbox_min_x"] + self.ds_index["jet_bbox_max_x"]) / 2
-        self.ds_index["bbox_center_y_arcsec"] = (self.ds_index["jet_bbox_min_y"] + self.ds_index["jet_bbox_max_y"]) / 2
-        # Transform center coordinates to pixel
         pixel_size = 0.6
         npixels = 4096
-        img_center = npixels/2
-        self.ds_index["bbox_center_x_pixel"] = (self.ds_index["bbox_center_x_arcsec"] / pixel_size) + img_center
-        self.ds_index["bbox_center_y_pixel"] = (self.ds_index["bbox_center_y_arcsec"] / pixel_size) + img_center
-        # Get FOV size in pixel
-        half_fov_size_pixel = ds_fov_size_pix / 2
-        # compute new bounding box coordinates in pixels
-        self.ds_index["bbox_ll_x_pixel"] = self.ds_index["bbox_center_x_pixel"] - half_fov_size_pixel
-        self.ds_index["bbox_ur_x_pixel"] = self.ds_index["bbox_center_x_pixel"] + half_fov_size_pixel
-        self.ds_index["bbox_ll_y_pixel"] = self.ds_index["bbox_center_y_pixel"] - half_fov_size_pixel
-        self.ds_index["bbox_ur_y_pixel"] = self.ds_index["bbox_center_y_pixel"] + half_fov_size_pixel
-        # Now correct for bounding box going "outside" of the image (center was too close to the border)
-        ### calculating necessary shift in x
-        shift_x = np.where(self.ds_index["bbox_ll_x_pixel"] < 0, 0 - self.ds_index["bbox_ll_x_pixel"], 0)
-        shift_x = np.where(self.ds_index["bbox_ur_x_pixel"] + shift_x > (npixels-1), 
-                           (npixels-1) - self.ds_index["bbox_ur_x_pixel"], shift_x)
-        ### calculating necessary shift in y
-        shift_y = np.where(self.ds_index["bbox_ll_y_pixel"] < 0, 0 - self.ds_index["bbox_ll_y_pixel"], 0)
-        shift_y = np.where(self.ds_index["bbox_ur_y_pixel"] + shift_y > (npixels-1), 
-                           (npixels-1) - self.ds_index["bbox_ur_y_pixel"], shift_y)
-        ### apply shifts (overwrite)
-        self.ds_index["bbox_ll_x_pixel"] = self.ds_index["bbox_ll_x_pixel"] + shift_x
-        self.ds_index["bbox_ur_x_pixel"] = self.ds_index["bbox_ur_x_pixel"] + shift_x
-        self.ds_index["bbox_ll_y_pixel"] = self.ds_index["bbox_ll_y_pixel"] + shift_y
-        self.ds_index["bbox_ur_y_pixel"] = self.ds_index["bbox_ur_y_pixel"] + shift_y
+        if ds_fov_size_pix is None:
+            raise ValueError("ds_fov_size_pix must be provided for SolarJetDataset")
+        if ds_fov_size_pix < npixels:
+            # Compute center coordinates of the bounding box (in arcsec)
+            self.ds_index["bbox_center_x_arcsec"] = (self.ds_index["jet_bbox_min_x"] + self.ds_index["jet_bbox_max_x"]) / 2
+            self.ds_index["bbox_center_y_arcsec"] = (self.ds_index["jet_bbox_min_y"] + self.ds_index["jet_bbox_max_y"]) / 2
+            # Transform center coordinates to pixel
+
+            img_center = npixels/2
+            self.ds_index["bbox_center_x_pixel"] = (self.ds_index["bbox_center_x_arcsec"] / pixel_size) + img_center
+            self.ds_index["bbox_center_y_pixel"] = (self.ds_index["bbox_center_y_arcsec"] / pixel_size) + img_center
+            # Get FOV size in pixel
+            half_fov_size_pixel = ds_fov_size_pix / 2
+            # compute new bounding box coordinates in pixels
+            self.ds_index["bbox_ll_x_pixel"] = self.ds_index["bbox_center_x_pixel"] - half_fov_size_pixel
+            self.ds_index["bbox_ur_x_pixel"] = self.ds_index["bbox_center_x_pixel"] + half_fov_size_pixel
+            self.ds_index["bbox_ll_y_pixel"] = self.ds_index["bbox_center_y_pixel"] - half_fov_size_pixel
+            self.ds_index["bbox_ur_y_pixel"] = self.ds_index["bbox_center_y_pixel"] + half_fov_size_pixel
+            # Now correct for bounding box going "outside" of the image (center was too close to the border)
+            ### calculating necessary shift in x
+            shift_x = np.where(self.ds_index["bbox_ll_x_pixel"] < 0, 0 - self.ds_index["bbox_ll_x_pixel"], 0)
+            shift_x = np.where(self.ds_index["bbox_ur_x_pixel"] + shift_x > (npixels-1), 
+                            (npixels-1) - self.ds_index["bbox_ur_x_pixel"], shift_x)
+            ### calculating necessary shift in y
+            shift_y = np.where(self.ds_index["bbox_ll_y_pixel"] < 0, 0 - self.ds_index["bbox_ll_y_pixel"], 0)
+            shift_y = np.where(self.ds_index["bbox_ur_y_pixel"] + shift_y > (npixels-1), 
+                            (npixels-1) - self.ds_index["bbox_ur_y_pixel"], shift_y)
+            ### apply shifts (overwrite)
+            self.ds_index["bbox_ll_x_pixel"] = self.ds_index["bbox_ll_x_pixel"] + shift_x
+            self.ds_index["bbox_ur_x_pixel"] = self.ds_index["bbox_ur_x_pixel"] + shift_x
+            self.ds_index["bbox_ll_y_pixel"] = self.ds_index["bbox_ll_y_pixel"] + shift_y
+            self.ds_index["bbox_ur_y_pixel"] = self.ds_index["bbox_ur_y_pixel"] + shift_y
+        else:
+            self.ds_index["bbox_ll_x_pixel"] = 0
+            self.ds_index["bbox_ur_x_pixel"] = 4096
+            self.ds_index["bbox_ll_y_pixel"] = 0
+            self.ds_index["bbox_ur_y_pixel"] = 4096
 
 
         # Implement normalization.  This is going to be DS application specific, no two will look the same
@@ -243,13 +251,15 @@ class SolarJetDataset(HelioNetCDFDatasetAWS):
         if self.return_surya_stack:
             # This lines assembles the dictionary that Surya's dataset returns (defined above)
             base_dictionary = super().__getitem__(idx=idx)
+            
+
             # crop according to FOV defined above
             x0 = int(self.df_valid_indices["bbox_ll_x_pixel"].iloc[idx])
             x1 = int(self.df_valid_indices["bbox_ur_x_pixel"].iloc[idx])
             y0 = int(self.df_valid_indices["bbox_ll_y_pixel"].iloc[idx])
             y1 = int(self.df_valid_indices["bbox_ur_y_pixel"].iloc[idx])
             base_dictionary["ts"] = base_dictionary["ts"][..., y0:y1, x0:x1]
-
+    
         # We now add the flare intensity label
         #base_dictionary["forecast"] = self.df_valid_indices.iloc[idx][
         #    "normalized_intensity"
