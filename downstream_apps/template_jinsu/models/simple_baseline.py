@@ -20,7 +20,7 @@ class ClsFlareBaseLine(nn.Module):
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             activation_layer=nn.ReLU,
-            norm_layer=nn.BatchNorm1d,
+            norm_layer=nn.LayerNorm,
             dropout=dropout,
         )
 

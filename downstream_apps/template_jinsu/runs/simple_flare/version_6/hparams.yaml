@@ -1,0 +1,16 @@
+batch_size: 1
+dropout: 0.1
+eval_threshold: 0.5
+hidden_channels:
+- 52
+- 26
+- 1
+in_channels: 52
+optimizer_dict:
+  epoch: 10
+  lr: 0.0001
+  optimizer_type: adamw
+  weight_decay: 1.0e-05
+scheduler_dict:
+  anneal_strategy: cos
+  scheduler_type: oncyclelr

@@ -40,16 +40,13 @@
             "name": "Finetune script",
             "type": "debugpy",
             "request": "launch",
-            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "program": "${file}",
             "console": "integratedTerminal",
-            "cwd":"${workspaceFolder}",
+            "cwd": "${fileDirname}",
             "justMyCode": false,
             "args": [
-              "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml",
-              "--devices", "0,1",
-              "--batch-size", "2",
-              "--max-epochs", "2",
-            //   "--train_baseline"
+                "--config",
+                "/home/jinsuhong/surya_workshop/downstream_apps/template_jinsu/configs/config_flare.yaml"
             ]
         }              
     ]

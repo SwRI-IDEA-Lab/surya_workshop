@@ -1,11 +1,11 @@
 import torch
-import pytorch_lightning as pl
+import lightning as L
 from transformers import get_cosine_schedule_with_warmup
 
 # from loguru import logger as lgr_logger
 
 
-class BaseModule(pl.LightningModule):
+class BaseModule(L.LightningModule):
     def __init__(
         self,
         scheduler_dict: dict,
@@ -21,27 +21,27 @@ class BaseModule(pl.LightningModule):
         self.total_steps = self.trainer.estimated_stepping_batches
         # lgr_logger.info(f"total_steps: {self.total_steps}")
 
-        match self.optimizer_dict.optimizer_type:
+        match self.optimizer_dict["optimizer_type"]:
             case "adam":
                 optimizer = torch.optim.Adam(
                     self.parameters(),
-                    lr=self.optimizer_dict.lr,
-                    weight_decay=self.optimizer_dict.weight_decay,
+                    lr=self.optimizer_dict["lr"],
+                    weight_decay=self.optimizer_dict["weight_decay"],
                 )
             case "adamw":
                 optimizer = torch.optim.AdamW(
                     self.parameters(),
-                    lr=self.optimizer_dict.lr,
-                    weight_decay=self.optimizer_dict.weight_decay,
+                    lr=self.optimizer_dict["lr"],
+                    weight_decay=self.optimizer_dict["weight_decay"],
                 )
 
-        match self.scheduler_dict.scheduler_type:
+        match self.scheduler_dict["scheduler_type"]:
             case "reducelronplateau":
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
                     mode="min",
-                    factor=self.scheduler_params.factor,
-                    patience=self.scheduler_params.patience,
+                    factor=self.scheduler_dict["factor"],
+                    patience=self.scheduler_dict["patience"],
                 )
 
                 return {
@@ -53,7 +53,9 @@ class BaseModule(pl.LightningModule):
                 }
 
             case "cosine_with_warmup":
-                num_warmup_steps = self.scheduler_dict.warmup_ratio * self.total_steps
+                num_warmup_steps = (
+                    self.scheduler_dict["warmup_ratio"] * self.total_steps
+                )
                 scheduler = get_cosine_schedule_with_warmup(
                     optimizer,
                     num_warmup_steps=num_warmup_steps,
@@ -71,12 +73,12 @@ class BaseModule(pl.LightningModule):
             case "onecyclelr":
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(
                     optimizer,
-                    max_lr=self.optimizer_dict.lr,
+                    max_lr=self.optimizer_dict["lr"],
                     total_steps=self.total_steps,
                     # steps_per_epoch=self.optimizer_params.steps_per_epoch,
                     # epochs=self.optimizer_params.epochs,
                     # pct_start=self.scheduler_params.pct_start,
-                    anneal_strategy=self.scheduler_params.anneal_strategy,
+                    anneal_strategy=self.scheduler_dict["anneal_strategy"],
                 )
 
                 return {

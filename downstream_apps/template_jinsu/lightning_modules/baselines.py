@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from Surya.downstream_examples.solar_flare_forcasting.metrics import (
@@ -240,11 +239,12 @@ class FlareBaseLine(BaseModule):
             "val_loss",
             loss,
             prog_bar=True,
+            on_step=False,
             on_epoch=True,
             sync_dist=True,
         )
 
-    def validation_epoch_end(self) -> None:
+    def on_validation_epoch_end(self) -> None:
 
         classifier_result = self.evaluation_metric.compute_and_reset()
 
