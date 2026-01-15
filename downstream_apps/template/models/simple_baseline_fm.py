@@ -8,7 +8,7 @@ from torch import squeeze
 """
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
-
+# needed 2d conv
 
 class RegressionFlilament(nn.Module):
     def __init__(self, input_dim, channel_order):
