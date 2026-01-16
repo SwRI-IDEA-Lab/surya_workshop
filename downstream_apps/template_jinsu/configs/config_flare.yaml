@@ -10,7 +10,7 @@ data:
   time_delta_target_minutes: +60
   # n_input_timestamps: 1 #Optional integer to randomly sample time_delta_input_minutes
   batch_size: 1
-  num_data_workers: 8
+  num_data_workers: 24
   prefetch_factor: 2
   scalers_path: ./assets/scalers.yaml
   #### Put your donwnstream (DS) specific parameters below this line

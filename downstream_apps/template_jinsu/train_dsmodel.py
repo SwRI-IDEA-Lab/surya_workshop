@@ -26,6 +26,7 @@ from lightning.pytorch.callbacks import (
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from downstream_apps.template_jinsu.datasets.dataset_flare import SolarFlareDataset
+from downstream_apps.template_jinsu.models.head import HelioSpectformerMLPHead
 from downstream_apps.template_jinsu.lightning_modules.headmodule import FlareDSModel
 
 from surya.models.helio_spectformer import HelioSpectFormer
@@ -102,9 +103,7 @@ def train(config):
 
     # set random seed
     L.seed_everything(config["seed_num"], workers=True)
-
-    # define backbone
-    backbone = HelioSpectFormer(
+    backbone = HelioSpectformerMLPHead(
         img_size=config["model"]["img_size"],
         patch_size=config["model"]["patch_size"],
         in_chans=config["model"]["in_channels"],
@@ -126,6 +125,11 @@ def train(config):
         ensemble=config["model"]["ensemble"],
         finetune=config["model"]["finetune"],
         nglo=config["model"]["nglo"],
+        # for downstream head
+        global_class_token=True,
+        in_channels=config["downstream_model"]["in_channels"],
+        hidden_channels=config["downstream_model"]["hidden_channels"],
+        dropout=config["downstream_model"]["dropout"],
     )
 
     # load pretrained Surya weights
@@ -157,12 +161,10 @@ def train(config):
         )
 
     model = FlareDSModel(
-        backbone=backbone,
+        model=backbone,
         optimizer_dict=config["opt"],
         scheduler_dict=config["scheduler"],
         eval_threshold=config["downstream_model"]["threshold"],
-        hidden_channels=config["downstream_model"]["hidden_channels"],
-        dropout=config["downstream_model"]["dropout"],
     )
 
     # define wandb
