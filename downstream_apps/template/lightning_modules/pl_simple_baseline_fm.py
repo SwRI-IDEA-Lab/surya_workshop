@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 #from pytorch_lightning import LightningModule, Trainer
 #############
 ##############
+#works for finetuning
 import lightning.pytorch as pl
 from lightning.pytorch import LightningModule
 ###############
@@ -52,8 +53,13 @@ LossDict = Mapping[str, torch.Tensor]
 MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
-
+#works for baseline
+#############
+##################
 #class FilamentLightningModule(LightningModule):
+#############
+##################
+#works for finetuning
 class FilamentLightningModule(pl.LightningModule):
     """
     PyTorch LightningModule for flare prediction training.
