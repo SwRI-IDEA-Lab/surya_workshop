@@ -1,0 +1,144 @@
+# wsa_config.yaml
+# WSA (Wang-Sheeley-Arge) Map Prediction Configuration
+
+# Configuration for re-training a Surya encoder + custom WSA decoder head
+# on AIA 193 images to predict full-disk WSA maps.
+
+# Adapted from template config.yaml for single-channel, single-timestamp,
+# 2D map regression task.
+
+job_id: wsa_map_prediction_lora
+
+data:
+  # Surya index paths (we use full index and filter by CR list)
+  surya_index_path: ../data/indices/surya_aws_s3_full_index.csv
+  
+  # WSA-specific data paths
+  wsa_map_dir: ./datasets/wsa_full_disk
+  wsa_params_path: "./data/target_dataset/fitted_wsa_params.csv"
+  
+  # Carrington Rotation (CR) lists for train/val/test splits
+  # These define which CRs to include in each dataset
+  train_crs: [2124,2157,2178,2236,2150,2188]
+  val_crs: [2263, 2140]
+  test_crs: [2200, 2164]
+  
+  # AIA channel to load (single channel: AIA 193 Angstrom)
+  # channels: ['aia193']
+  channels: ['aia94', 'aia131', 'aia171', 'aia193', 'aia211', 'aia304', 'aia335', 'aia1600', 'hmi_m', 'hmi_bx', 'hmi_by', 'hmi_bz', 'hmi_v']
+  
+  # Data loading parameters
+  batch_size: 1
+  num_data_workers: 4
+  prefetch_factor: 2
+  
+  # Surya normalization scalers
+  scalers_path: ./assets/scalers.yaml
+  
+  # CR tolerance for finding nearest AIA timestamp (in days)
+  cr_tolerance_days: 1
+  
+  # S3 caching for Surya data
+  s3_use_simplecache: true
+  s3_cache_dir: /tmp/helio_s3_cache
+
+model:
+  # Model architecture
+  model_type: spectformer_lora
+  
+  # Spectformer encoder parameters (same as Surya pre-training)
+  img_size: 4096
+  patch_size: 16
+  in_chans: 13            # Single AIA 193 channel
+  
+  # Time embedding (single timestamp, no temporal dimension)
+  time_embedding:
+    type: linear
+    n_queries: null
+    time_dim: 1               # Single frame
+  
+  # Encoder architecture
+  embed_dim: 1280
+  depth: 10
+  spectral_blocks: 2
+  num_heads: 16
+  mlp_ratio: 4.0
+  rpe: false
+  drop_rate: 0.0
+  window_size: 2
+  dp_rank: 4
+  learned_flow: false
+  init_weights: false
+  checkpoint_layers: []
+  ensemble: null
+  n_spectral_blocks: 1
+  
+  # Finetuning configuration
+  finetune: true
+  freeze_encoder: true        # Keep encoder frozen initially
+  ft_unembedding_type: "linear"
+  ft_out_chans: 1             # Single output channel for WSA map
+  
+  # LoRA (Low-Rank Adaptation) for efficient finetuning
+  use_lora: true
+  lora_config:
+    r: 32                      # LoRA rank
+    lora_alpha: 64             # LoRA alpha scaling
+    target_modules: ['q_proj', 'v_proj', 'k_proj', 'out_proj', 'fc1', 'fc2']
+    lora_dropout: 0.1
+    bias: 'none'
+  
+  # Pre-trained Surya checkpoint path
+  # checkpoint_path: ../../data/Surya-1.0/surya.366m.v1.pt
+  checkpoint_path: ./assets/surya.366m.v1.pt
+  
+  # Decoder head configuration
+  decoder:
+    use_batch_norm: false
+    hidden_dims: []            # Simple linear decoder (no hidden layers)
+
+# Optimizer and training configuration
+optimizer:
+  learning_rate: 5.0e-5       # Lower LR for fine-tuning with frozen encoder
+  min_lr: 1.0e-6
+  warm_up_steps: 1          # Small warmup for stability
+  max_epochs: 60              # Total training epochs
+  weight_decay: 1.0e-5        # L2 regularization
+
+# Loss and metrics configuration
+loss:
+  train_loss: mae             # Mean Absolute Error for backprop
+  train_metrics: mae          # Mean Absolute Error for monitoring
+  val_metrics: mae            # MAE for validation
+
+# Data preprocessing
+normalize_wsa_maps: true       # Normalize WSA maps to [0, 1] using vmin/vmax
+use_latitude_in_learned_flow: false
+rollout_steps: 0              # No rollout needed for single timestamp
+
+# Logging and checkpointing
+wandb:
+  enabled: false
+  project: wsa-forecasting    # W&B project name
+  entity: surya_handson       # W&B entity/team
+  run_name: wsa_baseline_run
+  log_frequency: 5           # Log every N steps
+
+checkpoint:
+  save_dir: ./checkpoints
+  monitor: val_loss           # Metric to monitor for best model
+  mode: min                   # Minimize validation loss
+  save_top_k: 1               # Keep only best checkpoint
+
+logging:
+  log_every_n_steps: 5        # Log training metrics every N steps
+  validate_after_epoch: 1     # Validate after each epoch
+  visualization_samples: 3    # Sample predictions to log
+
+# Device and precision
+device: auto                  # Auto-detect GPU/CPU
+dtype: float32               # Data type (float32 for stability)
+parallelism: ddp             # Distributed Data Parallel (if multi-GPU)
+
+# Gradient accumulation (for larger effective batch size)
+iters_grad_accum: 1
