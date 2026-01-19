@@ -131,9 +131,9 @@ def visualize_event(config, scalers, dst_data_path, cache_dir, checkpoint_path):
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         phase="val",
-        s3_use_simplecache=False,
-        s3_cache_dir=None,
-        # s3_cache_dir=cache_dir,
+        s3_use_simplecache=True,
+        # s3_cache_dir="./partial_cache",
+        s3_cache_dir=cache_dir,
         return_surya_stack=True,
         dst_hdf5_path=dst_data_path,
         delay_days=3,
@@ -262,14 +262,14 @@ def main():
             use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
             scalers=scalers,
             phase="train",
-            s3_use_simplecache=False,
-            s3_cache_dir=None,
-            # s3_cache_dir=CACHE_DIR,
+            s3_use_simplecache=True,
+            # s3_cache_dir="./partial_cache",
+            s3_cache_dir=CACHE_DIR,
             return_surya_stack=True,
             dst_hdf5_path=dst_data_path,
             delay_days=3,
             max_number_of_samples=None,
-            storm_threshold=-350.0  # Training on Extreme Storms
+            storm_threshold=-100.0  # Training on Extreme Storms
         )
 
         val_dataset = DstDataset(
@@ -283,9 +283,9 @@ def main():
             use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
             scalers=scalers,
             phase="val",
-            s3_use_simplecache=False,
-            s3_cache_dir=None,
-            # s3_cache_dir=CACHE_DIR,
+            s3_use_simplecache=True,
+            # s3_cache_dir="./partial_cache",
+            s3_cache_dir=CACHE_DIR,
             return_surya_stack=True,
             dst_hdf5_path=dst_data_path,
             delay_days=3,
@@ -293,9 +293,20 @@ def main():
             storm_threshold=-60  # Validate on ALL data
         )
 
-        batch_size = 1
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, persistent_workers=False)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0, persistent_workers=False)
+        batch_size = 4
+        train_loader = DataLoader(train_dataset, 
+                                  batch_size=batch_size, 
+                                  shuffle=True, 
+                                  num_workers=0, 
+                                #   prefetch_factor=2,
+                                  pin_memory=True,        # <--- KEY FIX: Faster CPU->GPU transfer
+                                  persistent_workers=False)
+        val_loader = DataLoader(val_dataset, 
+                                batch_size=batch_size, 
+                                num_workers=0, 
+                                # prefetch_factor=2,
+                                pin_memory=True,        # <--- KEY FIX: Faster CPU->GPU transfer
+                                persistent_workers=False)
 
         model = load_model_structure(config)
         
@@ -320,13 +331,23 @@ def main():
         wandb_logger = WandbLogger(entity="surya_handson", project="surya_dst_forecast", name="dst_finetune_v3", save_dir=os.environ["WANDB_DIR"])
         csv_logger = CSVLogger("runs", name="dst_forecast_new")
 
-        # Save Best Model Callback
+        # 1. Define your FIXED path
+        # This is where the file will always appear.
+        ckpt_dir = "runs/dst_forecast/dst_finetune_3day_delay_multiGPU/checkpoints"
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # 2. Configure the Callback
         checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,       # <--- Force the directory (No version folders)
+            filename="best_model",  # <--- Force the filename (No "epoch=9-step=90")
+            
             monitor="val_loss",
             mode="min",
-            save_top_k=1,
-            filename="best_model" # Explicit name makes it easier to find
-            save_last=True,         # <--- Recommended: Always saves "last.ckpt" even if val_loss is weird
+            save_top_k=1,           # Keep only the single best file
+            save_last=True,         # Also save 'last.ckpt' as a backup
+            
+            # Optional: Overwrite existing files so you don't fill the disk
+            every_n_epochs=1,
         )
 
         trainer = L.Trainer(
@@ -337,7 +358,7 @@ def main():
             precision="bf16-mixed",
             logger=[wandb_logger, csv_logger],
             callbacks=[checkpoint_callback],
-            accumulate_grad_batches=8,
+            accumulate_grad_batches=2,
             log_every_n_steps=2,
             num_sanity_val_steps=0, # Skip sanity check to see if training starts
         )
