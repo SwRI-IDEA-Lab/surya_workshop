@@ -1,10 +1,10 @@
 import random
 from typing import Optional
 
-from workshop_infrastructure.datasets.helio_aws import HelioNetCDFDatasetAWS
+from workshop_infrastructure.datasets.helio_boto import HelioNetCDFDataset
 
 
-class EUV2MAGDataset(HelioNetCDFDatasetAWS):
+class EUV2MAGDataset(HelioNetCDFDataset):
     """
     Dataset for translating EUV AIA channels to HMI magnetogram targets. It includes only the necessary parameters
     to initialize the parent class, but not the specific downstream (DS) parameters because this downstream application 
@@ -76,8 +76,10 @@ class EUV2MAGDataset(HelioNetCDFDatasetAWS):
         use_latitude_in_learned_flow=False,
         channels: list[str] | None = None,
         phase="train",
+        s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = True,
         s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3fs_kwargs: dict | None = None,
         #### Put your donwnstream (DS) specific parameters below this line
         input_channels: Optional[list[str]] = None,
         target_channels: Optional[list[str]] = None,
@@ -97,8 +99,10 @@ class EUV2MAGDataset(HelioNetCDFDatasetAWS):
             use_latitude_in_learned_flow=use_latitude_in_learned_flow,
             channels=channels,
             phase=phase,
+            s3_storage_options=s3_storage_options,
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
+            s3fs_kwargs=s3fs_kwargs,
         )
 
         self.input_channels = input_channels or ["aia304", "aia193", "aia171"]
