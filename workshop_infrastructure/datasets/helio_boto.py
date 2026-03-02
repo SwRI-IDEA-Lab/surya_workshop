@@ -270,13 +270,13 @@ class HelioNetCDFDataset(Dataset):
         # --- S3 options (used only if index contains s3:// URIs) ---
         s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = False,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str = "/d0/amunozj/surya_ws_cache",
         s3fs_kwargs: dict | None = None,
         # --- Ephemeral download-to-local-then-open (recommended for NetCDF/HDF5 on S3) ---
         # If True, S3 objects are downloaded to a temporary local file, opened locally
         # with xarray/h5netcdf, and deleted immediately after loading into memory.
         s3_download_to_temp: bool = True,
-        s3_temp_dir: str | None = "/tmp/helio_s3_cache",
+        s3_temp_dir: str | None = "/d0/amunozj/surya_ws_cache",
         # boto3 transfer tuning (used only when boto3 is available; otherwise falls back to s3fs/fsspec)
         s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
