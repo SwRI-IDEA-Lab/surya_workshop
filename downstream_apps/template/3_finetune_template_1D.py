@@ -125,7 +125,9 @@ def main() -> None:
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--train_baseline", action="store_true")
 
-    # New: checkpoint + optional S3 upload args
+    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to make file cache")
+
+    # checkpoint + optional S3 upload args
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Directory to save local checkpoints")
     parser.add_argument("--s3_bucket", type=str, default=None, help="Optional S3 bucket for best checkpoint upload")
     parser.add_argument("--s3_prefix", type=str, default="", help="Optional S3 key prefix (folder path)")
@@ -172,7 +174,7 @@ def main() -> None:
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         s3_use_simplecache=False,
-        s3_cache_dir="/tmp/helio_s3_cache",
+        s3_cache_dir=args.cache_dir,
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
@@ -180,6 +182,7 @@ def main() -> None:
         ds_time_column="start_time",
         ds_time_tolerance="4d",
         ds_match_direction="forward",
+        s3_download_to_temp=True,
     )
 
     train_dataset = FlareDSDataset(
