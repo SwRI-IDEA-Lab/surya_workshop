@@ -44,13 +44,14 @@
             "console": "integratedTerminal",
             "cwd":"${workspaceFolder}",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "7"
+                "CUDA_VISIBLE_DEVICES": "3"
               },            
             "justMyCode": false,
             "args": [
-              "--config", "/home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml",
+              "--config", "/d0/amunozj/git_repos/surya_workshop/downstream_apps/template/configs/config_script.yaml",
               "--batch-size", "2",
               "--max-epochs", "2",
+              // "--cache_dir", "/d0/amunozj/surya_ws_cache",
             //   "--train_baseline"
             ]
         }              
