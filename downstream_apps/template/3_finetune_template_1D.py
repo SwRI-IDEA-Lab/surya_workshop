@@ -20,9 +20,9 @@ S3 upload examples
   CUDA_VISIBLE_DEVICES=6,7 python -m downstream_apps.template.3_finetune_template_1D \
       --config /home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml \
       --batch-size 2 --max-epochs 2 \
-      --s3-bucket my-ml-artifacts \
-      --s3-prefix flare/exp_001 \
-      --s3-best-key best.ckpt
+      --s3_bucket my-ml-artifacts \
+      --s3_prefix flare/exp_001 \
+      --s3_best_key best.ckpt
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class UploadBestCheckpointToS3(L.Callback):
     """
     Uploads to S3 as soon as ModelCheckpoint records a *new best* checkpoint.
 
-    - No-op unless --s3-bucket is provided
+    - No-op unless --s3_bucket is provided
     - Uploads only when best_model_path changes
     - Only uploads from global rank 0 under DDP
     - Uses a stable key by default (e.g. best.ckpt)
@@ -127,10 +127,10 @@ def main() -> None:
 
     # New: checkpoint + optional S3 upload args
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Directory to save local checkpoints")
-    parser.add_argument("--s3-bucket", type=str, default=None, help="Optional S3 bucket for best checkpoint upload")
-    parser.add_argument("--s3-prefix", type=str, default="", help="Optional S3 key prefix (folder path)")
+    parser.add_argument("--s3_bucket", type=str, default=None, help="Optional S3 bucket for best checkpoint upload")
+    parser.add_argument("--s3_prefix", type=str, default="", help="Optional S3 key prefix (folder path)")
     parser.add_argument(
-        "--s3-best-key",
+        "--s3_best_key",
         type=str,
         default="best.ckpt",
         help='Stable S3 object name for latest best checkpoint (set "" to use local checkpoint filename)',
