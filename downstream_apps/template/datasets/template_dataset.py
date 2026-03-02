@@ -80,7 +80,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         channels: list[str] | None = None,
         phase="train",
         s3_use_simplecache: bool = True,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str = "/d0/amunozj/surya_ws_cache",
         #### Put your donwnstream (DS) specific parameters below this line
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
@@ -88,6 +88,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
         ds_time_column: str | None = None,
         ds_time_tolerance: str | None = None,
         ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
+        s3_download_to_temp: bool = True,
     ):
 
         if ds_match_direction not in ["forward", "backward", "nearest"]:
@@ -108,6 +109,7 @@ class FlareDSDataset(HelioNetCDFDatasetAWS):
             phase=phase,
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
+            s3_download_to_temp=s3_download_to_temp,
         )
 
         self.return_surya_stack = return_surya_stack

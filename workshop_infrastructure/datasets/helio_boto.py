@@ -14,6 +14,8 @@ from torch.utils.data import Dataset
 from Surya.surya.utils.distributed import get_rank
 from Surya.surya.utils.log import create_logger
 from functools import cache
+import hashlib
+import re
 
 # Optional S3 support (required only when reading s3:// URIs)
 try:
@@ -270,13 +272,13 @@ class HelioNetCDFDataset(Dataset):
         # --- S3 options (used only if index contains s3:// URIs) ---
         s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = False,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str = "/d0/amunozj/surya_ws_cache",
         s3fs_kwargs: dict | None = None,
         # --- Ephemeral download-to-local-then-open (recommended for NetCDF/HDF5 on S3) ---
         # If True, S3 objects are downloaded to a temporary local file, opened locally
         # with xarray/h5netcdf, and deleted immediately after loading into memory.
         s3_download_to_temp: bool = True,
-        s3_temp_dir: str | None = "/tmp/helio_s3_cache",
+        s3_temp_dir: str | None = "/d0/amunozj/surya_ws_cache",
         # boto3 transfer tuning (used only when boto3 is available; otherwise falls back to s3fs/fsspec)
         s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
@@ -548,6 +550,41 @@ class HelioNetCDFDataset(Dataset):
         path = s3_uri[5:]
         bucket, key = path.split("/", 1)
         return bucket, key
+    
+    def _s3_cache_path(self, s3_uri: str, suffix: str | None = None) -> str:
+        """
+        Stable, readable cache filename:
+        <bucket>__<hash>__<basename>.<ext>
+
+        - hash ensures uniqueness even if basenames collide
+        - basename makes the cache human-inspectable
+        - basename is sanitized to filesystem-safe characters
+        """
+        bucket, key = self._parse_s3_uri(s3_uri)
+
+        # Human-readable name: use the final path component of the key
+        base = os.path.basename(key) or "object"
+
+        # Sanitize basename (keep letters, digits, dot, dash, underscore)
+        base_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-")
+        if not base_safe:
+            base_safe = "object"
+
+        # Choose extension: prefer provided suffix; else use basename ext; else default ".nc"
+        if suffix is None:
+            _, ext = os.path.splitext(base_safe)
+            suffix = ext if ext else ".nc"
+
+        # Hash of full identity to avoid collisions
+        key_hash = hashlib.sha1(f"{bucket}/{key}".encode("utf-8")).hexdigest()
+
+        fname = f"{bucket}__{key_hash}__{base_safe}"
+        # Ensure fname ends with suffix
+        if not fname.endswith(suffix):
+            fname += suffix
+
+        return os.path.join(self.s3_cache_dir, fname)
+
 
     def _download_s3_to_path(self, s3_uri: str, local_path: str) -> None:
         """Download an S3 object to `local_path`.
@@ -648,30 +685,32 @@ class HelioNetCDFDataset(Dataset):
                     "Install them (e.g., pip install boto3) or (pip install s3fs fsspec)."
                 )
 
-            # Recommended for NetCDF/HDF5: download whole object to a local temp file,
-            # open locally (avoids many small S3 range reads), then delete immediately
-            # after data is loaded into memory.
+
+            # Recommended for NetCDF/HDF5: download whole object to a local file and open locally.
+            # Modified: keep a per-object cache on disk so repeated accesses do NOT re-download.
             if self.s3_download_to_temp:
-                tmp_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".nc",
-                        delete=False,
-                        dir=self.s3_temp_dir,
-                    ) as tmp:
-                        tmp_path = tmp.name
+                cache_path = self._s3_cache_path(filepath, suffix=".nc")
+                os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
 
-                    self._download_s3_to_path(filepath, tmp_path)
+                # Reuse cached file if it exists
+                if not os.path.exists(cache_path):
+                    tmp_path = cache_path + ".partial"
 
-                    with xr.open_dataset(tmp_path, engine="h5netcdf", chunks=None, cache=False) as ds:
-                        data = ds[channels].to_array().load().to_numpy()
-                    return data
-                finally:
-                    if tmp_path and os.path.exists(tmp_path):
+                    # Clean up any previous partial (e.g., from a crash)
+                    if os.path.exists(tmp_path):
                         try:
                             os.remove(tmp_path)
                         except OSError:
                             pass
+
+                    # Download to partial then atomically move into place
+                    self._download_s3_to_path(filepath, tmp_path)
+                    os.replace(tmp_path, cache_path)
+
+                with xr.open_dataset(cache_path, engine="h5netcdf", chunks=None, cache=False) as ds:
+                    data = ds[channels].to_array().load().to_numpy()
+                return data
+
 
             # If you explicitly want read-through caching rather than ephemeral temp files,
             # keep the existing fsspec/s3fs path.

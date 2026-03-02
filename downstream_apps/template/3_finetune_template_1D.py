@@ -14,6 +14,15 @@ Assumptions
 
 Usage
   CUDA_VISIBLE_DEVICES=6,7 python -m downstream_apps.template.3_finetune_template_1D --config /home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml --batch-size 2 --max-epochs 2
+
+S3 upload examples
+  # Upload immediately whenever a new best checkpoint is saved (stable key)
+  CUDA_VISIBLE_DEVICES=6,7 python -m downstream_apps.template.3_finetune_template_1D \
+      --config /home/amjlowlevel/surya_workshop/downstream_apps/template/configs/config_script.yaml \
+      --batch-size 2 --max-epochs 2 \
+      --s3_bucket my-ml-artifacts \
+      --s3_prefix flare/exp_001 \
+      --s3_best_key best.ckpt
 """
 
 from __future__ import annotations
@@ -31,17 +40,104 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
+
 def load_yaml(path: Union[str, Path]) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+class UploadBestCheckpointToS3(L.Callback):
+    """
+    Uploads to S3 as soon as ModelCheckpoint records a *new best* checkpoint.
+
+    - No-op unless --s3_bucket is provided
+    - Uploads only when best_model_path changes
+    - Only uploads from global rank 0 under DDP
+    - Uses a stable key by default (e.g. best.ckpt)
+    """
+
+    def __init__(
+        self,
+        checkpoint_cb: ModelCheckpoint,
+        bucket: str | None,
+        prefix: str = "",
+        fixed_key_name: str | None = "best.ckpt",
+    ):
+        super().__init__()
+        self.checkpoint_cb = checkpoint_cb
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+        self.fixed_key_name = fixed_key_name
+        self.last_uploaded_best = None
+        self._s3 = None
+
+    def _upload_if_new_best(self, trainer) -> None:
+        if not self.bucket:
+            return
+
+        # DDP safety: upload from rank 0 only
+        if hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
+            return
+
+        best_path = getattr(self.checkpoint_cb, "best_model_path", None)
+        if not best_path:
+            return
+
+        # Only upload if the best checkpoint changed
+        if best_path == self.last_uploaded_best:
+            return
+
+        ckpt_path = Path(best_path)
+        if not ckpt_path.exists():
+            return
+
+        if self._s3 is None:
+            try:
+                import boto3  # lazy import so local-only runs don't require boto3
+            except ImportError as e:
+                raise RuntimeError(
+                    "boto3 is required for S3 uploads. Install with: pip install boto3"
+                ) from e
+            self._s3 = boto3.client("s3")
+
+        object_name = self.fixed_key_name or ckpt_path.name
+        s3_key = f"{self.prefix}/{object_name}" if self.prefix else object_name
+
+        print(f"[S3] Uploading new best checkpoint: {ckpt_path} -> s3://{self.bucket}/{s3_key}")
+        self._s3.upload_file(str(ckpt_path), self.bucket, s3_key)
+        print("[S3] Upload complete.")
+
+        self.last_uploaded_best = str(ckpt_path)
+
+    def on_validation_end(self, trainer, pl_module) -> None:
+        self._upload_if_new_best(trainer)
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        # Final safety check/upload in case the last best update happens near fit end
+        self._upload_if_new_best(trainer)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="./configs/config.yaml")
     parser.add_argument("--max-epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size under DDP.")
-    parser.add_argument("--no-wandb", action="store_true")    
+    parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--train_baseline", action="store_true")
+
+    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to make file cache")
+
+    # checkpoint + optional S3 upload args
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Directory to save local checkpoints")
+    parser.add_argument("--s3_bucket", type=str, default=None, help="Optional S3 bucket for best checkpoint upload")
+    parser.add_argument("--s3_prefix", type=str, default="", help="Optional S3 key prefix (folder path)")
+    parser.add_argument(
+        "--s3_best_key",
+        type=str,
+        default="best.ckpt",
+        help='Stable S3 object name for latest best checkpoint (set "" to use local checkpoint filename)',
+    )
+
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("medium")
@@ -78,7 +174,7 @@ def main() -> None:
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         s3_use_simplecache=False,
-        s3_cache_dir="/tmp/helio_s3_cache",
+        s3_cache_dir=args.cache_dir,
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
@@ -86,6 +182,7 @@ def main() -> None:
         ds_time_column="start_time",
         ds_time_tolerance="4d",
         ds_match_direction="forward",
+        s3_download_to_temp=True,
     )
 
     train_dataset = FlareDSDataset(
@@ -131,10 +228,9 @@ def main() -> None:
         n_input_timestamps = config["model"]["time_embedding"]["time_dim"]
         n_channels = len(config["data"]["channels"])
 
-        model = RegressionFlareModel(n_input_timestamps*n_channels, config["data"]["channels"], scalers)        
+        model = RegressionFlareModel(n_input_timestamps * n_channels, config["data"]["channels"], scalers)
 
     else:
-
         from workshop_infrastructure.utils import apply_peft_lora
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
 
@@ -185,7 +281,6 @@ def main() -> None:
         # Optional: apply LoRA via config (mirrors notebook intent)
         model = apply_peft_lora(model, config)
 
-
     # Metrics + LightningModule
     metrics = {
         "train_loss": FlareMetrics("train_loss"),
@@ -218,6 +313,23 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Trainer (multi-GPU ready)
     # ---------------------------------------------------------------------
+    Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=args.ckpt_dir,
+        filename="best-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=False,
+    )
+
+    upload_cb = UploadBestCheckpointToS3(
+        checkpoint_cb=checkpoint_cb,
+        bucket=args.s3_bucket,
+        prefix=args.s3_prefix,
+        fixed_key_name=(args.s3_best_key or None),
+    )
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
@@ -226,11 +338,19 @@ def main() -> None:
         strategy="auto",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
         logger=loggers,
-        callbacks=[ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1)],
+        callbacks=[checkpoint_cb, upload_cb],
         log_every_n_steps=2,
     )
 
     trainer.fit(lit_model, train_loader, val_loader)
+
+    # Optional summary at end
+    if checkpoint_cb.best_model_path:
+        print(f"[CKPT] Best checkpoint: {checkpoint_cb.best_model_path}")
+        if checkpoint_cb.best_model_score is not None:
+            print(f"[CKPT] Best val_loss: {float(checkpoint_cb.best_model_score):.6f}")
+    else:
+        print("[CKPT] No best checkpoint was saved.")
 
 
 if __name__ == "__main__":
