@@ -75,7 +75,7 @@ Architecture: 2 spectral gating blocks + 8 long-short attention blocks.
 ### Downstream Fine-tuning Pattern
 
 Each downstream task follows this pattern:
-- `datasets/` — task dataset inheriting from `HelioNetCDFDatasetAWS` (see `workshop_infrastructure/datasets/helio_aws.py`)
+- `datasets/` — task dataset inheriting from `HelioNetCDFDataset` (see `workshop_infrastructure/datasets/helio.py`)
 - `models/` — task-specific head
 - `lightning_modules/` — PyTorch Lightning wrapper with loss and metrics
 - `metrics/` — custom metric implementations
@@ -91,7 +91,7 @@ PEFT LoRA is applied to attention and feed-forward layers (rank=8, alpha=8, drop
 ```
 NetCDF files (SDO, 4096×4096, 13 channels, 12-min cadence)
   ↓ CSV index (path, timestamp, label)  ←  data/indices/
-  ↓ HelioNetCDFDatasetAWS (fsspec simplecache for S3 → local)
+  ↓ HelioNetCDFDataset (local or S3; download-to-cache by default)
   ↓ Signum-log normalization: sign(x)*log(1+|x|) per channel
   ↓ DataLoader → HelioSpectformer1D → task head
 ```
@@ -111,7 +111,7 @@ DDP via PyTorch Lightning. Use `CUDA_VISIBLE_DEVICES` to select GPUs. FSDP is al
 | Purpose | Path |
 |---|---|
 | Core model architecture | `Surya/surya/models/helio_spectformer.py` |
-| Base dataset loader | `workshop_infrastructure/datasets/helio_aws.py` |
+| Base dataset loader | `workshop_infrastructure/datasets/helio.py` |
 | LoRA application utility | `workshop_infrastructure/utils.py` |
 | Downstream adapter model | `workshop_infrastructure/models/finetune_models.py` |
 | Fine-tuning entry point | `downstream_apps/template/3_finetune_template_1D.py` |
