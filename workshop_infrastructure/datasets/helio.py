@@ -231,7 +231,10 @@ class HelioNetCDFDataset(Dataset):
         sdo_data_root_path: Optional root directory prepended to relative local paths.
         s3_storage_options: Options forwarded to fsspec/s3fs (e.g., ``{'anon': True}`` for public buckets).
         s3_use_simplecache: If True, use fsspec simplecache for read-through S3 caching.
-        s3_cache_dir: Local directory for the S3 cache. Defaults to ``/tmp/helio_s3_cache``.
+        s3_cache_dir: **Required when reading from S3.** Local directory where S3 files are cached.
+            There is no default — you must set this explicitly. Each full-resolution SDO NetCDF file
+            is approximately 1 GB, so make sure the target filesystem has sufficient space
+            (budget ~1 GB × number of unique timesteps in your dataset).
         s3fs_kwargs: Additional kwargs passed to ``s3fs.S3FileSystem``.
         s3_download_to_temp: If True (recommended for NetCDF/HDF5), download each S3 object to a
             local file before opening. Avoids seekability issues with streaming reads.
@@ -259,7 +262,7 @@ class HelioNetCDFDataset(Dataset):
         # S3 options (only used when index contains s3:// URIs)
         s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = False,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str | None = None,
         s3fs_kwargs: dict | None = None,
         s3_download_to_temp: bool = True,
         s3_temp_dir: str | None = None,
@@ -283,6 +286,8 @@ class HelioNetCDFDataset(Dataset):
         self.s3fs_kwargs = s3fs_kwargs or {}
         self.s3_download_to_temp = s3_download_to_temp
         self.s3_temp_dir = s3_temp_dir if s3_temp_dir is not None else s3_cache_dir
+        # Note: s3_cache_dir is intentionally left as None here. Its presence is validated
+        # lazily in _load_s3_nc_data, so users with only local paths pay no cost.
         self.s3_boto3_max_concurrency = s3_boto3_max_concurrency
         self.s3_boto3_part_size_mb = s3_boto3_part_size_mb
         self._s3fs = None  # lazily initialized per process
@@ -470,6 +475,14 @@ class HelioNetCDFDataset(Dataset):
             raise ImportError(
                 "S3 support requires either 'boto3' or 'fsspec'+'s3fs'. "
                 "Install via: pip install boto3  or  pip install s3fs fsspec"
+            )
+
+        if self.s3_cache_dir is None:
+            raise ValueError(
+                "s3_cache_dir must be set when reading data from S3. "
+                "Each full-resolution SDO NetCDF file is approximately 1 GB, so choose a "
+                "filesystem with enough free space (budget ~1 GB × number of unique timesteps). "
+                "Example: s3_cache_dir='/scratch/my_project/helio_cache'"
             )
 
         if self.s3_download_to_temp:

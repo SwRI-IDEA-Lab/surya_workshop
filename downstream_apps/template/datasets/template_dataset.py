@@ -44,7 +44,7 @@ class FlareDSDataset(HelioNetCDFDataset):
         phase: str = "train",
         s3_storage_options: dict | None = None,
         s3_use_simplecache: bool = False,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_cache_dir: str | None = None,
         s3_download_to_temp: bool = True,
         # Downstream-specific parameters
         return_surya_stack: bool = True,
