@@ -53,16 +53,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # (assuming script_0_baseline_template_train.py is in downstream_apps/your_downstream/)
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 
-# Construct absolute paths to Surya and hfmds directories
-SURYA_DIR = os.path.join(PROJECT_ROOT, "Surya")
-
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-if SURYA_DIR not in sys.path:
-    sys.path.insert(0, SURYA_DIR)
 
 
-from surya.utils.data import build_scalers
+from workshop_infrastructure.utils import build_scalers
 
 from downstream_apps.template.datasets.template_dataset import FlareDSDataset
 from downstream_apps.template.models.simple_baseline import RegressionFlareModel

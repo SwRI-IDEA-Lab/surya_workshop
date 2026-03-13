@@ -4,12 +4,8 @@ from itertools import chain
 
 from torch.utils.checkpoint import checkpoint
 
-from surya.models.helio_spectformer import HelioSpectFormer
-
-from surya.models.embedding import (
-    LinearDecoder,
-    PerceiverDecoder,
-)
+from workshop_infrastructure.models.helio_spectformer import HelioSpectFormer
+from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDecoder
 
 class HelioSpectformer1D(HelioSpectFormer):
     def __init__(
