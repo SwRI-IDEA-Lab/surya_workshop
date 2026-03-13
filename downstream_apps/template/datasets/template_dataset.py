@@ -13,6 +13,10 @@ class FlareDSDataset(HelioNetCDFDataset):
     scalers, s3_cache_dir, etc.).
 
     Additional Args:
+        load_forecast_frames: If True, also load future Surya frames from S3/disk and include
+            ``forecast`` and ``lead_time_delta`` in the sample. Defaults to False because
+            flare forecasting uses its own label (``normalized_intensity``), not Surya's future frames.
+            Setting this to False avoids downloading the ~1 GB forecast files entirely.
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
             Set to False to return only the flare intensity label (useful for label inspection).
         max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
@@ -46,6 +50,7 @@ class FlareDSDataset(HelioNetCDFDataset):
         s3_use_simplecache: bool = False,
         s3_cache_dir: str | None = None,
         s3_download_to_temp: bool = True,
+        load_forecast_frames: bool = False,
         # Downstream-specific parameters
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
@@ -73,6 +78,7 @@ class FlareDSDataset(HelioNetCDFDataset):
             s3_use_simplecache=s3_use_simplecache,
             s3_cache_dir=s3_cache_dir,
             s3_download_to_temp=s3_download_to_temp,
+            load_forecast_frames=load_forecast_frames,
         )
 
         self.return_surya_stack = return_surya_stack

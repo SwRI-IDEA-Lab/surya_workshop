@@ -241,6 +241,11 @@ class HelioNetCDFDataset(Dataset):
         s3_temp_dir: Directory for downloaded S3 files. Defaults to ``s3_cache_dir``.
         s3_boto3_max_concurrency: Number of parallel threads for boto3 multipart downloads.
         s3_boto3_part_size_mb: Part size in MB for boto3 multipart downloads.
+        load_forecast_frames: If True (default), load both input and forecast frames and include
+            ``forecast`` and ``lead_time_delta`` in the returned sample. Set to False for downstream
+            tasks that supply their own target labels (e.g., flare intensity from a separate catalog),
+            so that future frames are never fetched from disk or S3. This also relaxes the index
+            validity check — only input-frame timestamps need to be present.
     """
 
     def __init__(
@@ -268,6 +273,7 @@ class HelioNetCDFDataset(Dataset):
         s3_temp_dir: str | None = None,
         s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
+        load_forecast_frames: bool = True,
     ):
         self.scalers = scalers
         self.phase = phase
@@ -291,6 +297,7 @@ class HelioNetCDFDataset(Dataset):
         self.s3_boto3_max_concurrency = s3_boto3_max_concurrency
         self.s3_boto3_part_size_mb = s3_boto3_part_size_mb
         self._s3fs = None  # lazily initialized per process
+        self.load_forecast_frames = load_forecast_frames
 
         self.channels = channels if channels is not None else [
             "0094", "0131", "0171", "0193", "0211", "0304", "0335", "hmi"
@@ -329,8 +336,15 @@ class HelioNetCDFDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _filter_valid_indices(self) -> list:
-        """Return the list of reference timesteps for which all required offsets are present."""
-        time_deltas = np.unique(self.time_delta_input_minutes + self.time_delta_target_minutes)
+        """Return the list of reference timesteps for which all required offsets are present.
+
+        When ``load_forecast_frames=False``, only input-frame offsets are checked, so the
+        index does not need to contain future timestamps.
+        """
+        if self.load_forecast_frames:
+            time_deltas = np.unique(self.time_delta_input_minutes + self.time_delta_target_minutes)
+        else:
+            time_deltas = np.unique(self.time_delta_input_minutes)
         return [
             ts for ts in self.index.index
             if all(ts + dt in self.index.index for dt in time_deltas)
@@ -370,12 +384,13 @@ class HelioNetCDFDataset(Dataset):
         Returns:
             Dictionary with keys:
                 ts (np.ndarray):               (C, T, H, W) — input frames
-                time_delta_input (np.ndarray): (T,) — input time offsets in hours
+                time_delta_input (np.ndarray): (T,) — input time offsets in hours (relative to "now")
+            When ``load_forecast_frames=True`` (default), also includes:
                 forecast (np.ndarray):         (C, L, H, W) — target frames
-                lead_time_delta (np.ndarray):  (L,) — forecast lead times in hours
+                lead_time_delta (np.ndarray):  (L,) — lead times in hours (negative = future)
             When ``use_latitude_in_learned_flow=True``, also includes:
                 input_latitudes (list[float])
-                forecast_latitude (list[float])
+                forecast_latitude (list[float])  — only when ``load_forecast_frames=True``
         """
         self._ensure_logger()
         self.logger.info(f"Retrieving index {idx}.")
@@ -386,55 +401,60 @@ class HelioNetCDFDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _get_index_data(self, idx: int) -> dict:
-        time_deltas = np.array(
+        reference_timestep = self.valid_indices[idx]
+
+        # Sample input time offsets and load input frames
+        input_time_deltas = np.array(
             sorted(random.sample(self.time_delta_input_minutes[:-1], self.n_input_timestamps - 1))
             + [self.time_delta_input_minutes[-1]]
-            + self.time_delta_target_minutes
         )
-        reference_timestep = self.valid_indices[idx]
-        required_timesteps = reference_timestep + time_deltas
-
-        sequence_data = [
-            self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
-            for ts in required_timesteps
-        ]
-
-        inputs = sequence_data[: -self.rollout_steps - 1]
-        targets = sequence_data[-self.rollout_steps - 1:]
-
-        stacked_inputs = np.stack(inputs, axis=1)
-        stacked_targets = np.stack(targets, axis=1)
+        input_timesteps = reference_timestep + input_time_deltas
+        stacked_inputs = np.stack(
+            [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
+             for ts in input_timesteps],
+            axis=1,
+        )
 
         if self.num_mask_aia_channels > 0 or self.drop_hmi_probability:
             stacked_inputs = self.masker(stacked_inputs)
 
-        if self.random_vert_flip and torch.bernoulli(torch.ones(()) / 2) == 1:
-            stacked_inputs = torch.flip(stacked_inputs, dims=[-2])
-            stacked_targets = torch.flip(stacked_targets, dims=[-2])
-
+        # "now" is the last input frame; all time deltas are relative to it
+        now_delta = input_time_deltas[-1]
         time_delta_input_float = (
-            (time_deltas[-self.rollout_steps - 2] - time_deltas[: -self.rollout_steps - 1])
-            / np.timedelta64(1, "h")
-        ).astype(np.float32)
-
-        lead_time_delta_float = (
-            (time_deltas[-self.rollout_steps - 2] - time_deltas[-self.rollout_steps - 1:])
-            / np.timedelta64(1, "h")
+            (now_delta - input_time_deltas) / np.timedelta64(1, "h")
         ).astype(np.float32)
 
         sample = {
             "ts": stacked_inputs,
             "time_delta_input": time_delta_input_float,
-            "forecast": stacked_targets,
-            "lead_time_delta": lead_time_delta_float,
         }
+
+        if self.load_forecast_frames:
+            target_time_deltas = np.array(self.time_delta_target_minutes)
+            target_timesteps = reference_timestep + target_time_deltas
+            stacked_targets = np.stack(
+                [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
+                 for ts in target_timesteps],
+                axis=1,
+            )
+            lead_time_delta_float = (
+                (now_delta - target_time_deltas) / np.timedelta64(1, "h")
+            ).astype(np.float32)
+            sample["forecast"] = stacked_targets
+            sample["lead_time_delta"] = lead_time_delta_float
+
+        if self.random_vert_flip and torch.bernoulli(torch.ones(()) / 2) == 1:
+            sample["ts"] = torch.flip(stacked_inputs, dims=[-2])
+            if self.load_forecast_frames:
+                sample["forecast"] = torch.flip(stacked_targets, dims=[-2])
 
         if self.use_latitude_in_learned_flow:
             from sunpy.coordinates.ephemeris import get_earth
 
-            latitudes = [get_earth(ts).lat.value for ts in required_timesteps]
-            sample["input_latitudes"] = latitudes[: -self.rollout_steps - 1]
-            sample["forecast_latitude"] = latitudes[-self.rollout_steps - 1:]
+            input_latitudes = [get_earth(ts).lat.value for ts in input_timesteps]
+            sample["input_latitudes"] = input_latitudes
+            if self.load_forecast_frames:
+                sample["forecast_latitude"] = [get_earth(ts).lat.value for ts in target_timesteps]
 
         return sample
 
