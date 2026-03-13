@@ -145,7 +145,6 @@ def main() -> None:
     # Mirror notebook sys.path adjustments
     script_dir = Path(__file__).resolve().parent
     sys.path.append(str((script_dir / "../../").resolve()))
-    sys.path.append(str((script_dir / "../../Surya").resolve()))
 
     # Determinism similar to typical Lightning usage
     L.seed_everything(42, workers=True)
@@ -156,7 +155,7 @@ def main() -> None:
     config = load_yaml(args.config)
     config["data"]["scalers"] = load_yaml(config["data"]["scalers_path"])
 
-    from surya.utils.data import build_scalers
+    from workshop_infrastructure.utils import build_scalers
     scalers = build_scalers(info=config["data"]["scalers"])
 
     # ---------------------------------------------------------------------
@@ -174,7 +173,7 @@ def main() -> None:
         use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
         scalers=scalers,
         s3_use_simplecache=False,
-        s3_cache_dir=args.cache_dir,
+        **({"s3_cache_dir": args.cache_dir} if args.cache_dir is not None else {}),
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
