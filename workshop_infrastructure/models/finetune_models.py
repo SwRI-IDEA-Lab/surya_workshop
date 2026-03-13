@@ -7,7 +7,19 @@ from torch.utils.checkpoint import checkpoint
 from workshop_infrastructure.models.helio_spectformer import HelioSpectFormer
 from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDecoder
 
+
+_VALID_POOLINGS = {"global_average", "global_max", "attention", "transformer", "class_token"}
+
+
 class HelioSpectformer1D(HelioSpectFormer):
+    """
+    Fine-tuning wrapper for 1D outputs (e.g. regression or classification).
+
+    Adds a pooling layer and a linear head on top of the HelioSpectFormer backbone.
+    All backbone parameters are passed through to HelioSpectFormer.__init__();
+    the parameters below the dividing comment are specific to the fine-tuning head.
+    """
+
     def __init__(
         self,
         img_size: int,
@@ -31,12 +43,13 @@ class HelioSpectformer1D(HelioSpectFormer):
         finetune: bool = False,
         nglo: int = 0,
         dtype: torch.dtype = torch.bfloat16,
-        # Put finetuning additions below this line
+        # --- Fine-tuning head ---
         dropout: float = 0.1,
         num_outputs: int = 1,
         num_penultimate_transformer_layers: int = 1,
         num_penultimate_heads: int = 8,
-        config=None,
+        pooling: str = "class_token",
+        penultimate_linear_layer: bool = True,
     ):
         super().__init__(
             img_size=img_size,
@@ -62,43 +75,18 @@ class HelioSpectformer1D(HelioSpectFormer):
             nglo=nglo,
         )
 
-        self.pooling_strategies = [
-            config["model"]["global_average_pooling"],
-            config["model"]["global_max_pooling"],
-            config["model"]["attention_pooling"],
-            config["model"]["transformer_pooling"],
-            config["model"]["global_class_token"],
-        ]
+        if pooling not in _VALID_POOLINGS:
+            raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
 
-        assert (
-            sum(self.pooling_strategies) == 1
-        ), "No or multiple pooling strategy selected. Aborting."
+        self.pooling = pooling
+        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
+        self.penultimate_linear_layer_enabled = penultimate_linear_layer
 
-        self.global_average_pooling = False
-        self.global_max_pooling = False
-        self.attention_pooling = False
-        self.transformer_pooling = False
-        self.penultimate_linear_layer = False
-        self.global_class_token = False
+        if pooling == "attention":
+            self.attn_pool = nn.MultiheadAttention(embed_dim, num_penultimate_heads, dropout=dropout)
 
-        if config["model"]["dropout"] is not None:
-            self.dropout_layer = nn.Dropout(config["model"]["dropout"])
-            self.dropout = True
-
-        if config["model"]["global_average_pooling"]:
-            self.global_average_pooling = True
-
-        elif config["model"]["global_max_pooling"]:
-            self.global_max_pooling = True
-
-        elif config["model"]["attention_pooling"]:
-            self.attention = nn.MultiheadAttention(
-                embed_dim=embed_dim, num_heads=num_penultimate_heads, dropout=dropout
-            )
-            self.attention_pooling = True
-
-        elif config["model"]["transformer_pooling"]:
-            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))  # (batch, 1, 1, token_dim)
+        elif pooling == "transformer":
+            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_penultimate_heads,
@@ -108,18 +96,12 @@ class HelioSpectformer1D(HelioSpectFormer):
             self.downstream_transformer = nn.TransformerEncoder(
                 encoder_layer, num_layers=num_penultimate_transformer_layers
             )
-            self.transformer_pooling = True
 
-        elif config["model"]["global_class_token"]:
+        elif pooling == "class_token":
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-            self.global_class_token = True
 
-        else:
-            raise Exception("No valid pooling strategy selected.")
-
-        if config["model"]["penultimate_linear_layer"]:
+        if penultimate_linear_layer:
             self.linear = nn.Linear(embed_dim, embed_dim)
-            self.penultimate_linear_layer = True
 
         self.unembed = nn.Linear(embed_dim, num_outputs)
 
@@ -129,91 +111,75 @@ class HelioSpectformer1D(HelioSpectFormer):
         B, C, T, H, W = x.shape
 
         if self.learned_flow:
-            y_hat_flow = self.learned_flow_model(batch)  # B, C, H, W
-            if any([param.requires_grad for param in self.learned_flow_model.parameters()]):
+            y_hat_flow = self.learned_flow_model(batch)
+            if any(param.requires_grad for param in self.learned_flow_model.parameters()):
                 return y_hat_flow
             else:
-                x = torch.concat((x, y_hat_flow.unsqueeze(2)), dim=2)  # B, C, T+1, H, W
+                x = torch.concat((x, y_hat_flow.unsqueeze(2)), dim=2)
                 if self.time_embedding["type"] == "perceiver":
                     dt = torch.cat((dt, batch["lead_time_delta"].reshape(-1, 1)), dim=1)
 
-        # embed the data
         tokens = self.embedding(x, dt)
 
         if self.ensemble:
             raise NotImplementedError(
-                "Use of CLS token has not been implemented with ensemble modifications."
+                "CLS token pooling has not been implemented with ensemble modifications."
             )
-        else:
-            noise = None
+        noise = None
 
-        # pass the time series through the encoder
         for i, blk in enumerate(
             chain(self.backbone.blocks_spectral_gating, self.backbone.blocks_attention)
         ):
             if i == self.backbone.n_spectral_blocks:
                 tokens = torch.cat(
-                    (
-                        self.cls_token.expand(B, 1, self.embed_dim),
-                        tokens,
-                    ),
+                    (self.cls_token.expand(B, 1, self.embed_dim), tokens),
                     dim=1,
                 )
-            if i in self.backbone._checkpoint_layers:
-                tokens = checkpoint(blk, tokens, noise, use_reentrant=False)
-            else:
-                tokens = blk(tokens, noise)
-        tokens = tokens[:, [0], :]
+            tokens = checkpoint(blk, tokens, noise, use_reentrant=False) if i in self.backbone._checkpoint_layers else blk(tokens, noise)
 
-        return tokens
+        return tokens[:, [0], :]
 
     def forward(self, batch):
-        if self.global_class_token:
+        if self.pooling == "class_token":
             tokens = self._forward_cls_token(batch)
         else:
             tokens = super().forward(batch=batch)
 
-        if self.dropout is not None:
+        if self.dropout_layer is not None:
             tokens = self.dropout_layer(tokens)
 
-        if self.penultimate_linear_layer:
+        if self.penultimate_linear_layer_enabled:
             tokens = self.linear(tokens)
 
-        # Global average pooling
-        if self.global_average_pooling:
-            agg_tokens = torch.mean(tokens, dim=1)  # (B, L, D) -> (B, D)
+        if self.pooling == "global_average":
+            agg_tokens = torch.mean(tokens, dim=1)
+        elif self.pooling == "global_max":
+            agg_tokens, _ = torch.max(tokens, dim=1)
+        elif self.pooling == "attention":
+            tokens = tokens.permute(1, 0, 2)
+            tokens, _ = self.attn_pool(query=tokens, key=tokens, value=tokens)
+            agg_tokens = tokens.sum(dim=0)
+        elif self.pooling == "transformer":
+            B = tokens.size(0)
+            tokens = torch.cat((self.cls_token.expand(B, -1, -1), tokens), dim=1)
+            tokens = self.downstream_transformer(tokens.permute(1, 0, 2))
+            agg_tokens = tokens[0, :, :]
+        elif self.pooling == "class_token":
+            agg_tokens = tokens.squeeze(dim=1)
 
-        # Global max pooling
-        if self.global_max_pooling:
-            agg_tokens, _ = torch.max(tokens, dim=1)  # (B, L, D) -> (B, D)
+        if self.dropout_layer is not None:
+            agg_tokens = self.dropout_layer(agg_tokens)
 
-        # Global attention pooling
-        if self.attention_pooling:
-            tokens = tokens.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-            tokens = self.attention(query=tokens, key=tokens, value=tokens)  # (L, B, D)
-            agg_tokens = tokens.sum(dim=0)  # (B, D)
-
-        if self.transformer_pooling:
-            batch_size = tokens.size(0)
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  #  (B, 1, D)
-            tokens = torch.cat((cls_tokens, tokens), dim=1)  #  (B, L+1, D)
-            tokens = tokens.permute(1, 0, 2)  # (B, L+1, D) -> (L+1, B, D)
-            tokens = self.downstream_transformer(tokens)  # (L+1, B, D)
-            agg_tokens = tokens[0, :, :]  # (B, D)
-
-        if self.global_class_token:
-            agg_tokens = torch.squeeze(tokens, dim=1)
-
-        if self.dropout is not None:
-            out = self.dropout_layer(agg_tokens)
-
-        out = self.unembed(agg_tokens)
-        out = out.squeeze(dim=1)
-
-        return out
+        return self.unembed(agg_tokens).squeeze(dim=1)
 
 
 class HelioSpectformer2D(HelioSpectFormer):
+    """
+    Fine-tuning wrapper for 2D outputs (e.g. image reconstruction or forecasting).
+
+    Adds a spatial decoder head on top of the HelioSpectFormer backbone.
+    """
+
     def __init__(
         self,
         img_size: int,
@@ -235,8 +201,9 @@ class HelioSpectformer2D(HelioSpectFormer):
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
         finetune: bool = False,
-        # Put finetuning additions below this line
-        config=None,
+        # --- Fine-tuning head ---
+        ft_unembedding_type: str = "linear",
+        ft_out_chans: int = 1,
     ):
         super().__init__(
             img_size=img_size,
@@ -260,30 +227,23 @@ class HelioSpectformer2D(HelioSpectFormer):
             finetune=finetune,
         )
 
-        match config["model"]["ft_unembedding_type"]:
-            case "linear":
-                self.unembed = LinearDecoder(
-                    patch_size=patch_size,
-                    out_chans=config["model"]["ft_out_chans"],
-                    embed_dim=embed_dim,
-                )
-            case "perceiver":
-                self.unembed = PerceiverDecoder(
-                    embed_dim=embed_dim,
-                    patch_size=patch_size,
-                    out_chans=config["model"]["ft_out_chans"],
-                )
-            case _:
-                raise NotImplementedError(
-                    f'Embedding {time_embedding["type"]} has not been implemented.'
-                )
+        if ft_unembedding_type == "linear":
+            self.unembed = LinearDecoder(
+                patch_size=patch_size,
+                out_chans=ft_out_chans,
+                embed_dim=embed_dim,
+            )
+        elif ft_unembedding_type == "perceiver":
+            self.unembed = PerceiverDecoder(
+                embed_dim=embed_dim,
+                patch_size=patch_size,
+                out_chans=ft_out_chans,
+            )
+        else:
+            raise ValueError(
+                f"ft_unembedding_type must be 'linear' or 'perceiver', got {ft_unembedding_type!r}"
+            )
 
     def forward(self, batch):
-
         tokens = super().forward(batch=batch)
-
-        # Unembed the tokens
-        # BE L D -> BE C H W
-        forecast_hat = self.unembed(tokens)
-
-        return forecast_hat
+        return self.unembed(tokens)  # (B, E, L, D) -> (B, C, H, W)
