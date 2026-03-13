@@ -51,8 +51,8 @@
               "--config", "/d0/amunozj/git_repos/surya_workshop/downstream_apps/template/configs/config_script.yaml",
               "--batch-size", "2",
               "--max-epochs", "2",
-              // "--cache_dir", "/d0/amunozj/surya_ws_cache",
-            //   "--train_baseline"
+              "--cache_dir", "/d0/amunozj/surya_ws_cache",
+              "--train_baseline"
             ]
         }              
     ]
