@@ -77,15 +77,24 @@ def class_from_name(module_name: str, class_name: str):
     return getattr(m, class_name)
 
 
-def build_scalers(info: dict) -> Dict:
-    """Reconstruct per-channel scaler objects from a scalers YAML dict.
+def build_scalers(info) -> Dict:
+    """Reconstruct per-channel scaler objects from a scalers YAML file or dict.
+
+    Args:
+        info: Path to a scalers YAML file, or an already-loaded dict.
 
     The YAML entries contain a 'base' module path and 'class' name that were
     recorded when the scalers were originally fitted (e.g. 'surya.datasets.transformations').
     We resolve the class from our local transformations module instead of the
     stored (now stale) module path.
     """
+    import yaml
     import workshop_infrastructure.datasets.transformations as _transformations
+
+    if not isinstance(info, dict):
+        with open(info, "r", encoding="utf-8") as f:
+            info = yaml.safe_load(f)
+
     ret_dict = {k: None for k in info.keys()}
     for p_key, p_val in info.items():
         cls = getattr(_transformations, p_val["class"])
@@ -94,49 +103,40 @@ def build_scalers(info: dict) -> Dict:
 
 def apply_peft_lora(
     model: torch.nn.Module,
-    config: dict,
+    lora_config,
 ) -> torch.nn.Module:
     """
-    Applies PEFT LoRA to the HelioSpectformer1D model
+    Applies PEFT LoRA adapters to a model.
 
     Args:
-        model: The HelioSpectformer1D model to apply LoRA to.
-        config: Configuration object containing LoRA settings.
-        logger: Standard python logging.Logger object.
+        model: The model to apply LoRA to.
+        lora_config: A LoraAdapterConfig dataclass or a plain dict with the
+                     same fields (r, lora_alpha, target_modules, lora_dropout, bias).
 
     Returns:
         Model with PEFT LoRA adapters applied.
     """
-    if "lora_config" not in config["model"].keys():
-        print("No LoRA configuration found. Using default LoRA settings.")
-        lora_config = {
-            "r": 8,  # LoRA rank
-            "lora_alpha": 8,  # LoRA alpha parameter
-            "target_modules": [
-                "q_proj",
-                "v_proj",
-                "k_proj",
-                "out_proj",
-                "fc1",
-                "fc2",
-            ],  # Target modules for LoRA
-            "lora_dropout": 0.1,
-            "bias": "none",
-        }
+    # Accept both a dataclass and a plain dict for flexibility.
+    if hasattr(lora_config, "__dataclass_fields__"):
+        cfg = lora_config
+        r, lora_alpha = cfg.r, cfg.lora_alpha
+        target_modules, lora_dropout, bias = cfg.target_modules, cfg.lora_dropout, cfg.bias
     else:
-        lora_config = config["model"]["lora_config"]
+        r = lora_config.get("r", 8)
+        lora_alpha = lora_config.get("lora_alpha", 8)
+        target_modules = lora_config.get("target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"])
+        lora_dropout = lora_config.get("lora_dropout", 0.1)
+        bias = lora_config.get("bias", "none")
 
-    print(f"Applying PEFT LoRA with configuration: {lora_config}")
+    print(f"Applying PEFT LoRA: r={r}, alpha={lora_alpha}, dropout={lora_dropout}, modules={target_modules}")
 
     # Create LoRA configuration
     peft_config = LoraConfig(
-        r=lora_config.get("r", 8),
-        lora_alpha=lora_config.get("lora_alpha", 8),
-        target_modules=lora_config.get(
-            "target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
-        ),
-        lora_dropout=lora_config.get("lora_dropout", 0.1),
-        bias=lora_config.get("bias", "none"),
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias=bias,
     )
 
     # Apply LoRA to the model

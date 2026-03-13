@@ -28,24 +28,19 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 import torch
-import yaml
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
+from downstream_apps.template.configs import TrainingConfig, load_config
 from downstream_apps.template.datasets.template_dataset import FlareDSDataset
 from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 from downstream_apps.template.metrics.template_metrics import FlareMetrics
 from workshop_infrastructure.utils import apply_peft_lora, build_scalers
-
-
-def load_yaml(path: str | Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -141,34 +136,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_datasets(
-    config: Dict[str, Any], args: argparse.Namespace
+    cfg: TrainingConfig, args: argparse.Namespace
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config."""
-    scalers = build_scalers(info=load_yaml(config["data"]["scalers_path"]))
+    scalers = build_scalers(info=cfg.data.scalers_path)
 
     common_ds_kwargs = dict(
-        time_delta_input_minutes=config["data"]["time_delta_input_minutes"],
-        time_delta_target_minutes=config["data"]["time_delta_target_minutes"],
-        n_input_timestamps=config["model"]["time_embedding"]["time_dim"],
-        rollout_steps=config["rollout_steps"],
-        channels=config["data"]["channels"],
-        drop_hmi_probability=config["drop_hmi_probability"],
-        use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
+        time_delta_input_minutes=cfg.data.time_delta_input_minutes,
+        time_delta_target_minutes=cfg.data.time_delta_target_minutes,
+        n_input_timestamps=cfg.model.time_embedding.time_dim,
+        rollout_steps=cfg.rollout_steps,
+        channels=cfg.data.channels,
+        drop_hmi_probability=cfg.drop_hmi_probability,
+        use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         scalers=scalers,
         s3_use_simplecache=False,
         s3_download_to_temp=True,
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
-        ds_flare_index_path=config["data"]["flare_index_path"],
+        ds_flare_index_path=cfg.data.flare_index_path,
         ds_time_column="start_time",
         ds_time_tolerance="4d",
         ds_match_direction="forward",
         **({"s3_cache_dir": args.cache_dir} if args.cache_dir is not None else {}),
     )
 
-    train_dataset = FlareDSDataset(index_path=config["data"]["train_data_path"], phase="train", **common_ds_kwargs)
-    val_dataset = FlareDSDataset(index_path=config["data"]["valid_data_path"], phase="val", **common_ds_kwargs)
+    train_dataset = FlareDSDataset(index_path=cfg.data.train_data_path, phase="train", **common_ds_kwargs)
+    val_dataset = FlareDSDataset(index_path=cfg.data.valid_data_path, phase="val", **common_ds_kwargs)
 
     loader_kwargs = dict(
         batch_size=args.batch_size,
@@ -184,7 +179,7 @@ def build_datasets(
     return train_loader, val_loader
 
 
-def build_model(config: Dict[str, Any], args: argparse.Namespace) -> L.LightningModule:
+def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningModule:
     """Instantiate the model and wrap it in a LightningModule."""
     metrics = {
         "train_loss": FlareMetrics("train_loss"),
@@ -194,44 +189,45 @@ def build_model(config: Dict[str, Any], args: argparse.Namespace) -> L.Lightning
 
     if args.train_baseline:
         from downstream_apps.template.models.simple_baseline import RegressionFlareModel
-        scalers = build_scalers(info=load_yaml(config["data"]["scalers_path"]))
-        n_input_timestamps = config["model"]["time_embedding"]["time_dim"]
-        n_channels = len(config["data"]["channels"])
-        model = RegressionFlareModel(n_input_timestamps * n_channels, config["data"]["channels"], scalers)
+        scalers = build_scalers(info=cfg.data.scalers_path)
+        n_input_timestamps = cfg.model.time_embedding.time_dim
+        n_channels = len(cfg.data.channels)
+        model = RegressionFlareModel(n_input_timestamps * n_channels, cfg.data.channels, scalers)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
+        m = cfg.model
         model = HelioSpectformer1D(
-            img_size=config["model"]["img_size"],
-            patch_size=config["model"]["patch_size"],
-            in_chans=config["model"]["in_channels"],
-            embed_dim=config["model"]["embed_dim"],
-            time_embedding=config["model"]["time_embedding"],
-            depth=config["model"]["depth"],
-            num_heads=config["model"]["num_heads"],
-            mlp_ratio=config["model"]["mlp_ratio"],
-            drop_rate=config["model"]["drop_rate"],
-            dtype=config["dtype"],
-            window_size=config["model"]["window_size"],
-            dp_rank=config["model"]["dp_rank"],
-            learned_flow=config["model"]["learned_flow"],
-            use_latitude_in_learned_flow=config["use_latitude_in_learned_flow"],
-            init_weights=config["model"]["init_weights"],
-            checkpoint_layers=config["model"]["checkpoint_layers"],
-            n_spectral_blocks=config["model"]["spectral_blocks"],
-            rpe=config["model"]["rpe"],
-            ensemble=config["model"]["ensemble"],
-            finetune=config["model"]["finetune"],
-            nglo=config["model"]["nglo"],
-            dropout=config["model"]["dropout"],
-            num_penultimate_transformer_layers=0,
-            num_penultimate_heads=0,
+            img_size=m.img_size,
+            patch_size=m.patch_size,
+            in_chans=m.in_channels,
+            embed_dim=m.embed_dim,
+            time_embedding=vars(m.time_embedding),
+            depth=m.depth,
+            num_heads=m.num_heads,
+            mlp_ratio=m.mlp_ratio,
+            drop_rate=m.drop_rate,
+            dtype=cfg.dtype,
+            window_size=m.window_size,
+            dp_rank=m.dp_rank,
+            learned_flow=m.learned_flow,
+            use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
+            init_weights=m.init_weights,
+            checkpoint_layers=m.checkpoint_layers,
+            n_spectral_blocks=m.spectral_blocks,
+            rpe=m.rpe,
+            ensemble=m.ensemble,
+            finetune=m.finetune,
+            nglo=m.nglo,
+            dropout=m.dropout,
             num_outputs=1,
-            config=config,
+            pooling=m.pooling,
+            penultimate_linear_layer=m.penultimate_linear_layer,
         )
-        _load_pretrained_weights(model, config.get("pretrained_path"))
-        model = apply_peft_lora(model, config)
+        _load_pretrained_weights(model, cfg.pretrained_path)
+        if m.use_lora:
+            model = apply_peft_lora(model, m.lora_config)
 
-    return FlareLightningModule(model, metrics, lr=config.get("learning_rate", 1e-3), batch_size=args.batch_size)
+    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size)
 
 
 def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None) -> None:
@@ -250,18 +246,18 @@ def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None
     model.load_state_dict(model_state, strict=True)
 
 
-def build_trainer(config: Dict[str, Any], args: argparse.Namespace) -> Tuple[L.Trainer, ModelCheckpoint]:
+def build_trainer(cfg: TrainingConfig, args: argparse.Namespace) -> Tuple[L.Trainer, ModelCheckpoint]:
     """Configure loggers, callbacks, and the Lightning Trainer."""
     loggers = []
     if not args.no_wandb:
         loggers.append(WandbLogger(
             entity="surya_handson",
-            project="template_flare_regression",
-            name="baseline_experiment_1",
+            project=cfg.wandb_project,
+            name=cfg.job_id,
             log_model=False,
             save_dir=os.environ.get("TMPDIR", "./wandb/wandb_tmp"),
         ))
-    loggers.append(CSVLogger("runs", name="simple_flare"))
+    loggers.append(CSVLogger("runs", name=cfg.job_id))
 
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
     checkpoint_cb = ModelCheckpoint(
@@ -301,10 +297,10 @@ def main() -> None:
     torch.set_float32_matmul_precision("medium")
     L.seed_everything(42, workers=True)
 
-    config = load_yaml(args.config)
-    train_loader, val_loader = build_datasets(config, args)
-    lit_model = build_model(config, args)
-    trainer, checkpoint_cb = build_trainer(config, args)
+    cfg = load_config(args.config)
+    train_loader, val_loader = build_datasets(cfg, args)
+    lit_model = build_model(cfg, args)
+    trainer, checkpoint_cb = build_trainer(cfg, args)
 
     trainer.fit(lit_model, train_loader, val_loader)
 
