@@ -38,7 +38,6 @@ class HelioSpectformer1D(nn.Module):
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
         ensemble: int | None = None,
-        finetune: bool = False,
         nglo: int = 0,
         dtype: torch.dtype = torch.bfloat16,
         # --- Fine-tuning head ---
@@ -168,7 +167,6 @@ class HelioSpectformer2D(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
-        finetune: bool = False,
         # --- Fine-tuning head ---
         ft_unembedding_type: str = "linear",
         ft_out_chans: int = 1,

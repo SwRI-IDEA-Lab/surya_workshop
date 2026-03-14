@@ -237,7 +237,6 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
             n_spectral_blocks=m.spectral_blocks,
             rpe=m.rpe,
             ensemble=m.ensemble,
-            finetune=m.finetune,
             nglo=m.nglo,
             dropout=m.dropout,
             num_outputs=1,

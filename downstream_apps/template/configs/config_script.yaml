@@ -28,7 +28,6 @@ model:
   init_weights: false
   checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   ensemble: null
-  finetune: true
   nglo: 1
   time_embedding:
     type: linear      # Options: linear, fourier, perceiver

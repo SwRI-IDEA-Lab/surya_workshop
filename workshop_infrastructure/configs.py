@@ -64,7 +64,6 @@ class ModelConfig:
     init_weights: bool = False
     checkpoint_layers: List[int] = field(default_factory=lambda: list(range(10)))
     ensemble: Optional[int] = None
-    finetune: bool = True
     nglo: int = 1
     time_embedding: TimeEmbeddingConfig = field(default_factory=TimeEmbeddingConfig)
 
