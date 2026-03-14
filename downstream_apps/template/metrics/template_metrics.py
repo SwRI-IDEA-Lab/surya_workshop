@@ -1,14 +1,15 @@
-import torch
-import torchmetrics as tm  # Lots of possible metrics in here https://lightning.ai/docs/torchmetrics/stable/all-metrics.html
-
 """
-Template metrics to be used for flare forecasting.  Within the FlareMetrics class,
-different methods are defined to calculate metrics for training loss, as well as evaluation
-metrics to report during training, and validation. The __call__ method allows for easy selection
-of the appropriate metric set based on the provided mode.
+Template metrics for flare forecasting.
+
+Within the FlareMetrics class, different methods are defined to calculate metrics for
+training loss, as well as evaluation metrics to report during training and validation.
+The __call__ method selects the appropriate metric set based on the provided mode.
 
 The loss names used in the dictionary keys are propagated during the logging.
 """
+
+import torch
+import torchmetrics as tm  # Lots of possible metrics in here https://lightning.ai/docs/torchmetrics/stable/all-metrics.html
 
 class FlareMetrics:
     def __init__(self, mode: str):
