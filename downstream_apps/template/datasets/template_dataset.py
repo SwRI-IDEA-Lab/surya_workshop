@@ -112,8 +112,10 @@ class FlareDSDataset(HelioNetCDFDataset):
         self.adjusted_length = len(self.valid_indices)
         self.df_valid_indices.set_index("valid_indices", inplace=True)
 
-        if max_number_of_samples is not None:
-            self.adjusted_length = min(self.adjusted_length, max_number_of_samples)
+        if max_number_of_samples is not None and max_number_of_samples < self.adjusted_length:
+            self.valid_indices = self.valid_indices[:max_number_of_samples]
+            self.df_valid_indices = self.df_valid_indices.iloc[:max_number_of_samples]
+            self.adjusted_length = max_number_of_samples
 
     def __len__(self):
         return self.adjusted_length

@@ -7,8 +7,11 @@ data:
   channels: ['aia94', 'aia131', 'aia171', 'aia193', 'aia211', 'aia304', 'aia335', 'aia1600', 'hmi_m', 'hmi_bx', 'hmi_by', 'hmi_bz', 'hmi_v']
   time_delta_input_minutes: [0]
   time_delta_target_minutes: 60
-  ## Downstream-specific
+  ## Downstream-specific label alignment
   flare_index_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/data/hek_flare_catalog.csv
+  ds_time_column: start_time    # Column in flare catalog used as the event timestamp
+  ds_time_tolerance: 4d         # Maximum allowed offset when matching Surya and flare timestamps
+  ds_match_direction: forward   # "forward": predict flares from prior solar state (causal)
 
 model:
   # Backbone

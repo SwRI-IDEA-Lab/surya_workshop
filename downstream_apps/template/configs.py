@@ -43,6 +43,10 @@ class DataConfig:
     time_delta_input_minutes: List[int]
     time_delta_target_minutes: int
     flare_index_path: str
+    # Downstream label-alignment parameters (passed to FlareDSDataset)
+    ds_time_column: str = "start_time"
+    ds_time_tolerance: str = "4d"
+    ds_match_direction: str = "forward"
 
 
 @dataclass

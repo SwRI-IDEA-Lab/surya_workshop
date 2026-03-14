@@ -123,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--train_baseline", action="store_true")
     parser.add_argument("--cache_dir", type=str, default=None, help="Directory for local file cache.")
+    parser.add_argument("--max-samples", type=int, default=None, help="Cap dataset size (useful for quick experiments).")
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Directory to save local checkpoints.")
     parser.add_argument("--s3_bucket", type=str, default=None, help="Optional S3 bucket for best-checkpoint upload.")
     parser.add_argument("--s3_prefix", type=str, default="", help="Optional S3 key prefix (folder path).")
@@ -168,12 +169,12 @@ def build_datasets(
         s3_download_to_temp=True,
         # Downstream-specific
         return_surya_stack=True,
-        max_number_of_samples=10,
+        max_number_of_samples=args.max_samples,
         label_transform=_flare_label_transform,
         ds_flare_index_path=cfg.data.flare_index_path,
-        ds_time_column="start_time",
-        ds_time_tolerance="4d",
-        ds_match_direction="forward",
+        ds_time_column=cfg.data.ds_time_column,
+        ds_time_tolerance=cfg.data.ds_time_tolerance,
+        ds_match_direction=cfg.data.ds_match_direction,
         **({"s3_cache_dir": args.cache_dir} if args.cache_dir is not None else {}),
     )
 
