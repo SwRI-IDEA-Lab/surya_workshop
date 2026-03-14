@@ -135,6 +135,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
+    """Normalize flare peak intensity for the template task.
+
+    Converts raw GOES intensity to a z-score-like label:
+      1. Take log10 (intensity values span many orders of magnitude).
+      2. Shift so the minimum is 0.
+      3. Scale by 2 * std so most values fall in [-1, 1].
+    """
+    import numpy as np
+    log_intensity = np.log10(intensity)
+    shifted = log_intensity - log_intensity.min()
+    return shifted / (2 * shifted.std())
+
+
 def build_datasets(
     cfg: TrainingConfig, args: argparse.Namespace
 ) -> Tuple[DataLoader, DataLoader]:
@@ -155,6 +169,7 @@ def build_datasets(
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=10,
+        label_transform=_flare_label_transform,
         ds_flare_index_path=cfg.data.flare_index_path,
         ds_time_column="start_time",
         ds_time_tolerance="4d",
@@ -188,11 +203,17 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
     }
 
     if args.train_baseline:
-        from downstream_apps.template.models.simple_baseline import RegressionFlareModel
+        from functools import partial
+        from downstream_apps.template.models.simple_baseline import (
+            RegressionFlareModel,
+            inverse_transform_channels,
+        )
         scalers = build_scalers(info=cfg.data.scalers_path)
         n_input_timestamps = cfg.model.time_embedding.time_dim
         n_channels = len(cfg.data.channels)
-        model = RegressionFlareModel(n_input_timestamps * n_channels, cfg.data.channels, scalers)
+        model = RegressionFlareModel(n_input_timestamps * n_channels)
+        preprocess_fn = partial(inverse_transform_channels, channel_order=cfg.data.channels, scalers=scalers)
+        return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
         m = cfg.model

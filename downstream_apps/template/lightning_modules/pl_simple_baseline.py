@@ -18,6 +18,11 @@ Key batch contract:
   - batch["ts"]       : torch.Tensor input stack (e.g., [B, C, T, H, W])
   - batch["forecast"] : torch.Tensor target values (e.g., [B] or [B,])
 
+Optional preprocessing:
+  - If ``preprocess_fn`` is provided to ``__init__``, it is called on the batch dict
+    before every model call. This is the intended hook for input transformations (such
+    as inverse-normalizing SDO channels) that should not live inside the model.
+
 Key metrics contract (the `metrics` dict passed to __init__):
   - metrics["train_loss"]    : callable(output, target) -> (loss_dict, weight_list)
   - metrics["train_metrics"] : callable(output, target) -> (metric_dict, weight_list)
@@ -80,6 +85,12 @@ class FlareLightningModule(L.LightningModule):
         Optional batch size passed to Lightning's `self.log(..., batch_size=...)`.
         This improves correct averaging behavior when using distributed settings
         or variable batch sizes.
+
+    preprocess_fn:
+        Optional callable applied to the batch dict before every model call.
+        Signature: ``(batch: dict) -> dict``. Use this to apply input
+        transformations (e.g., ``inverse_transform_channels``) without
+        embedding them in the model itself.
     """
 
     def __init__(
@@ -88,10 +99,12 @@ class FlareLightningModule(L.LightningModule):
         metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
         lr: float,
         batch_size: Optional[int] = None,
+        preprocess_fn: Optional[Callable[[Dict], Dict]] = None,
     ):
         super().__init__()
         self.batch_size = batch_size
         self.model = model
+        self.preprocess_fn = preprocess_fn
 
         # Loss callable: returns (loss_dict, weight_list)
         self.training_loss = metrics["train_loss"]
@@ -150,6 +163,8 @@ class FlareLightningModule(L.LightningModule):
         """
         target = batch["forecast"].unsqueeze(1).float()
 
+        if self.preprocess_fn is not None:
+            batch = self.preprocess_fn(batch)
         output = self(batch)
         training_losses, training_loss_weights = self.training_loss(output, target)
 
@@ -200,6 +215,8 @@ class FlareLightningModule(L.LightningModule):
         """
         target = batch["forecast"].unsqueeze(1).float()
 
+        if self.preprocess_fn is not None:
+            batch = self.preprocess_fn(batch)
         output = self(batch)
         val_losses, val_loss_weights = self.training_loss(output, target)
 

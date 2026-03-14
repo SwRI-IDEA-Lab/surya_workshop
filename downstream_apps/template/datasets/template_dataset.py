@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Literal
+from typing import Callable, Literal
 from workshop_infrastructure.datasets.helio import HelioNetCDFDataset
 
 
@@ -20,6 +20,11 @@ class FlareDSDataset(HelioNetCDFDataset):
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
             Set to False to return only the flare intensity label (useful for label inspection).
         max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
+        label_transform: Optional callable applied to the ``intensity`` column of the flare index
+            to produce the ``normalized_intensity`` label. Signature:
+            ``(series: pd.Series) -> pd.Series``.  If ``None``, the raw intensity values are
+            used as-is. Define this at the call site (e.g., in ``build_datasets()``) to keep
+            normalization logic out of the dataset class.
         ds_flare_index_path: Path to the downstream flare intensity CSV index.
         ds_time_column: Column name in the flare index to use as the event timestamp.
         ds_time_tolerance: Maximum allowed time offset when matching Surya and DS indices
@@ -54,6 +59,7 @@ class FlareDSDataset(HelioNetCDFDataset):
         # Downstream-specific parameters
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
+        label_transform: Callable[[pd.Series], pd.Series] | None = None,
         ds_flare_index_path: str | None = None,
         ds_time_column: str | None = None,
         ds_time_tolerance: str | None = None,
@@ -94,14 +100,11 @@ class FlareDSDataset(HelioNetCDFDataset):
         ).values.astype("datetime64[ns]")
         self.ds_index.sort_values("ds_index", inplace=True)
 
-        # Implement normalization.  This is going to be DS application specific, no two will look the same
-        self.ds_index["normalized_intensity"] = np.log10(self.ds_index["intensity"])
-        self.ds_index["normalized_intensity"] = self.ds_index[
-            "normalized_intensity"
-        ] - np.min(self.ds_index["normalized_intensity"])
-        self.ds_index["normalized_intensity"] = self.ds_index[
-            "normalized_intensity"
-        ] / (2 * np.std(self.ds_index["normalized_intensity"]))
+        # Apply label transform if provided; otherwise use raw intensity values.
+        if label_transform is not None:
+            self.ds_index["normalized_intensity"] = label_transform(self.ds_index["intensity"])
+        else:
+            self.ds_index["normalized_intensity"] = self.ds_index["intensity"]
 
         # Create Surya valid indices and find closest match to DS index
         self.df_valid_indices = pd.DataFrame(
