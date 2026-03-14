@@ -7,13 +7,7 @@ import torch
 import torch.distributed as dist
 from peft import LoraConfig, get_peft_model
 
-from packaging.version import Version
-import wandb
-
-if Version(wandb.__version__) < Version("0.20.0"):
-    _WANDB_USE_SYNC = True
-else:
-    _WANDB_USE_SYNC = False
+from workshop_infrastructure.configs import LoraAdapterConfig
 
 
 # ---------------------------------------------------------------------------
@@ -56,17 +50,6 @@ def create_logger(output_dir: str, dist_rank: int, name: str) -> logging.Logger:
     return logger
 
 
-def log(run, data: dict, step=None, commit=None) -> None:
-    """Thin wrapper around wandb.run.log that handles API version differences."""
-    if run is not None:
-        if _WANDB_USE_SYNC:
-            run.log(data, step, commit)
-        else:
-            run.log(data, step, commit)
-    else:
-        print(data)
-
-
 # ---------------------------------------------------------------------------
 # Scaler utilities
 # ---------------------------------------------------------------------------
@@ -101,45 +84,34 @@ def build_scalers(info) -> Dict:
         ret_dict[p_key] = cls.from_dict(p_val)
     return ret_dict
 
+
 def apply_peft_lora(
     model: torch.nn.Module,
-    lora_config,
+    lora_config: LoraAdapterConfig,
 ) -> torch.nn.Module:
     """
     Applies PEFT LoRA adapters to a model.
 
     Args:
         model: The model to apply LoRA to.
-        lora_config: A LoraAdapterConfig dataclass or a plain dict with the
-                     same fields (r, lora_alpha, target_modules, lora_dropout, bias).
+        lora_config: A LoraAdapterConfig instance (from workshop_infrastructure.configs).
 
     Returns:
         Model with PEFT LoRA adapters applied.
     """
-    # Accept both a dataclass and a plain dict for flexibility.
-    if hasattr(lora_config, "__dataclass_fields__"):
-        cfg = lora_config
-        r, lora_alpha = cfg.r, cfg.lora_alpha
-        target_modules, lora_dropout, bias = cfg.target_modules, cfg.lora_dropout, cfg.bias
-    else:
-        r = lora_config.get("r", 8)
-        lora_alpha = lora_config.get("lora_alpha", 8)
-        target_modules = lora_config.get("target_modules", ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"])
-        lora_dropout = lora_config.get("lora_dropout", 0.1)
-        bias = lora_config.get("bias", "none")
-
-    print(f"Applying PEFT LoRA: r={r}, alpha={lora_alpha}, dropout={lora_dropout}, modules={target_modules}")
-
-    # Create LoRA configuration
-    peft_config = LoraConfig(
-        r=r,
-        lora_alpha=lora_alpha,
-        target_modules=target_modules,
-        lora_dropout=lora_dropout,
-        bias=bias,
+    print(
+        f"Applying PEFT LoRA: r={lora_config.r}, alpha={lora_config.lora_alpha}, "
+        f"dropout={lora_config.lora_dropout}, modules={lora_config.target_modules}"
     )
 
-    # Apply LoRA to the model
+    peft_config = LoraConfig(
+        r=lora_config.r,
+        lora_alpha=lora_config.lora_alpha,
+        target_modules=lora_config.target_modules,
+        lora_dropout=lora_config.lora_dropout,
+        bias=lora_config.bias,
+    )
+
     model = get_peft_model(model, peft_config)
 
     # Log the number of trainable parameters
