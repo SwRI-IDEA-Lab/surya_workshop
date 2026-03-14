@@ -35,75 +35,12 @@ from downstream_apps.template.configs import TrainingConfig, load_config
 from downstream_apps.template.datasets.template_dataset import FlareDSDataset
 from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 from downstream_apps.template.metrics.template_metrics import FlareMetrics
-from workshop_infrastructure.utils import apply_peft_lora, build_scalers
-
-
-# ---------------------------------------------------------------------------
-# S3 upload callback
-# ---------------------------------------------------------------------------
-
-class UploadBestCheckpointToS3(L.Callback):
-    """
-    Uploads the best checkpoint to S3 whenever ModelCheckpoint records a new best.
-
-    - No-op unless output.s3_bucket is set in the config.
-    - Only runs from global rank 0 under DDP.
-    - Uses a stable S3 key (output.s3_best_key) so the latest best is always
-      at a predictable location.
-    """
-
-    def __init__(
-        self,
-        checkpoint_cb: ModelCheckpoint,
-        bucket: str | None,
-        prefix: str = "",
-        fixed_key_name: str | None = "best.ckpt",
-    ):
-        super().__init__()
-        self.checkpoint_cb = checkpoint_cb
-        self.bucket = bucket
-        self.prefix = prefix.strip("/")
-        self.fixed_key_name = fixed_key_name
-        self.last_uploaded_best = None
-        self._s3 = None
-
-    def _upload_if_new_best(self, trainer) -> None:
-        if not self.bucket:
-            return
-        if hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
-            return
-
-        best_path = getattr(self.checkpoint_cb, "best_model_path", None)
-        if not best_path or best_path == self.last_uploaded_best:
-            return
-
-        ckpt_path = Path(best_path)
-        if not ckpt_path.exists():
-            return
-
-        if self._s3 is None:
-            try:
-                import boto3
-            except ImportError as e:
-                raise RuntimeError(
-                    "boto3 is required for S3 uploads. Install with: pip install boto3"
-                ) from e
-            self._s3 = boto3.client("s3")
-
-        object_name = self.fixed_key_name or ckpt_path.name
-        s3_key = f"{self.prefix}/{object_name}" if self.prefix else object_name
-
-        print(f"[S3] Uploading {ckpt_path} -> s3://{self.bucket}/{s3_key}")
-        self._s3.upload_file(str(ckpt_path), self.bucket, s3_key)
-        print("[S3] Upload complete.")
-        self.last_uploaded_best = str(ckpt_path)
-
-    def on_validation_end(self, trainer, pl_module) -> None:
-        self._upload_if_new_best(trainer)
-
-    def on_fit_end(self, trainer, pl_module) -> None:
-        # Final check in case the last best update happens near fit end.
-        self._upload_if_new_best(trainer)
+from workshop_infrastructure.utils import (
+    apply_peft_lora,
+    build_scalers,
+    load_pretrained_weights,
+    UploadBestCheckpointToS3,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +60,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int, default=None,
                         help="Override max_epochs from the config YAML.")
     return parser.parse_args()
+
+
+def _ensure_assets(cfg: TrainingConfig) -> None:
+    """Download scalers and model weights from HuggingFace if not already present.
+
+    Checks the paths declared in the config and fetches only the missing files,
+    so users who ran the notebooks first (and already have the files) pay no cost.
+    """
+    from pathlib import Path
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to download assets. "
+            "Install it with: pip install huggingface_hub"
+        ) from e
+
+    assets_to_fetch = [
+        (cfg.data.scalers_path, "nasa-ibm-ai4science/core-sdo", "dataset", "scalers.yaml"),
+    ]
+    if cfg.pretrained_path:
+        assets_to_fetch.append(
+            (cfg.pretrained_path, "nasa-ibm-ai4science/Surya-1.0", "model", "surya.366m.v1.pt")
+        )
+
+    for local_path, repo_id, repo_type, filename in assets_to_fetch:
+        if Path(local_path).exists():
+            continue
+        print(f"[assets] {Path(local_path).name} not found — downloading from {repo_id} ...")
+        dest_dir = Path(local_path).parent
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            filename=filename,
+            local_dir=str(dest_dir),
+        )
+        print(f"[assets] Saved to {local_path}")
 
 
 def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
@@ -211,38 +186,11 @@ def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.Lightnin
             dtype=cfg.dtype,
             use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         )
-        _load_pretrained_weights(model, cfg.pretrained_path)
+        load_pretrained_weights(model, cfg.pretrained_path)
         if cfg.model.use_lora:
             model = apply_peft_lora(model, cfg.model.lora_config)
 
     return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
-
-
-def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None) -> None:
-    """Load pretrained weights into model, skipping shape-mismatched keys.
-
-    The pretrained checkpoint was saved from HelioSpectFormer directly, so its
-    keys are flat (e.g. ``embedding.proj.weight``).  The composed fine-tuning
-    models nest that backbone under ``backbone.*``, so we try both the original
-    key and the ``backbone.``-prefixed key when matching against the current
-    model's state dict.
-    """
-    if not pretrained_path:
-        return
-    print(f"Loading pretrained weights from {pretrained_path}.")
-    model_state = model.state_dict()
-    checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
-
-    # Build a remapped view that also tries the backbone. prefix.
-    remapped = {}
-    for k, v in checkpoint_state.items():
-        for candidate in (k, f"backbone.{k}"):
-            if candidate in model_state and hasattr(v, "shape") and v.shape == model_state[candidate].shape:
-                remapped[candidate] = v
-                break
-
-    model_state.update(remapped)
-    model.load_state_dict(model_state, strict=True)
 
 
 def build_trainer(
@@ -303,6 +251,7 @@ def main() -> None:
     L.seed_everything(42, workers=True)
 
     cfg = load_config(args.config)
+    _ensure_assets(cfg)
     train_loader, val_loader = build_datasets(cfg)
     lit_model = build_model(cfg, train_baseline=args.train_baseline)
     trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
