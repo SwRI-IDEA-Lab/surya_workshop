@@ -1,4 +1,12 @@
+from __future__ import annotations
+
+import dataclasses
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from workshop_infrastructure.configs import ModelConfig
 from torch import nn
 
 from workshop_infrastructure.models.helio_spectformer import HelioSpectFormer
@@ -138,6 +146,39 @@ class HelioSpectformer1D(nn.Module):
 
         return self.unembed(agg_tokens).squeeze(dim=1)
 
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer1D":
+        """Construct from a ModelConfig, with optional field overrides.
+
+        Fields that live outside ModelConfig (e.g. ``dtype``,
+        ``use_latitude_in_learned_flow``) should be supplied via ``overrides``.
+        """
+        kwargs = dict(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_channels,
+            embed_dim=cfg.embed_dim,
+            time_embedding=dataclasses.asdict(cfg.time_embedding),
+            depth=cfg.depth,
+            n_spectral_blocks=cfg.spectral_blocks,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            drop_rate=cfg.drop_rate,
+            window_size=cfg.window_size,
+            dp_rank=cfg.dp_rank,
+            learned_flow=cfg.learned_flow,
+            init_weights=cfg.init_weights,
+            checkpoint_layers=cfg.checkpoint_layers,
+            rpe=cfg.rpe,
+            ensemble=cfg.ensemble,
+            nglo=cfg.nglo,
+            dropout=cfg.dropout,
+            pooling=cfg.pooling,
+            penultimate_linear_layer=cfg.penultimate_linear_layer,
+        )
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
 
 class HelioSpectformer2D(nn.Module):
     """
@@ -215,3 +256,32 @@ class HelioSpectformer2D(nn.Module):
     def forward(self, batch):
         tokens = self.backbone.forward(batch)
         return self.unembed(tokens)  # (B, L, D) -> (B, C, H, W)
+
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer2D":
+        """Construct from a ModelConfig, with optional field overrides.
+
+        Fields that live outside ModelConfig (e.g. ``dtype``,
+        ``use_latitude_in_learned_flow``, ``ft_unembedding_type``,
+        ``ft_out_chans``) should be supplied via ``overrides``.
+        """
+        kwargs = dict(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_channels,
+            embed_dim=cfg.embed_dim,
+            time_embedding=dataclasses.asdict(cfg.time_embedding),
+            depth=cfg.depth,
+            n_spectral_blocks=cfg.spectral_blocks,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            drop_rate=cfg.drop_rate,
+            window_size=cfg.window_size,
+            dp_rank=cfg.dp_rank,
+            learned_flow=cfg.learned_flow,
+            init_weights=cfg.init_weights,
+            checkpoint_layers=cfg.checkpoint_layers,
+            rpe=cfg.rpe,
+        )
+        kwargs.update(overrides)
+        return cls(**kwargs)

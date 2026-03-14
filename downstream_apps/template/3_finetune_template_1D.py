@@ -216,36 +216,15 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
         return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
-        m = cfg.model
-        model = HelioSpectformer1D(
-            img_size=m.img_size,
-            patch_size=m.patch_size,
-            in_chans=m.in_channels,
-            embed_dim=m.embed_dim,
-            time_embedding=vars(m.time_embedding),
-            depth=m.depth,
-            num_heads=m.num_heads,
-            mlp_ratio=m.mlp_ratio,
-            drop_rate=m.drop_rate,
-            dtype=cfg.dtype,
-            window_size=m.window_size,
-            dp_rank=m.dp_rank,
-            learned_flow=m.learned_flow,
-            use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
-            init_weights=m.init_weights,
-            checkpoint_layers=m.checkpoint_layers,
-            n_spectral_blocks=m.spectral_blocks,
-            rpe=m.rpe,
-            ensemble=m.ensemble,
-            nglo=m.nglo,
-            dropout=m.dropout,
+        model = HelioSpectformer1D.from_config(
+            cfg.model,
             num_outputs=1,
-            pooling=m.pooling,
-            penultimate_linear_layer=m.penultimate_linear_layer,
+            dtype=cfg.dtype,
+            use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         )
         _load_pretrained_weights(model, cfg.pretrained_path)
-        if m.use_lora:
-            model = apply_peft_lora(model, m.lora_config)
+        if cfg.model.use_lora:
+            model = apply_peft_lora(model, cfg.model.lora_config)
 
     return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size)
 
