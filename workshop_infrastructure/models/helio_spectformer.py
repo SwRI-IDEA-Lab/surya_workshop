@@ -1,6 +1,8 @@
 import torch
 from einops import rearrange
+from itertools import chain
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 import numpy as np
 
@@ -238,6 +240,57 @@ class HelioSpectFormer(nn.Module):
                             c_out += 1
                 if module[0].bias is not None:
                     module[0].bias.data.zero_()
+
+    def forward_with_cls_token(self, batch, cls_token: torch.nn.Parameter) -> torch.Tensor:
+        """Run the backbone with a CLS token injected between spectral and attention blocks.
+
+        The CLS token is inserted at the boundary between spectral gating blocks and
+        attention blocks so that it attends over all patch tokens. Only the CLS token
+        output is returned.
+
+        Args:
+            batch: Dictionary with keys ``ts`` (B, C, T, H, W) and ``time_delta_input`` (B, T).
+            cls_token: Learnable CLS token parameter of shape (1, 1, embed_dim).
+
+        Returns:
+            Tensor of shape (B, 1, embed_dim) — the CLS token after the full forward pass.
+        """
+        x = batch["ts"]
+        dt = batch["time_delta_input"]
+        B = x.shape[0]
+
+        if self.learned_flow:
+            y_hat_flow = self.learned_flow_model(batch)
+            if any(param.requires_grad for param in self.learned_flow_model.parameters()):
+                return y_hat_flow
+            else:
+                x = torch.concat((x, y_hat_flow.unsqueeze(2)), dim=2)
+                if self.time_embedding["type"] == "perceiver":
+                    dt = torch.cat((dt, batch["lead_time_delta"].reshape(-1, 1)), dim=1)
+
+        tokens = self.embedding(x, dt)
+
+        if self.ensemble:
+            raise NotImplementedError(
+                "CLS token pooling has not been implemented with ensemble modifications."
+            )
+
+        noise = None
+        for i, blk in enumerate(
+            chain(self.backbone.blocks_spectral_gating, self.backbone.blocks_attention)
+        ):
+            if i == self.backbone.n_spectral_blocks:
+                tokens = torch.cat(
+                    (cls_token.expand(B, 1, self.embed_dim), tokens),
+                    dim=1,
+                )
+            tokens = (
+                checkpoint(blk, tokens, noise, use_reentrant=False)
+                if i in self.backbone._checkpoint_layers
+                else blk(tokens, noise)
+            )
+
+        return tokens[:, [0], :]
 
     def forward(self, batch):
         """

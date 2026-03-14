@@ -231,18 +231,29 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
 
 
 def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None) -> None:
-    """Load pretrained weights into model, skipping shape-mismatched keys."""
+    """Load pretrained weights into model, skipping shape-mismatched keys.
+
+    The pretrained checkpoint was saved from HelioSpectFormer directly, so its
+    keys are flat (e.g. ``embedding.proj.weight``).  The composed fine-tuning
+    models nest that backbone under ``backbone.*``, so we try both the original
+    key and the ``backbone.``-prefixed key when matching against the current
+    model's state dict.
+    """
     if not pretrained_path:
         return
     print(f"Loading pretrained weights from {pretrained_path}.")
     model_state = model.state_dict()
     checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
-    compatible = {
-        k: v
-        for k, v in checkpoint_state.items()
-        if k in model_state and hasattr(v, "shape") and v.shape == model_state[k].shape
-    }
-    model_state.update(compatible)
+
+    # Build a remapped view that also tries the backbone. prefix.
+    remapped = {}
+    for k, v in checkpoint_state.items():
+        for candidate in (k, f"backbone.{k}"):
+            if candidate in model_state and hasattr(v, "shape") and v.shape == model_state[candidate].shape:
+                remapped[candidate] = v
+                break
+
+    model_state.update(remapped)
     model.load_state_dict(model_state, strict=True)
 
 

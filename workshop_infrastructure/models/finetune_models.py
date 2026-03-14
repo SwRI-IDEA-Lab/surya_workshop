@@ -1,8 +1,5 @@
 import torch
 from torch import nn
-from itertools import chain
-
-from torch.utils.checkpoint import checkpoint
 
 from workshop_infrastructure.models.helio_spectformer import HelioSpectFormer
 from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDecoder
@@ -11,17 +8,18 @@ from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDec
 _VALID_POOLINGS = {"global_average", "global_max", "attention", "transformer", "class_token"}
 
 
-class HelioSpectformer1D(HelioSpectFormer):
+class HelioSpectformer1D(nn.Module):
     """
     Fine-tuning wrapper for 1D outputs (e.g. regression or classification).
 
-    Adds a pooling layer and a linear head on top of the HelioSpectFormer backbone.
-    All backbone parameters are passed through to HelioSpectFormer.__init__();
-    the parameters below the dividing comment are specific to the fine-tuning head.
+    Holds a frozen-or-trainable HelioSpectFormer backbone and adds a pooling
+    layer plus a linear head on top. Only the head-specific parameters are
+    defined here; all backbone parameters are forwarded to HelioSpectFormer.
     """
 
     def __init__(
         self,
+        # --- Backbone ---
         img_size: int,
         patch_size: int,
         in_chans: int,
@@ -51,7 +49,12 @@ class HelioSpectformer1D(HelioSpectFormer):
         pooling: str = "class_token",
         penultimate_linear_layer: bool = True,
     ):
-        super().__init__(
+        super().__init__()
+
+        if pooling not in _VALID_POOLINGS:
+            raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
+
+        self.backbone = HelioSpectFormer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
@@ -70,15 +73,13 @@ class HelioSpectformer1D(HelioSpectFormer):
             checkpoint_layers=checkpoint_layers,
             rpe=rpe,
             ensemble=ensemble,
-            finetune=finetune,
+            finetune=True,  # always strip the pretraining decoder
             dtype=dtype,
             nglo=nglo,
         )
 
-        if pooling not in _VALID_POOLINGS:
-            raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
-
         self.pooling = pooling
+        self.embed_dim = embed_dim
         self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
         self.penultimate_linear_layer_enabled = penultimate_linear_layer
 
@@ -105,45 +106,11 @@ class HelioSpectformer1D(HelioSpectFormer):
 
         self.unembed = nn.Linear(embed_dim, num_outputs)
 
-    def _forward_cls_token(self, batch):
-        x = batch["ts"]
-        dt = batch["time_delta_input"]
-        B, C, T, H, W = x.shape
-
-        if self.learned_flow:
-            y_hat_flow = self.learned_flow_model(batch)
-            if any(param.requires_grad for param in self.learned_flow_model.parameters()):
-                return y_hat_flow
-            else:
-                x = torch.concat((x, y_hat_flow.unsqueeze(2)), dim=2)
-                if self.time_embedding["type"] == "perceiver":
-                    dt = torch.cat((dt, batch["lead_time_delta"].reshape(-1, 1)), dim=1)
-
-        tokens = self.embedding(x, dt)
-
-        if self.ensemble:
-            raise NotImplementedError(
-                "CLS token pooling has not been implemented with ensemble modifications."
-            )
-        noise = None
-
-        for i, blk in enumerate(
-            chain(self.backbone.blocks_spectral_gating, self.backbone.blocks_attention)
-        ):
-            if i == self.backbone.n_spectral_blocks:
-                tokens = torch.cat(
-                    (self.cls_token.expand(B, 1, self.embed_dim), tokens),
-                    dim=1,
-                )
-            tokens = checkpoint(blk, tokens, noise, use_reentrant=False) if i in self.backbone._checkpoint_layers else blk(tokens, noise)
-
-        return tokens[:, [0], :]
-
     def forward(self, batch):
         if self.pooling == "class_token":
-            tokens = self._forward_cls_token(batch)
+            tokens = self.backbone.forward_with_cls_token(batch, self.cls_token)
         else:
-            tokens = super().forward(batch=batch)
+            tokens = self.backbone.forward(batch)
 
         if self.dropout_layer is not None:
             tokens = self.dropout_layer(tokens)
@@ -173,15 +140,16 @@ class HelioSpectformer1D(HelioSpectFormer):
         return self.unembed(agg_tokens).squeeze(dim=1)
 
 
-class HelioSpectformer2D(HelioSpectFormer):
+class HelioSpectformer2D(nn.Module):
     """
     Fine-tuning wrapper for 2D outputs (e.g. image reconstruction or forecasting).
 
-    Adds a spatial decoder head on top of the HelioSpectFormer backbone.
+    Holds a HelioSpectFormer backbone and adds a spatial decoder head on top.
     """
 
     def __init__(
         self,
+        # --- Backbone ---
         img_size: int,
         patch_size: int,
         in_chans: int,
@@ -205,7 +173,9 @@ class HelioSpectformer2D(HelioSpectFormer):
         ft_unembedding_type: str = "linear",
         ft_out_chans: int = 1,
     ):
-        super().__init__(
+        super().__init__()
+
+        self.backbone = HelioSpectFormer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
@@ -224,7 +194,7 @@ class HelioSpectformer2D(HelioSpectFormer):
             dtype=dtype,
             checkpoint_layers=checkpoint_layers,
             rpe=rpe,
-            finetune=finetune,
+            finetune=True,  # always strip the pretraining decoder
         )
 
         if ft_unembedding_type == "linear":
@@ -245,5 +215,5 @@ class HelioSpectformer2D(HelioSpectFormer):
             )
 
     def forward(self, batch):
-        tokens = super().forward(batch=batch)
-        return self.unembed(tokens)  # (B, E, L, D) -> (B, C, H, W)
+        tokens = self.backbone.forward(batch)
+        return self.unembed(tokens)  # (B, L, D) -> (B, C, H, W)
