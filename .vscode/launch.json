@@ -52,7 +52,8 @@
               "--batch-size", "2",
               "--max-epochs", "2",
               "--cache_dir", "/d0/amunozj/surya_ws_cache",
-              "--train_baseline"
+              "--max-samples", "10",
+              // "--train_baseline"
             ]
         }              
     ]
