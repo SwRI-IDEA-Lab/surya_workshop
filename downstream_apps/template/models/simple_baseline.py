@@ -1,10 +1,10 @@
-import torch
-import torch.nn as nn
-from einops import rearrange
-
 """
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
+
+import torch
+import torch.nn as nn
+from einops import rearrange
 
 
 def inverse_transform_channels(batch: dict, channel_order: list, scalers: dict) -> dict:
