@@ -119,9 +119,6 @@ class HelioSpectformer1D(nn.Module):
         else:
             tokens = self.backbone.forward(batch)
 
-        if self.dropout_layer is not None:
-            tokens = self.dropout_layer(tokens)
-
         if self.penultimate_linear_layer_enabled:
             tokens = self.linear(tokens)
 
