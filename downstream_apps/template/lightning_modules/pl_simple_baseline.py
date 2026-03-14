@@ -115,6 +115,21 @@ class FlareLightningModule(L.LightningModule):
 
         self.lr = lr
 
+    @staticmethod
+    def _combine_losses(loss_dict: LossDict, weights: Weights) -> torch.Tensor:
+        """Return a weighted sum of the losses in ``loss_dict``.
+
+        ``weights`` must be aligned with ``loss_dict.keys()`` iteration order.
+        Raises ``ValueError`` if ``loss_dict`` is empty.
+        """
+        loss = None
+        for n, key in enumerate(loss_dict.keys()):
+            component = loss_dict[key] * weights[n]
+            loss = component if loss is None else (loss + component)
+        if loss is None:
+            raise ValueError("loss_dict is empty; cannot compute a scalar loss.")
+        return loss
+
     def forward(self, batch: dict) -> torch.Tensor:
         """
         Forward pass used by Lightning and by explicit calls in steps.
@@ -167,17 +182,7 @@ class FlareLightningModule(L.LightningModule):
             batch = self.preprocess_fn(batch)
         output = self(batch)
         training_losses, training_loss_weights = self.training_loss(output, target)
-
-        # Combine losses according to their weights.
-        # Assumes training_loss_weights aligns with iteration order of training_losses.keys().
-        loss = None
-        for n, key in enumerate(training_losses.keys()):
-            component = training_losses[key] * training_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        # Safety: if no losses returned, raise a clear error.
-        if loss is None:
-            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar loss.")
+        loss = self._combine_losses(training_losses, training_loss_weights)
 
         # Log aggregate loss and component losses.
         self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
@@ -219,15 +224,7 @@ class FlareLightningModule(L.LightningModule):
             batch = self.preprocess_fn(batch)
         output = self(batch)
         val_losses, val_loss_weights = self.training_loss(output, target)
-
-        # Combine losses according to their weights.
-        loss = None
-        for n, key in enumerate(val_losses.keys()):
-            component = val_losses[key] * val_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        if loss is None:
-            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar val loss.")
+        loss = self._combine_losses(val_losses, val_loss_weights)
 
         # Log aggregate loss and component losses.
         self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
