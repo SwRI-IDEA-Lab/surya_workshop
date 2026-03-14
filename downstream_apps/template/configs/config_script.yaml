@@ -1,21 +1,62 @@
+# =============================================================================
+# Surya workshop — template fine-tuning config
+#
+# Five sections own all parameters:
+#   data      — what to load and how to align labels
+#   model     — backbone architecture, fine-tuning head, LoRA
+#   training  — optimization and augmentation hyperparameters
+#   output    — where to save checkpoints (and optional S3 upload)
+#   logging   — experiment tracking (WandB)
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
+#       --config downstream_apps/template/configs/config_script.yaml
+#
+# Override max_epochs for a quick sweep without editing this file:
+#   ... --max-epochs 5
+# =============================================================================
+
 job_id: solar_flare_forecasting
 
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
 data:
+  # -- Paths --
   train_data_path: /d0/amunozj/git_repos/surya_workshop/data/indices/surya_aws_s3_train.csv
   valid_data_path: /d0/amunozj/git_repos/surya_workshop/data/indices/surya_aws_s3_val.csv
   scalers_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/assets/scalers.yaml
-  channels: ['aia94', 'aia131', 'aia171', 'aia193', 'aia211', 'aia304', 'aia335', 'aia1600', 'hmi_m', 'hmi_bx', 'hmi_by', 'hmi_bz', 'hmi_v']
-  time_delta_input_minutes: [0]
-  time_delta_target_minutes: 60
-  ## Downstream-specific label alignment
-  flare_index_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/data/hek_flare_catalog.csv
-  ds_time_column: start_time    # Column in flare catalog used as the event timestamp
-  ds_time_tolerance: 4d         # Maximum allowed offset when matching Surya and flare timestamps
-  ds_match_direction: forward   # "forward": predict flares from prior solar state (causal)
-  s3_anon: true                 # true for public buckets (e.g. nasa-surya-bench); false when using IAM credentials
 
+  # -- Input channels and temporal sampling --
+  channels: [aia94, aia131, aia171, aia193, aia211, aia304, aia335, aia1600,
+             hmi_m, hmi_bx, hmi_by, hmi_bz, hmi_v]
+  time_delta_input_minutes: [0]   # Offsets (minutes) of input frames relative to reference timestep
+  time_delta_target_minutes: 60   # Step size (minutes) between forecast frames
+
+  # -- Downstream label alignment (flare catalog → Surya index) --
+  flare_index_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/data/hek_flare_catalog.csv
+  ds_time_column: start_time      # Column in the flare catalog used as the event timestamp
+  ds_time_tolerance: 4d           # Max allowed gap between catalog and Surya timestamps
+  ds_match_direction: forward     # "forward": use solar state *before* the flare (causal)
+
+  # -- S3 (only needed when index contains s3:// paths) --
+  s3_anon: true                   # true for public buckets; false to use IAM credentials
+  s3_cache_dir: null              # Local cache directory; budget ~1 GB per unique timestep
+
+  # -- Development --
+  max_samples: null               # Cap dataset size for quick experiments (null = all samples)
+
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
 model:
-  # Backbone
+  # -- Pretrained checkpoint --
+  # Download via: downstream_apps/template/download_scalers_and_weights.sh
+  pretrained_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/assets/surya.366m.v1.pt
+
+  # -- Backbone (Surya 366M defaults — match the pretrained checkpoint) --
   img_size: 4096
   patch_size: 16
   in_channels: 13
@@ -34,33 +75,56 @@ model:
   ensemble: null
   nglo: 1
   time_embedding:
-    type: linear      # Options: linear, fourier, perceiver
-    n_queries: null   # Integer for perceiver; otherwise null
-    time_dim: 1       # Number of input timesteps
+    type: linear        # Options: linear | fourier | perceiver
+    n_queries: null     # Required for perceiver; unused otherwise
+    time_dim: 1         # Number of input timesteps (must match time_delta_input_minutes length)
 
-  # Fine-tuning head
-  # Options: global_average | global_max | attention | transformer | class_token
-  pooling: class_token
+  # -- Fine-tuning head --
+  pooling: class_token  # Options: class_token | global_average | global_max | attention | transformer
   penultimate_linear_layer: true
   dropout: 0.2
   freeze_backbone: false
 
-  # PEFT LoRA
+  # -- LoRA adapters --
   use_lora: true
   lora_config:
     r: 8
     lora_alpha: 8
-    target_modules: ['q_proj', 'v_proj', 'k_proj', 'out_proj', 'fc1', 'fc2']
     lora_dropout: 0.1
-    bias: 'none'
+    bias: none
+    target_modules: [q_proj, v_proj, k_proj, out_proj, fc1, fc2]
 
-optimizer:
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
   learning_rate: 0.0001
-  max_epochs: 20
+  batch_size: 2         # Per-device batch size under DDP
+  max_epochs: 20        # Can be overridden with --max-epochs at the CLI
 
-pretrained_path: /d0/amunozj/git_repos/surya_workshop/downstream_apps/template/assets/surya.366m.v1.pt
-rollout_steps: 0
-drop_hmi_probability: 0.0
-use_latitude_in_learned_flow: false
-dtype: float32
-wandb_project: template_flare_regression
+  # Task-specific
+  rollout_steps: 0
+  drop_hmi_probability: 0.0
+  use_latitude_in_learned_flow: false
+  dtype: float32        # Options: float32 | bfloat16
+
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+output:
+  ckpt_dir: checkpoints   # Local directory for saved checkpoints
+
+  # S3 upload of best checkpoint (set s3_bucket to enable; all three are used together)
+  s3_bucket: null         # e.g. my-ml-artifacts
+  s3_prefix: ""           # Key prefix (folder) within the bucket, e.g. flare/exp_001
+  s3_best_key: best.ckpt  # Stable object name; always points to the latest best checkpoint
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  wandb_project: template_flare_regression
+  wandb_entity: null      # WandB team/org name; null to log to your personal account

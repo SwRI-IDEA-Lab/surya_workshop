@@ -3,24 +3,19 @@
 Runnable finetuning script derived from `2_finetune_template_1D.ipynb`.
 
 Design goals
-- Minimal CLI arguments
+- Config-driven: all hyperparameters live in config_script.yaml
+- Minimal CLI: only --config is required; three optional overrides for dev convenience
 - Multi-GPU capable (DDP) when run as a script
-- Mirrors notebook behavior closely
 
 Assumptions
 - You have already downloaded `scalers.yaml` + model weights (the notebook ran `download_scalers_and_weights.sh`).
 - You run this script from the repo root and specify devices via CUDA_VISIBLE_DEVICES:
     CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
-        --config downstream_apps/template/configs/config_script.yaml \
-        --batch-size 2 --max-epochs 20
+        --config downstream_apps/template/configs/config_script.yaml
 
-S3 upload example
-    CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
-        --config downstream_apps/template/configs/config_script.yaml \
-        --batch-size 2 --max-epochs 20 \
-        --s3_bucket my-ml-artifacts \
-        --s3_prefix flare/exp_001 \
-        --s3_best_key best.ckpt
+All other parameters (batch_size, max_epochs, S3 upload settings, etc.) are set in
+the YAML. Pass --max-epochs N to override max_epochs for quick sweeps without editing
+the file.
 """
 
 from __future__ import annotations
@@ -51,10 +46,10 @@ class UploadBestCheckpointToS3(L.Callback):
     """
     Uploads the best checkpoint to S3 whenever ModelCheckpoint records a new best.
 
-    - No-op unless --s3_bucket is provided.
+    - No-op unless output.s3_bucket is set in the config.
     - Only runs from global rank 0 under DDP.
-    - Uses a stable S3 key by default (e.g. best.ckpt) so the latest best is
-      always at a predictable location.
+    - Uses a stable S3 key (output.s3_best_key) so the latest best is always
+      at a predictable location.
     """
 
     def __init__(
@@ -117,22 +112,16 @@ class UploadBestCheckpointToS3(L.Callback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="./configs/config.yaml")
-    parser.add_argument("--max-epochs", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size under DDP.")
-    parser.add_argument("--no-wandb", action="store_true")
-    parser.add_argument("--train_baseline", action="store_true")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Directory for local file cache.")
-    parser.add_argument("--max-samples", type=int, default=None, help="Cap dataset size (useful for quick experiments).")
-    parser.add_argument("--ckpt-dir", type=str, default="checkpoints", help="Directory to save local checkpoints.")
-    parser.add_argument("--s3_bucket", type=str, default=None, help="Optional S3 bucket for best-checkpoint upload.")
-    parser.add_argument("--s3_prefix", type=str, default="", help="Optional S3 key prefix (folder path).")
-    parser.add_argument(
-        "--s3_best_key",
-        type=str,
-        default="best.ckpt",
-        help='Stable S3 object name for latest best checkpoint (set "" to use the local filename).',
-    )
+    parser.add_argument("--config", type=str, default="./configs/config.yaml",
+                        help="Path to config_script.yaml.")
+    # Dev toggles: flip without editing the YAML
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable WandB logging (useful for local runs).")
+    parser.add_argument("--train_baseline", action="store_true",
+                        help="Train the simple linear baseline instead of HelioSpectformer.")
+    # Sweep override: vary across jobs without touching the YAML
+    parser.add_argument("--max-epochs", type=int, default=None,
+                        help="Override max_epochs from the config YAML.")
     return parser.parse_args()
 
 
@@ -150,9 +139,7 @@ def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
     return shifted / (2 * shifted.std())
 
 
-def build_datasets(
-    cfg: TrainingConfig, args: argparse.Namespace
-) -> Tuple[DataLoader, DataLoader]:
+def build_datasets(cfg: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config."""
     scalers = build_scalers(info=cfg.data.scalers_path)
 
@@ -168,22 +155,22 @@ def build_datasets(
         s3_use_simplecache=False,
         s3_download_to_temp=True,
         s3_storage_options={"anon": cfg.data.s3_anon},
+        s3_cache_dir=cfg.data.s3_cache_dir,
         # Downstream-specific
         return_surya_stack=True,
-        max_number_of_samples=args.max_samples,
+        max_number_of_samples=cfg.data.max_samples,
         label_transform=_flare_label_transform,
         ds_flare_index_path=cfg.data.flare_index_path,
         ds_time_column=cfg.data.ds_time_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
         ds_match_direction=cfg.data.ds_match_direction,
-        **({"s3_cache_dir": args.cache_dir} if args.cache_dir is not None else {}),
     )
 
     train_dataset = FlareDSDataset(index_path=cfg.data.train_data_path, phase="train", **common_ds_kwargs)
     val_dataset = FlareDSDataset(index_path=cfg.data.valid_data_path, phase="val", **common_ds_kwargs)
 
     loader_kwargs = dict(
-        batch_size=args.batch_size,
+        batch_size=cfg.batch_size,
         num_workers=8,
         multiprocessing_context="spawn",
         persistent_workers=True,
@@ -196,7 +183,7 @@ def build_datasets(
     return train_loader, val_loader
 
 
-def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningModule:
+def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.LightningModule:
     """Instantiate the model and wrap it in a LightningModule."""
     metrics = {
         "train_loss": FlareMetrics("train_loss"),
@@ -204,7 +191,7 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
         "val_metrics": FlareMetrics("val_metrics"),
     }
 
-    if args.train_baseline:
+    if train_baseline:
         from functools import partial
         from downstream_apps.template.models.simple_baseline import (
             RegressionFlareModel,
@@ -215,7 +202,7 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
         n_channels = len(cfg.data.channels)
         model = RegressionFlareModel(n_input_timestamps * n_channels)
         preprocess_fn = partial(inverse_transform_channels, channel_order=cfg.data.channels, scalers=scalers)
-        return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size, preprocess_fn=preprocess_fn)
+        return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
         model = HelioSpectformer1D.from_config(
@@ -228,7 +215,7 @@ def build_model(cfg: TrainingConfig, args: argparse.Namespace) -> L.LightningMod
         if cfg.model.use_lora:
             model = apply_peft_lora(model, cfg.model.lora_config)
 
-    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=args.batch_size)
+    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
 
 
 def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None) -> None:
@@ -258,12 +245,18 @@ def _load_pretrained_weights(model: torch.nn.Module, pretrained_path: str | None
     model.load_state_dict(model_state, strict=True)
 
 
-def build_trainer(cfg: TrainingConfig, args: argparse.Namespace) -> Tuple[L.Trainer, ModelCheckpoint]:
+def build_trainer(
+    cfg: TrainingConfig,
+    no_wandb: bool = False,
+    max_epochs_override: int | None = None,
+) -> Tuple[L.Trainer, ModelCheckpoint]:
     """Configure loggers, callbacks, and the Lightning Trainer."""
+    max_epochs = max_epochs_override if max_epochs_override is not None else cfg.max_epochs
+
     loggers = []
-    if not args.no_wandb:
+    if not no_wandb:
         loggers.append(WandbLogger(
-            entity="surya_handson",
+            entity=cfg.wandb_entity,  # None = personal account; set in YAML for team runs
             project=cfg.wandb_project,
             name=cfg.job_id,
             log_model=False,
@@ -271,9 +264,9 @@ def build_trainer(cfg: TrainingConfig, args: argparse.Namespace) -> Tuple[L.Trai
         ))
     loggers.append(CSVLogger("runs", name=cfg.job_id))
 
-    Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.output.ckpt_dir).mkdir(parents=True, exist_ok=True)
     checkpoint_cb = ModelCheckpoint(
-        dirpath=args.ckpt_dir,
+        dirpath=cfg.output.ckpt_dir,
         filename="best-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
@@ -282,13 +275,13 @@ def build_trainer(cfg: TrainingConfig, args: argparse.Namespace) -> Tuple[L.Trai
     )
     upload_cb = UploadBestCheckpointToS3(
         checkpoint_cb=checkpoint_cb,
-        bucket=args.s3_bucket,
-        prefix=args.s3_prefix,
-        fixed_key_name=(args.s3_best_key or None),
+        bucket=cfg.output.s3_bucket,
+        prefix=cfg.output.s3_prefix,
+        fixed_key_name=(cfg.output.s3_best_key or None),
     )
 
     trainer = L.Trainer(
-        max_epochs=args.max_epochs,
+        max_epochs=max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices="auto",
         strategy="auto",
@@ -310,9 +303,9 @@ def main() -> None:
     L.seed_everything(42, workers=True)
 
     cfg = load_config(args.config)
-    train_loader, val_loader = build_datasets(cfg, args)
-    lit_model = build_model(cfg, args)
-    trainer, checkpoint_cb = build_trainer(cfg, args)
+    train_loader, val_loader = build_datasets(cfg)
+    lit_model = build_model(cfg, train_baseline=args.train_baseline)
+    trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
 
     trainer.fit(lit_model, train_loader, val_loader)
 

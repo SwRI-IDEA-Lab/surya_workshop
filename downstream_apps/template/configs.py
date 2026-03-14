@@ -6,14 +6,14 @@ returns a fully typed TrainingConfig. All downstream code receives a
 TrainingConfig instead of a raw dict, giving IDE completion and
 catching missing/misspelled keys at startup rather than mid-training.
 
-Only the fields actually used by this app are represented here. The
-YAML may contain additional keys that are silently ignored — that is
-intentional to keep the dataclass contract minimal and clear.
+The YAML is divided into five sections (data, model, training, output, logging).
+load_config() maps each section to its dataclass explicitly, so the relationship
+between YAML keys and Python fields is easy to follow.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields as dc_fields
+from dataclasses import dataclass, field, fields as dc_fields
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -35,7 +35,7 @@ def _from_dict(cls, d: dict):
 
 @dataclass
 class DataConfig:
-    """Paths and sampling parameters for the SDO/flare dataset."""
+    """Paths, sampling parameters, and S3 cache settings for the SDO/flare dataset."""
     train_data_path: str
     valid_data_path: str
     scalers_path: str
@@ -47,8 +47,21 @@ class DataConfig:
     ds_time_column: str = "start_time"
     ds_time_tolerance: str = "4d"
     ds_match_direction: str = "forward"
-    # Set to true for publicly accessible S3 buckets that don't require credentials
+    # S3
     s3_anon: bool = False
+    s3_cache_dir: Optional[str] = None
+    # Development
+    max_samples: Optional[int] = None
+
+
+@dataclass
+class OutputConfig:
+    """Paths and S3 settings for checkpoints and artifacts."""
+    ckpt_dir: str = "checkpoints"
+    # S3 upload of best checkpoint (all three required together; leave s3_bucket null to disable)
+    s3_bucket: Optional[str] = None
+    s3_prefix: str = ""
+    s3_best_key: str = "best.ckpt"
 
 
 @dataclass
@@ -57,37 +70,54 @@ class TrainingConfig:
     job_id: str
     data: DataConfig
     model: ModelConfig
+    output: OutputConfig = field(default_factory=OutputConfig)
     pretrained_path: Optional[str] = None
     learning_rate: float = 1e-4
+    max_epochs: int = 20
+    batch_size: int = 2
     rollout_steps: int = 0
     drop_hmi_probability: float = 0.0
     use_latitude_in_learned_flow: bool = False
     dtype: str = "float32"
     wandb_project: str = "template_flare_regression"
+    wandb_entity: Optional[str] = None
 
 
 def load_config(path: Union[str, Path]) -> TrainingConfig:
     """Parse config_script.yaml into a typed TrainingConfig.
 
-    Nested dicts are converted to their dataclass types via _from_dict(),
-    which silently drops YAML keys not present in the dataclass. This means
-    adding a new field only requires editing the dataclass and YAML — not
-    this function.
-
-    The one exception is learning_rate, which lives under optimizer.learning_rate
-    in the YAML but is a flat field on TrainingConfig.
+    The YAML has five top-level sections (data, model, training, output, logging)
+    plus job_id. Each section is parsed into its corresponding dataclass.
+    Unknown keys within each section are silently ignored by _from_dict(), so
+    adding a new field only requires editing the dataclass and YAML.
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
+    # model: build ModelConfig, then extract pretrained_path (which lives here in the
+    # YAML but is stored flat on TrainingConfig, since it's used at the training level).
     model_raw = raw["model"]
     model_kwargs = dict(model_raw)
     model_kwargs["time_embedding"] = _from_dict(TimeEmbeddingConfig, model_raw.get("time_embedding", {}))
     model_kwargs["lora_config"] = _from_dict(LoraAdapterConfig, model_raw.get("lora_config", {}))
     model_cfg = _from_dict(ModelConfig, model_kwargs)
 
-    training_kwargs = dict(raw)
-    training_kwargs["learning_rate"] = raw.get("optimizer", {}).get("learning_rate", 1e-4)
-    training_kwargs["data"] = _from_dict(DataConfig, raw["data"])
-    training_kwargs["model"] = model_cfg
-    return _from_dict(TrainingConfig, training_kwargs)
+    training = raw.get("training", {})
+    logging_cfg = raw.get("logging", {})
+
+    return TrainingConfig(
+        job_id=raw["job_id"],
+        data=_from_dict(DataConfig, raw["data"]),
+        model=model_cfg,
+        output=_from_dict(OutputConfig, raw.get("output", {})),
+        pretrained_path=model_raw.get("pretrained_path"),
+        learning_rate=training.get("learning_rate", 1e-4),
+        max_epochs=training.get("max_epochs", 20),
+        batch_size=training.get("batch_size", 2),
+        rollout_steps=training.get("rollout_steps", 0),
+        drop_hmi_probability=training.get("drop_hmi_probability", 0.0),
+        use_latitude_in_learned_flow=training.get("use_latitude_in_learned_flow", False),
+        dtype=training.get("dtype", "float32"),
+        wandb_project=logging_cfg.get("wandb_project", "template_flare_regression"),
+        wandb_entity=logging_cfg.get("wandb_entity"),
+    )
