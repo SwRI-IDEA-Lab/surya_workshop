@@ -47,6 +47,8 @@ class DataConfig:
     ds_time_column: str = "start_time"
     ds_time_tolerance: str = "4d"
     ds_match_direction: str = "forward"
+    # Set to true for publicly accessible S3 buckets that don't require credentials
+    s3_anon: bool = False
 
 
 @dataclass

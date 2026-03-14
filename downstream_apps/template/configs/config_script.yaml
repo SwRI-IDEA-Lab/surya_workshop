@@ -12,6 +12,7 @@ data:
   ds_time_column: start_time    # Column in flare catalog used as the event timestamp
   ds_time_tolerance: 4d         # Maximum allowed offset when matching Surya and flare timestamps
   ds_match_direction: forward   # "forward": predict flares from prior solar state (causal)
+  s3_anon: true                 # true for public buckets (e.g. nasa-surya-bench); false when using IAM credentials
 
 model:
   # Backbone

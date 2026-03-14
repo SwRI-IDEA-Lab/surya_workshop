@@ -167,6 +167,7 @@ def build_datasets(
         scalers=scalers,
         s3_use_simplecache=False,
         s3_download_to_temp=True,
+        s3_storage_options={"anon": cfg.data.s3_anon},
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=args.max_samples,
