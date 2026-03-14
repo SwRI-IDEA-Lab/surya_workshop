@@ -3,7 +3,6 @@ import re
 import random
 import hashlib
 from datetime import datetime
-from typing import Tuple
 import torch
 import numpy as np
 import skimage.measure
@@ -12,7 +11,6 @@ import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
 from workshop_infrastructure.utils import get_rank, create_logger
-from functools import cache
 
 # Optional S3 support via fsspec/s3fs (read-through streaming)
 try:
@@ -35,7 +33,7 @@ except Exception:  # pragma: no cover
     TransferConfig = None
 
 from numba import njit, prange
-import hdf5plugin
+import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compression filters
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +329,12 @@ class HelioNetCDFDataset(Dataset):
         self.rank = get_rank()
         self.logger: Logger | None = None
 
+        # Pre-compute normalization arrays once (avoids repeated dict lookups per sample).
+        self._means = np.array([self.scalers[ch].mean for ch in self.channels])
+        self._stds = np.array([self.scalers[ch].std for ch in self.channels])
+        self._epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
+        self._sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
+
     # ------------------------------------------------------------------
     # Index filtering
     # ------------------------------------------------------------------
@@ -444,9 +448,9 @@ class HelioNetCDFDataset(Dataset):
             sample["lead_time_delta"] = lead_time_delta_float
 
         if self.random_vert_flip and torch.bernoulli(torch.ones(()) / 2) == 1:
-            sample["ts"] = torch.flip(stacked_inputs, dims=[-2])
+            sample["ts"] = np.flip(stacked_inputs, axis=-2).copy()
             if self.load_forecast_frames:
-                sample["forecast"] = torch.flip(stacked_targets, dims=[-2])
+                sample["forecast"] = np.flip(stacked_targets, axis=-2).copy()
 
         if self.use_latitude_in_learned_flow:
             from sunpy.coordinates.ephemeris import get_earth
@@ -478,6 +482,7 @@ class HelioNetCDFDataset(Dataset):
         Returns:
             NumPy array of shape (C, H, W).
         """
+        self._ensure_logger()
         self.logger.info(f"Reading file {filepath}.")
 
         if not self._is_s3_path(filepath) and self.sdo_data_root_path and not os.path.isabs(filepath):
@@ -630,26 +635,18 @@ class HelioNetCDFDataset(Dataset):
     # Normalization
     # ------------------------------------------------------------------
 
-    @cache
-    def _transformation_inputs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        means = np.array([self.scalers[ch].mean for ch in self.channels])
-        stds = np.array([self.scalers[ch].std for ch in self.channels])
-        epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
-        sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
-        return means, stds, epsilons, sl_scale_factors
-
     def transform_data(self, data: np.ndarray) -> np.ndarray:
-        """Apply signum-log normalization to a (C, H, W) array."""
+        """Apply spatial pooling (if configured) then signum-log normalization to a (C, H, W) array."""
         assert data.ndim == 3
         if self.pooling > 1:
             data = skimage.measure.block_reduce(data, block_size=(1, self.pooling, self.pooling), func=np.mean)
-        means, stds, epsilons, sl_scale_factors = self._transformation_inputs()
-        return transform(data, means, stds, sl_scale_factors, epsilons)
+        return transform(data, self._means, self._stds, self._sl_scale_factors, self._epsilons)
 
     def inverse_transform_data(self, data: np.ndarray) -> np.ndarray:
-        """Invert signum-log normalization on a (C, H, W) array."""
+        """Invert signum-log normalization on a (C, H, W) array.
+
+        Note: this only inverts the *normalization*, not spatial pooling.
+        Pooling (applied in ``transform_data``) is not invertible.
+        """
         assert data.ndim == 3
-        if self.pooling > 1:
-            data = skimage.measure.block_reduce(data, block_size=(1, self.pooling, self.pooling), func=np.mean)
-        means, stds, epsilons, sl_scale_factors = self._transformation_inputs()
-        return fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons)
+        return fast_inverse_transform(data, self._means, self._stds, self._sl_scale_factors, self._epsilons)
