@@ -9,14 +9,12 @@ class FlareDSDataset(HelioNetCDFDataset):
     Template child class of HelioNetCDFDataset showing how to build a downstream dataset.
     Extends the base class with a flare intensity label aligned to the Surya index.
 
-    See ``HelioNetCDFDataset`` for all base class parameters (index_path, time_delta_input_minutes,
-    scalers, s3_cache_dir, etc.).
+    All ``HelioNetCDFDataset`` keyword arguments (``index_path``, ``scalers``, ``channels``,
+    ``s3_cache_dir``, etc.) are accepted via ``**kwargs`` and forwarded to the base class.
+    ``load_forecast_frames`` defaults to ``False`` here (flare forecasting supplies its own
+    labels, so future Surya frames are never fetched); pass it explicitly to override.
 
     Additional Args:
-        load_forecast_frames: If True, also load future Surya frames from S3/disk and include
-            ``forecast`` and ``lead_time_delta`` in the sample. Defaults to False because
-            flare forecasting uses its own label (``normalized_intensity``), not Surya's future frames.
-            Setting this to False avoids downloading the ~1 GB forecast files entirely.
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
             Set to False to return only the flare intensity label (useful for label inspection).
         max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
@@ -39,23 +37,6 @@ class FlareDSDataset(HelioNetCDFDataset):
 
     def __init__(
         self,
-        # Base class parameters (forwarded to HelioNetCDFDataset)
-        index_path: str,
-        time_delta_input_minutes: list[int],
-        time_delta_target_minutes: int,
-        n_input_timestamps: int,
-        rollout_steps: int,
-        scalers=None,
-        num_mask_aia_channels: int = 0,
-        drop_hmi_probability: float = 0.0,
-        use_latitude_in_learned_flow: bool = False,
-        channels: list[str] | None = None,
-        phase: str = "train",
-        s3_storage_options: dict | None = None,
-        s3_use_simplecache: bool = False,
-        s3_cache_dir: str | None = None,
-        s3_download_to_temp: bool = True,
-        load_forecast_frames: bool = False,
         # Downstream-specific parameters
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
@@ -64,28 +45,16 @@ class FlareDSDataset(HelioNetCDFDataset):
         ds_time_column: str | None = None,
         ds_time_tolerance: str | None = None,
         ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
+        # All HelioNetCDFDataset parameters (index_path, scalers, channels, s3_*, etc.)
+        **kwargs,
     ):
         if ds_match_direction not in ["forward", "backward", "nearest"]:
             raise ValueError("ds_match_direction must be one of 'forward', 'backward', or 'nearest'")
 
-        super().__init__(
-            index_path=index_path,
-            time_delta_input_minutes=time_delta_input_minutes,
-            time_delta_target_minutes=time_delta_target_minutes,
-            n_input_timestamps=n_input_timestamps,
-            rollout_steps=rollout_steps,
-            scalers=scalers,
-            num_mask_aia_channels=num_mask_aia_channels,
-            drop_hmi_probability=drop_hmi_probability,
-            use_latitude_in_learned_flow=use_latitude_in_learned_flow,
-            channels=channels,
-            phase=phase,
-            s3_storage_options=s3_storage_options,
-            s3_use_simplecache=s3_use_simplecache,
-            s3_cache_dir=s3_cache_dir,
-            s3_download_to_temp=s3_download_to_temp,
-            load_forecast_frames=load_forecast_frames,
-        )
+        # load_forecast_frames defaults to False here: flare forecasting supplies its
+        # own labels, so future Surya frames never need to be fetched from disk/S3.
+        kwargs.setdefault("load_forecast_frames", False)
+        super().__init__(**kwargs)
 
         self.return_surya_stack = return_surya_stack
 
