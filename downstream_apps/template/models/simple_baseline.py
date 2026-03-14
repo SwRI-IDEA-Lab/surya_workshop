@@ -50,13 +50,13 @@ class RegressionFlareModel(nn.Module):
         Performs a forward pass through the model.
 
         Args:
-            x (dict): Batch dict with 'ts' of shape (B, C, T, W, H) in physical space.
+            x (dict): Batch dict with 'ts' of shape (B, C, T, H, W) in physical space.
 
         B - Batch size
         C - Channels
         T - Time steps
-        W - Width
         H - Height
+        W - Width
         """
         x = x["ts"]
 
