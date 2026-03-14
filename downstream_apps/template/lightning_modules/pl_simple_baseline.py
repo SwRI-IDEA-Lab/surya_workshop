@@ -115,21 +115,21 @@ class FlareLightningModule(L.LightningModule):
 
         self.lr = lr
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, batch: dict) -> torch.Tensor:
         """
         Forward pass used by Lightning and by explicit calls in steps.
 
         Parameters
         ----------
-        x:
-            Input tensor, typically batch["ts"].
+        batch:
+            Batch dict (at minimum contains ``"ts"`` and ``"forecast"``).
 
         Returns
         -------
         torch.Tensor
             Model predictions for the batch.
         """
-        return self.model(x)
+        return self.model(batch)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
