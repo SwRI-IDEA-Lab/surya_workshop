@@ -1,6 +1,9 @@
+import functools
 import os
 import logging
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -11,6 +14,37 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from peft import LoraConfig, get_peft_model
 
 from workshop_infrastructure.configs import LoraAdapterConfig
+
+
+# ---------------------------------------------------------------------------
+# AWS / infrastructure utilities
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def detect_ec2_region() -> str | None:
+    """Return the AWS region of the current EC2 instance, or None if not on EC2.
+
+    Queries the IMDSv2 endpoint (169.254.169.254), which is only reachable from
+    within an EC2 instance.  The 1-second timeout makes this a no-op on any
+    other machine.  Results are cached so the network round-trip happens at most
+    once per process.
+    """
+    try:
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+        )
+        with urllib.request.urlopen(token_req, timeout=1) as resp:
+            token = resp.read().decode()
+        region_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/placement/region",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        with urllib.request.urlopen(region_req, timeout=1) as resp:
+            return resp.read().decode()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

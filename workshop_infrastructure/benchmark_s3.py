@@ -14,16 +14,15 @@ Usage:
 
 import argparse
 import csv
-import functools
 import os
 import random
 import statistics
 import sys
 import time
-import urllib.request
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+
+from workshop_infrastructure.utils import detect_ec2_region
 
 try:
     import boto3
@@ -97,33 +96,6 @@ class BenchmarkConfig:
 # ---------------------------------------------------------------------------
 # AWS client helpers
 # ---------------------------------------------------------------------------
-
-@functools.lru_cache(maxsize=1)
-def _detect_ec2_region() -> str | None:
-    """Return the AWS region of the current EC2 instance, or None if not on EC2.
-
-    Queries the IMDSv2 endpoint (169.254.169.254), which is only reachable from
-    within an EC2 instance.  The 1-second timeout makes this a no-op on any
-    other machine.  Results are cached so the network round-trip happens at most
-    once per process.
-    """
-    try:
-        token_req = urllib.request.Request(
-            "http://169.254.169.254/latest/api/token",
-            method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-        )
-        with urllib.request.urlopen(token_req, timeout=1) as resp:
-            token = resp.read().decode()
-        region_req = urllib.request.Request(
-            "http://169.254.169.254/latest/meta-data/placement/region",
-            headers={"X-aws-ec2-metadata-token": token},
-        )
-        with urllib.request.urlopen(region_req, timeout=1) as resp:
-            return resp.read().decode()
-    except Exception:
-        return None
-
 
 def _make_client(anon: bool, region: str | None, pool_size: int = 32):
     """Return a boto3 S3 client with the given signature and connection pool."""
@@ -546,7 +518,7 @@ def main() -> None:
         region=(args.region
                 or os.environ.get("AWS_REGION")
                 or os.environ.get("AWS_DEFAULT_REGION")
-                or _detect_ec2_region()),
+                or detect_ec2_region()),
         output_csv=args.output_csv,
         warmup=not args.no_warmup,
     )
@@ -582,7 +554,7 @@ def main() -> None:
             f"({file_size_mb:.0f} MB). Sampling the full file.\n"
         )
 
-    if cfg.region and _detect_ec2_region():
+    if cfg.region and detect_ec2_region():
         print(
             f"NOTE: Running on EC2 (region: {cfg.region}). "
             "Expected throughput: 500-1000+ MB/s when traffic stays on the AWS internal network.\n"
