@@ -1,3 +1,20 @@
+"""
+PyTorch dataset for SDO (Solar Dynamics Observatory) NetCDF files.
+
+This module provides:
+- ``HelioNetCDFDataset`` — the base dataset class used by all Surya downstream tasks.
+  Handles index loading, temporal frame sampling, signum-log normalization, channel
+  masking, and transparent local/S3 file access.
+- ``RandomChannelMaskerTransform`` — callable that randomly zeros input channels to
+  improve robustness to missing observations.
+- Signum-log transform functions (``transform``, ``fast_transform``, and their inverses)
+  used to normalize solar imagery before passing it to the model.
+
+When writing a downstream task, subclass ``HelioNetCDFDataset`` and override
+``__getitem__`` to attach your task-specific labels to the sample dict returned by
+``super().__getitem__()``.
+"""
+
 import os
 import re
 import random
@@ -39,23 +56,40 @@ import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compressio
 # ---------------------------------------------------------------------------
 # Signum-log transforms (module-level so numba can JIT-compile them)
 # ---------------------------------------------------------------------------
+#
+# Why signum-log?  Solar imagery (especially magnetograms and EUV channels)
+# has values that span many orders of magnitude and are symmetric around zero.
+# A plain log is undefined for negative values; a standard z-score squashes the
+# large dynamic range unevenly.  Signum-log preserves sign, compresses extreme
+# values, and then standardizes:
+#
+#   forward:  y = sign(x * s) * log1p(|x * s|)   then  (y - μ) / (σ + ε)
+#   inverse:  y_raw = y * (σ + ε) + μ             then  sign(y_raw) * expm1(|y_raw|) / s
+#
+# where s = sl_scale_factor (per-channel amplitude scaling applied before the log).
+# μ, σ, ε, and s are stored in the per-channel scaler objects built by
+# ``workshop_infrastructure/utils.py:build_scalers()``.
+#
+# Two implementations are provided:
+#   fast_transform / fast_inverse_transform — Numba JIT, parallel across channels.
+#     Faster for large arrays but may hang on some GPU clusters with dataloader workers.
+#   transform / inverse_transform_single_channel — pure NumPy, always safe.
+# ---------------------------------------------------------------------------
 
 @njit(parallel=True)
 def fast_transform(data, means, stds, sl_scale_factors, epsilons):
-    """
-    Signum-log normalization using Numba for speed.
+    """Signum-log normalization, Numba parallel implementation.
 
-    Notes:
-    - Must reside outside class definitions (Numba requirement).
-    - May cause hangs on some GPU clusters when called from dataloader workers;
-      use the pure-NumPy ``transform`` function in that case.
+    See the module-level comment for the mathematical definition.
+    Must live outside class definitions (Numba requirement).
+    May hang on some GPU clusters with dataloader workers — use ``transform`` in that case.
 
     Args:
-        data: Numpy array of shape (C, H, W).
+        data: NumPy array of shape (C, H, W).
         means: Per-channel means, shape (C,).
         stds: Per-channel standard deviations, shape (C,).
-        sl_scale_factors: Per-channel signum-log scale factors, shape (C,).
-        epsilons: Per-channel small constants to avoid zero division, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
 
     Returns:
         Normalized array of shape (C, H, W), dtype float32.
@@ -77,15 +111,16 @@ def fast_transform(data, means, stds, sl_scale_factors, epsilons):
 
 @njit(parallel=True)
 def fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons):
-    """
-    Inverse signum-log normalization using Numba for speed.
+    """Inverse signum-log normalization, Numba parallel implementation.
+
+    See the module-level comment for the mathematical definition.
 
     Args:
         data: Normalized array of shape (C, H, W).
         means: Per-channel means, shape (C,).
         stds: Per-channel standard deviations, shape (C,).
-        sl_scale_factors: Per-channel signum-log scale factors, shape (C,).
-        epsilons: Per-channel small constants to avoid zero division, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
 
     Returns:
         Reconstructed array of shape (C, H, W), dtype float32.
@@ -112,15 +147,17 @@ def transform(
     sl_scale_factors: np.ndarray,
     epsilons: np.ndarray,
 ) -> np.ndarray:
-    """
-    Signum-log normalization (pure NumPy). Drop-in replacement for ``fast_transform``.
+    """Signum-log normalization, pure NumPy. Drop-in replacement for ``fast_transform``.
+
+    Safe to use with DataLoader workers on any platform. See the module-level comment
+    for the mathematical definition.
 
     Args:
-        data: Numpy array of shape (C, H, W).
+        data: NumPy array of shape (C, H, W).
         means: Per-channel means, shape (C,).
         stds: Per-channel standard deviations, shape (C,).
-        sl_scale_factors: Per-channel signum-log scale factors, shape (C,).
-        epsilons: Per-channel small constants to avoid zero division, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
 
     Returns:
         Normalized array of shape (C, H, W).
@@ -137,15 +174,18 @@ def transform(
 
 
 def inverse_transform_single_channel(data, mean, std, sl_scale_factor, epsilon):
-    """
-    Inverse signum-log normalization for a single channel.
+    """Inverse signum-log normalization for a single channel (pure NumPy).
+
+    Convenience wrapper for per-channel post-processing (e.g. model output visualization).
+    For full (C, H, W) arrays use ``fast_inverse_transform`` or invert via
+    ``HelioNetCDFDataset.inverse_transform_data()``.
 
     Args:
-        data: Numpy array of shape (H, W).
+        data: NumPy array of shape (H, W).
         mean: Scalar mean.
         std: Scalar standard deviation.
-        sl_scale_factor: Scalar signum-log scale factor.
-        epsilon: Small constant to avoid zero division.
+        sl_scale_factor: Scalar amplitude scaling factor.
+        epsilon: Small constant that prevents division by zero.
 
     Returns:
         Reconstructed array of shape (H, W).
@@ -177,6 +217,18 @@ class RandomChannelMaskerTransform:
         self.drop_hmi_probability = drop_hmi_probability
 
     def __call__(self, input_tensor):
+        """Apply random channel masking to a (C, T, H, W) image stack.
+
+        Zeros out ``num_mask_aia_channels`` randomly chosen channels uniformly across all
+        timesteps, and independently drops the last channel (HMI) with probability
+        ``drop_hmi_probability``.
+
+        Args:
+            input_tensor: Array of shape (C, T, H, W).
+
+        Returns:
+            Masked array of the same shape.
+        """
         C, T, H, W = input_tensor.shape
 
         channels_to_mask = random.sample(range(C), self.num_mask_aia_channels)
@@ -214,11 +266,21 @@ class HelioNetCDFDataset(Dataset):
 
     Args:
         index_path: Path to the CSV index file.
-        time_delta_input_minutes: List of input time offsets in minutes from the reference timestep.
-        time_delta_target_minutes: Target time step in minutes; rollout targets are multiples of this.
-        n_input_timestamps: Number of input frames to sample.
-        rollout_steps: Number of forecast steps.
-        scalers: Per-channel normalization statistics (see ``workshop_infrastructure/configs.py``).
+        time_delta_input_minutes: List of candidate input time offsets in minutes, sorted ascending.
+            The **last entry must be 0** (the "now" frame, always included). Earlier entries are the
+            pool of historical offsets from which ``n_input_timestamps - 1`` frames are sampled
+            randomly per call to ``__getitem__``.
+        time_delta_target_minutes: Step size in minutes between forecast frames.
+            Forecast targets are at offsets 1×, 2×, … (``rollout_steps + 1``)× this value.
+            Only used when ``load_forecast_frames=True``.
+        n_input_timestamps: Number of input frames to include per sample. Must be
+            ≤ ``len(time_delta_input_minutes)``.
+        rollout_steps: Number of additional forecast steps beyond the first target frame.
+            ``rollout_steps=0`` produces one target frame; ``rollout_steps=N`` produces N+1.
+            Only used when ``load_forecast_frames=True``.
+        scalers: Per-channel normalization statistics produced by
+            ``workshop_infrastructure/utils.py:build_scalers()``. Each entry must expose
+            ``.mean``, ``.std``, ``.epsilon``, and ``.sl_scale_factor``.
         num_mask_aia_channels: Number of AIA channels to randomly mask during training.
         drop_hmi_probability: Probability of dropping the HMI channel during training.
         use_latitude_in_learned_flow: If True, include heliographic latitude in the output dict.
@@ -312,6 +374,8 @@ class HelioNetCDFDataset(Dataset):
         self.time_delta_input_minutes = sorted(
             np.timedelta64(t, "m") for t in time_delta_input_minutes
         )
+        # range(1, rollout_steps + 2): starts at 1× (first target), ends at (rollout_steps + 1)×.
+        # rollout_steps=0 → one target frame; rollout_steps=N → N+1 target frames.
         self.time_delta_target_minutes = [
             np.timedelta64(iroll * time_delta_target_minutes, "m")
             for iroll in range(1, rollout_steps + 2)
@@ -346,6 +410,7 @@ class HelioNetCDFDataset(Dataset):
         index does not need to contain future timestamps.
         """
         if self.load_forecast_frames:
+            # `+` concatenates two Python lists of np.timedelta64 objects before deduplication.
             time_deltas = np.unique(self.time_delta_input_minutes + self.time_delta_target_minutes)
         else:
             time_deltas = np.unique(self.time_delta_input_minutes)
@@ -375,7 +440,8 @@ class HelioNetCDFDataset(Dataset):
     # Dataset interface
     # ------------------------------------------------------------------
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of valid reference timesteps in this dataset."""
         return self.adjusted_length
 
     def __getitem__(self, idx: int) -> dict:
@@ -420,6 +486,12 @@ class HelioNetCDFDataset(Dataset):
         )
 
     def _get_index_data(self, idx: int) -> dict:
+        """Build and return the sample dict for a single reference timestep.
+
+        Samples historical input frames randomly from ``time_delta_input_minutes``,
+        applies channel masking and optional vertical flip, then assembles the sample
+        dict described in ``__getitem__``.
+        """
         reference_timestep = self.valid_indices[idx]
 
         # The last entry in time_delta_input_minutes is always the "now" frame (offset 0
@@ -502,7 +574,20 @@ class HelioNetCDFDataset(Dataset):
             return ds[channels].to_array().load().to_numpy()
 
     def _load_s3_nc_data(self, s3_uri: str, channels: list[str]) -> np.ndarray:
-        """Download an S3 NetCDF file to local cache (if needed) and open it."""
+        """Load a NetCDF file from S3 and return the requested channels as a NumPy array.
+
+        Two code paths depending on ``s3_download_to_temp`` (recommended default: True):
+
+        1. **Download-to-cache** (``s3_download_to_temp=True``): the full S3 object is
+           downloaded to ``s3_cache_dir`` before opening with xarray. Uses an atomic
+           write (partial → rename) so a crashed download never leaves a corrupt cache
+           file. Subsequent calls for the same URI are served from the local cache.
+           Requires boto3 (preferred, parallel multipart) or s3fs (fallback streaming).
+
+        2. **Streaming** (``s3_download_to_temp=False``): the file is opened in-place
+           via fsspec simplecache or direct s3fs. Avoid for NetCDF/HDF5 — these formats
+           require random seeks that streaming reads cannot always satisfy.
+        """
         if boto3 is None and fsspec is None:
             raise ImportError(
                 "S3 support requires either 'boto3' or 'fsspec'+'s3fs'. "
@@ -560,6 +645,7 @@ class HelioNetCDFDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _is_s3_path(self, path: str) -> bool:
+        """Return True if ``path`` is an S3 URI (starts with ``s3://``)."""
         return isinstance(path, str) and path.startswith("s3://")
 
     def _get_s3fs(self):
@@ -643,7 +729,16 @@ class HelioNetCDFDataset(Dataset):
     # ------------------------------------------------------------------
 
     def transform_data(self, data: np.ndarray) -> np.ndarray:
-        """Apply spatial pooling (if configured) then signum-log normalization to a (C, H, W) array."""
+        """Apply spatial pooling (if configured) then signum-log normalization.
+
+        Args:
+            data: Raw channel array of shape (C, H, W).
+
+        Returns:
+            Normalized array of shape (C, H//pooling, W//pooling). See the module-level
+            comment for the signum-log math and the ``inverse_transform_data`` method
+            to reverse the normalization.
+        """
         assert data.ndim == 3
         if self.pooling > 1:
             data = skimage.measure.block_reduce(data, block_size=(1, self.pooling, self.pooling), func=np.mean)
