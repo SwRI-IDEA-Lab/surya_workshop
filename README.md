@@ -132,7 +132,7 @@ conda env create -f environment.yml
 conda activate surya_ws
 ```
 
-Python 3.11+ is required. Key dependencies: PyTorch, PyTorch Lightning, PEFT, WandB, SunPy, xarray, Dask, fsspec.
+Python 3.12+ is required. Key dependencies: PyTorch, PyTorch Lightning, PEFT, WandB, SunPy, xarray, Dask, fsspec.
 
 ### 2. Work through the template notebooks in order
 
