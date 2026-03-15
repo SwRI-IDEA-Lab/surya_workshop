@@ -404,25 +404,39 @@ class HelioNetCDFDataset(Dataset):
     # Internal data loading
     # ------------------------------------------------------------------
 
+    def _load_and_stack_frames(self, timesteps) -> np.ndarray:
+        """Load, normalize, and stack NetCDF frames into a (C, T, H, W) array.
+
+        Args:
+            timesteps: Sequence of timestamps; one NetCDF file is loaded per entry.
+
+        Returns:
+            NumPy array of shape (C, T, H, W).
+        """
+        return np.stack(
+            [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
+             for ts in timesteps],
+            axis=1,
+        )
+
     def _get_index_data(self, idx: int) -> dict:
         reference_timestep = self.valid_indices[idx]
 
-        # Sample input time offsets and load input frames
+        # The last entry in time_delta_input_minutes is always the "now" frame (offset 0
+        # relative to the reference timestep). The remaining n-1 input frames are sampled
+        # randomly from the earlier offsets, giving the model varied historical context
+        # across training steps.
         input_time_deltas = np.array(
             sorted(random.sample(self.time_delta_input_minutes[:-1], self.n_input_timestamps - 1))
             + [self.time_delta_input_minutes[-1]]
         )
         input_timesteps = reference_timestep + input_time_deltas
-        stacked_inputs = np.stack(
-            [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
-             for ts in input_timesteps],
-            axis=1,
-        )
+        stacked_inputs = self._load_and_stack_frames(input_timesteps)
 
         if self.num_mask_aia_channels > 0 or self.drop_hmi_probability:
             stacked_inputs = self.masker(stacked_inputs)
 
-        # "now" is the last input frame; all time deltas are relative to it
+        # All time deltas are expressed relative to "now" (the last input frame), in hours.
         now_delta = input_time_deltas[-1]
         time_delta_input_float = (
             (now_delta - input_time_deltas) / np.timedelta64(1, "h")
@@ -436,27 +450,20 @@ class HelioNetCDFDataset(Dataset):
         if self.load_forecast_frames:
             target_time_deltas = np.array(self.time_delta_target_minutes)
             target_timesteps = reference_timestep + target_time_deltas
-            stacked_targets = np.stack(
-                [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
-                 for ts in target_timesteps],
-                axis=1,
-            )
-            lead_time_delta_float = (
+            sample["forecast"] = self._load_and_stack_frames(target_timesteps)
+            sample["lead_time_delta"] = (
                 (now_delta - target_time_deltas) / np.timedelta64(1, "h")
             ).astype(np.float32)
-            sample["forecast"] = stacked_targets
-            sample["lead_time_delta"] = lead_time_delta_float
 
         if self.random_vert_flip and torch.bernoulli(torch.ones(()) / 2) == 1:
-            sample["ts"] = np.flip(stacked_inputs, axis=-2).copy()
+            sample["ts"] = np.flip(sample["ts"], axis=-2).copy()
             if self.load_forecast_frames:
-                sample["forecast"] = np.flip(stacked_targets, axis=-2).copy()
+                sample["forecast"] = np.flip(sample["forecast"], axis=-2).copy()
 
         if self.use_latitude_in_learned_flow:
             from sunpy.coordinates.ephemeris import get_earth
 
-            input_latitudes = [get_earth(ts).lat.value for ts in input_timesteps]
-            sample["input_latitudes"] = input_latitudes
+            sample["input_latitudes"] = [get_earth(ts).lat.value for ts in input_timesteps]
             if self.load_forecast_frames:
                 sample["forecast_latitude"] = [get_earth(ts).lat.value for ts in target_timesteps]
 
