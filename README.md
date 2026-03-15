@@ -176,7 +176,7 @@ If your training data is read from S3, `workshop_infrastructure/benchmark_s3.py`
 python -m workshop_infrastructure.benchmark_s3 s3://bucket/path/to/file.nc --anon --quick
 ```
 
-The `--quick` flag runs a 9-cell grid and finishes in about 2–3 minutes. Copy the recommended values into the `data:` section of `config_script.yaml`:
+One of the files in the surya index works fine (e.g. `s3://nasa-surya-bench/2011/01/20110131_0000.nc`).  The `--quick` flag runs a 9-cell grid and finishes in about 2–3 minutes. Copy the recommended values into the `data:` section of `config_script.yaml`:
 
 ```yaml
 s3_boto3_max_concurrency: 8   # suggested by benchmark
