@@ -1,19 +1,33 @@
+from __future__ import annotations
+
+import dataclasses
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from workshop_infrastructure.configs import ModelConfig
 from torch import nn
-from itertools import chain
 
-from torch.utils.checkpoint import checkpoint
+from workshop_infrastructure.models.helio_spectformer import HelioSpectFormer
+from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDecoder
 
-from surya.models.helio_spectformer import HelioSpectFormer
 
-from surya.models.embedding import (
-    LinearDecoder,
-    PerceiverDecoder,
-)
+_VALID_POOLINGS = {"global_average", "global_max", "attention", "transformer", "class_token"}
 
-class HelioSpectformer1D(HelioSpectFormer):
+
+class HelioSpectformer1D(nn.Module):
+    """
+    Fine-tuning wrapper for 1D outputs (e.g. regression or classification).
+
+    Holds a frozen-or-trainable HelioSpectFormer backbone and adds a pooling
+    layer plus a linear head on top. Only the head-specific parameters are
+    defined here; all backbone parameters are forwarded to HelioSpectFormer.
+    """
+
     def __init__(
         self,
+        # --- Backbone ---
         img_size: int,
         patch_size: int,
         in_chans: int,
@@ -32,17 +46,22 @@ class HelioSpectformer1D(HelioSpectFormer):
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
         ensemble: int | None = None,
-        finetune: bool = False,
         nglo: int = 0,
         dtype: torch.dtype = torch.bfloat16,
-        # Put finetuning additions below this line
+        # --- Fine-tuning head ---
         dropout: float = 0.1,
         num_outputs: int = 1,
         num_penultimate_transformer_layers: int = 1,
         num_penultimate_heads: int = 8,
-        config=None,
+        pooling: str = "class_token",
+        penultimate_linear_layer: bool = True,
     ):
-        super().__init__(
+        super().__init__()
+
+        if pooling not in _VALID_POOLINGS:
+            raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
+
+        self.backbone = HelioSpectFormer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
@@ -61,48 +80,21 @@ class HelioSpectformer1D(HelioSpectFormer):
             checkpoint_layers=checkpoint_layers,
             rpe=rpe,
             ensemble=ensemble,
-            finetune=finetune,
+            finetune=True,  # always strip the pretraining decoder
             dtype=dtype,
             nglo=nglo,
         )
 
-        self.pooling_strategies = [
-            config["model"]["global_average_pooling"],
-            config["model"]["global_max_pooling"],
-            config["model"]["attention_pooling"],
-            config["model"]["transformer_pooling"],
-            config["model"]["global_class_token"],
-        ]
+        self.pooling = pooling
+        self.embed_dim = embed_dim
+        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
+        self.penultimate_linear_layer_enabled = penultimate_linear_layer
 
-        assert (
-            sum(self.pooling_strategies) == 1
-        ), "No or multiple pooling strategy selected. Aborting."
+        if pooling == "attention":
+            self.attn_pool = nn.MultiheadAttention(embed_dim, num_penultimate_heads, dropout=dropout)
 
-        self.global_average_pooling = False
-        self.global_max_pooling = False
-        self.attention_pooling = False
-        self.transformer_pooling = False
-        self.penultimate_linear_layer = False
-        self.global_class_token = False
-
-        if config["model"]["dropout"] is not None:
-            self.dropout_layer = nn.Dropout(config["model"]["dropout"])
-            self.dropout = True
-
-        if config["model"]["global_average_pooling"]:
-            self.global_average_pooling = True
-
-        elif config["model"]["global_max_pooling"]:
-            self.global_max_pooling = True
-
-        elif config["model"]["attention_pooling"]:
-            self.attention = nn.MultiheadAttention(
-                embed_dim=embed_dim, num_heads=num_penultimate_heads, dropout=dropout
-            )
-            self.attention_pooling = True
-
-        elif config["model"]["transformer_pooling"]:
-            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))  # (batch, 1, 1, token_dim)
+        elif pooling == "transformer":
+            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_penultimate_heads,
@@ -112,114 +104,89 @@ class HelioSpectformer1D(HelioSpectFormer):
             self.downstream_transformer = nn.TransformerEncoder(
                 encoder_layer, num_layers=num_penultimate_transformer_layers
             )
-            self.transformer_pooling = True
 
-        elif config["model"]["global_class_token"]:
+        elif pooling == "class_token":
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-            self.global_class_token = True
 
-        else:
-            raise Exception("No valid pooling strategy selected.")
-
-        if config["model"]["penultimate_linear_layer"]:
+        if penultimate_linear_layer:
             self.linear = nn.Linear(embed_dim, embed_dim)
-            self.penultimate_linear_layer = True
 
         self.unembed = nn.Linear(embed_dim, num_outputs)
 
-    def _forward_cls_token(self, batch):
-        x = batch["ts"]
-        dt = batch["time_delta_input"]
-        B, C, T, H, W = x.shape
-
-        if self.learned_flow:
-            y_hat_flow = self.learned_flow_model(batch)  # B, C, H, W
-            if any([param.requires_grad for param in self.learned_flow_model.parameters()]):
-                return y_hat_flow
-            else:
-                x = torch.concat((x, y_hat_flow.unsqueeze(2)), dim=2)  # B, C, T+1, H, W
-                if self.time_embedding["type"] == "perceiver":
-                    dt = torch.cat((dt, batch["lead_time_delta"].reshape(-1, 1)), dim=1)
-
-        # embed the data
-        tokens = self.embedding(x, dt)
-
-        if self.ensemble:
-            raise NotImplementedError(
-                "Use of CLS token has not been implemented with ensemble modifications."
-            )
-        else:
-            noise = None
-
-        # pass the time series through the encoder
-        for i, blk in enumerate(
-            chain(self.backbone.blocks_spectral_gating, self.backbone.blocks_attention)
-        ):
-            if i == self.backbone.n_spectral_blocks:
-                tokens = torch.cat(
-                    (
-                        self.cls_token.expand(B, 1, self.embed_dim),
-                        tokens,
-                    ),
-                    dim=1,
-                )
-            if i in self.backbone._checkpoint_layers:
-                tokens = checkpoint(blk, tokens, noise, use_reentrant=False)
-            else:
-                tokens = blk(tokens, noise)
-        tokens = tokens[:, [0], :]
-
-        return tokens
-
     def forward(self, batch):
-        if self.global_class_token:
-            tokens = self._forward_cls_token(batch)
+        if self.pooling == "class_token":
+            tokens = self.backbone.forward_with_cls_token(batch, self.cls_token)
         else:
-            tokens = super().forward(batch=batch)
+            tokens = self.backbone.forward(batch)
 
-        if self.dropout is not None:
-            tokens = self.dropout_layer(tokens)
-
-        if self.penultimate_linear_layer:
+        if self.penultimate_linear_layer_enabled:
             tokens = self.linear(tokens)
 
-        # Global average pooling
-        if self.global_average_pooling:
-            agg_tokens = torch.mean(tokens, dim=1)  # (B, L, D) -> (B, D)
+        if self.pooling == "global_average":
+            agg_tokens = torch.mean(tokens, dim=1)
+        elif self.pooling == "global_max":
+            agg_tokens, _ = torch.max(tokens, dim=1)
+        elif self.pooling == "attention":
+            tokens = tokens.permute(1, 0, 2)
+            tokens, _ = self.attn_pool(query=tokens, key=tokens, value=tokens)
+            agg_tokens = tokens.sum(dim=0)
+        elif self.pooling == "transformer":
+            B = tokens.size(0)
+            tokens = torch.cat((self.cls_token.expand(B, -1, -1), tokens), dim=1)
+            tokens = self.downstream_transformer(tokens.permute(1, 0, 2))
+            agg_tokens = tokens[0, :, :]
+        elif self.pooling == "class_token":
+            agg_tokens = tokens.squeeze(dim=1)
 
-        # Global max pooling
-        if self.global_max_pooling:
-            agg_tokens, _ = torch.max(tokens, dim=1)  # (B, L, D) -> (B, D)
+        if self.dropout_layer is not None:
+            agg_tokens = self.dropout_layer(agg_tokens)
 
-        # Global attention pooling
-        if self.attention_pooling:
-            tokens = tokens.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-            tokens = self.attention(query=tokens, key=tokens, value=tokens)  # (L, B, D)
-            agg_tokens = tokens.sum(dim=0)  # (B, D)
+        return self.unembed(agg_tokens).squeeze(dim=1)
 
-        if self.transformer_pooling:
-            batch_size = tokens.size(0)
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  #  (B, 1, D)
-            tokens = torch.cat((cls_tokens, tokens), dim=1)  #  (B, L+1, D)
-            tokens = tokens.permute(1, 0, 2)  # (B, L+1, D) -> (L+1, B, D)
-            tokens = self.downstream_transformer(tokens)  # (L+1, B, D)
-            agg_tokens = tokens[0, :, :]  # (B, D)
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer1D":
+        """Construct from a ModelConfig, with optional field overrides.
 
-        if self.global_class_token:
-            agg_tokens = torch.squeeze(tokens, dim=1)
+        Fields that live outside ModelConfig (e.g. ``dtype``,
+        ``use_latitude_in_learned_flow``) should be supplied via ``overrides``.
+        """
+        kwargs = dict(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_channels,
+            embed_dim=cfg.embed_dim,
+            time_embedding=dataclasses.asdict(cfg.time_embedding),
+            depth=cfg.depth,
+            n_spectral_blocks=cfg.spectral_blocks,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            drop_rate=cfg.drop_rate,
+            window_size=cfg.window_size,
+            dp_rank=cfg.dp_rank,
+            learned_flow=cfg.learned_flow,
+            init_weights=cfg.init_weights,
+            checkpoint_layers=cfg.checkpoint_layers,
+            rpe=cfg.rpe,
+            ensemble=cfg.ensemble,
+            nglo=cfg.nglo,
+            dropout=cfg.dropout,
+            pooling=cfg.pooling,
+            penultimate_linear_layer=cfg.penultimate_linear_layer,
+        )
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
-        if self.dropout is not None:
-            out = self.dropout_layer(agg_tokens)
 
-        out = self.unembed(agg_tokens)
-        out = out.squeeze(dim=1)
+class HelioSpectformer2D(nn.Module):
+    """
+    Fine-tuning wrapper for 2D outputs (e.g. image reconstruction or forecasting).
 
-        return out
+    Holds a HelioSpectFormer backbone and adds a spatial decoder head on top.
+    """
 
-
-class HelioSpectformer2D(HelioSpectFormer):
     def __init__(
         self,
+        # --- Backbone ---
         img_size: int,
         patch_size: int,
         in_chans: int,
@@ -238,11 +205,13 @@ class HelioSpectformer2D(HelioSpectFormer):
         dtype: torch.dtype = torch.bfloat16,
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
-        finetune: bool = False,
-        # Put finetuning additions below this line
-        config=None,
+        # --- Fine-tuning head ---
+        ft_unembedding_type: str = "linear",
+        ft_out_chans: int = 1,
     ):
-        super().__init__(
+        super().__init__()
+
+        self.backbone = HelioSpectFormer(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
@@ -261,33 +230,55 @@ class HelioSpectformer2D(HelioSpectFormer):
             dtype=dtype,
             checkpoint_layers=checkpoint_layers,
             rpe=rpe,
-            finetune=finetune,
+            finetune=True,  # always strip the pretraining decoder
         )
 
-        match config["model"]["ft_unembedding_type"]:
-            case "linear":
-                self.unembed = LinearDecoder(
-                    patch_size=patch_size,
-                    out_chans=config["model"]["ft_out_chans"],
-                    embed_dim=embed_dim,
-                )
-            case "perceiver":
-                self.unembed = PerceiverDecoder(
-                    embed_dim=embed_dim,
-                    patch_size=patch_size,
-                    out_chans=config["model"]["ft_out_chans"],
-                )
-            case _:
-                raise NotImplementedError(
-                    f'Embedding {time_embedding["type"]} has not been implemented.'
-                )
+        if ft_unembedding_type == "linear":
+            self.unembed = LinearDecoder(
+                patch_size=patch_size,
+                out_chans=ft_out_chans,
+                embed_dim=embed_dim,
+            )
+        elif ft_unembedding_type == "perceiver":
+            self.unembed = PerceiverDecoder(
+                embed_dim=embed_dim,
+                patch_size=patch_size,
+                out_chans=ft_out_chans,
+            )
+        else:
+            raise ValueError(
+                f"ft_unembedding_type must be 'linear' or 'perceiver', got {ft_unembedding_type!r}"
+            )
 
     def forward(self, batch):
+        tokens = self.backbone.forward(batch)
+        return self.unembed(tokens)  # (B, L, D) -> (B, C, H, W)
 
-        tokens = super().forward(batch=batch)
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer2D":
+        """Construct from a ModelConfig, with optional field overrides.
 
-        # Unembed the tokens
-        # BE L D -> BE C H W
-        forecast_hat = self.unembed(tokens)
-
-        return forecast_hat
+        Fields that live outside ModelConfig (e.g. ``dtype``,
+        ``use_latitude_in_learned_flow``, ``ft_unembedding_type``,
+        ``ft_out_chans``) should be supplied via ``overrides``.
+        """
+        kwargs = dict(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_channels,
+            embed_dim=cfg.embed_dim,
+            time_embedding=dataclasses.asdict(cfg.time_embedding),
+            depth=cfg.depth,
+            n_spectral_blocks=cfg.spectral_blocks,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            drop_rate=cfg.drop_rate,
+            window_size=cfg.window_size,
+            dp_rank=cfg.dp_rank,
+            learned_flow=cfg.learned_flow,
+            init_weights=cfg.init_weights,
+            checkpoint_layers=cfg.checkpoint_layers,
+            rpe=cfg.rpe,
+        )
+        kwargs.update(overrides)
+        return cls(**kwargs)

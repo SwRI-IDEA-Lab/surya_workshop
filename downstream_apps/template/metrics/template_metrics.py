@@ -1,14 +1,18 @@
+"""
+Template metrics for flare forecasting.
+
+FlareMetrics defines three metric sets:
+- "train_loss"    — differentiable loss that drives backpropagation (MSE).
+- "train_metrics" — non-differentiable metrics logged during training (RRSE).
+- "val_metrics"   — metrics logged at validation (MSE + RRSE).
+
+The __call__ method selects the appropriate metric set based on the mode passed at
+construction time. The dictionary keys returned by each method become the metric names
+propagated to the logger (e.g. WandB, CSV).
+"""
+
 import torch
 import torchmetrics as tm  # Lots of possible metrics in here https://lightning.ai/docs/torchmetrics/stable/all-metrics.html
-
-"""
-Template metrics to be used for flare forecasting.  Within the FlareMetrics class,
-different methods are defined to calculate metrics for training loss, as well as evaluation
-metrics to report during training, and validation. The __call__ method allows for easy selection
-of the appropriate metric set based on the provided mode.
-
-The loss names used in the dictionary keys are propagated during the logging.
-"""
 
 class FlareMetrics:
     def __init__(self, mode: str):
@@ -24,10 +28,10 @@ class FlareMetrics:
         # Cache torchmetrics instances once (instead of recreating each call)
         self._rrse = tm.RelativeSquaredError(squared=False)
 
-    def _ensure_device(self, preds: torch.Tensor):
-        # Move metric module to the same device as preds, but only when needed
+    def _ensure_device(self, preds: torch.Tensor) -> None:
+        """Move torchmetrics modules to the same device as ``preds``, if needed."""
         if self._rrse.device != preds.device:
-            self._rrse = self._rrse.to(preds.device)        
+            self._rrse = self._rrse.to(preds.device)
 
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
@@ -117,25 +121,18 @@ class FlareMetrics:
     def __call__(
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
-        """
-        Default method to evaluated all metrics.
+        """Evaluate metrics for the mode set at construction time.
 
-        Parameters
-        ----------
-        preds : torch.Tensor
-            Output target of the AI model. Shape depends on the application.
-        target : torch.Tensor
-            Ground truth to compare AI model output against
+        Args:
+            preds: Model output tensor. Shape depends on the application.
+            target: Ground truth tensor to compare against.
 
-        Returns
-        -------
-        dict
-            Dictionary with all metrics. Metrics aggregate over the batch. So the
-            dicationary takes the shape [str, torch.Tensor] with the tensors having
-            shape [].
-        list
-            List of weights for each calculated metric to enable giving a different
-            weight to each loss term.
+        Returns:
+            tuple[dict[str, torch.Tensor], list[float]]:
+                - Metric dictionary. Keys become logger metric names; values are
+                  scalar tensors aggregated over the batch.
+                - List of per-metric weights (used by FlareLightningModule to
+                  combine multiple loss terms into a single scalar).
         """
 
         match self.mode.lower():

@@ -1,8 +1,25 @@
+"""
+PyTorch dataset for SDO (Solar Dynamics Observatory) NetCDF files.
+
+This module provides:
+- ``HelioNetCDFDataset`` — the base dataset class used by all Surya downstream tasks.
+  Handles index loading, temporal frame sampling, signum-log normalization, channel
+  masking, and transparent local/S3 file access.
+- ``RandomChannelMaskerTransform`` — callable that randomly zeros input channels to
+  improve robustness to missing observations.
+- Signum-log transform functions (``transform``, ``fast_transform``, and their inverses)
+  used to normalize solar imagery before passing it to the model.
+
+When writing a downstream task, subclass ``HelioNetCDFDataset`` and override
+``__getitem__`` to attach your task-specific labels to the sample dict returned by
+``super().__getitem__()``.
+"""
+
 import os
-import sys
+import re
 import random
+import hashlib
 from datetime import datetime
-from typing import Tuple
 import torch
 import numpy as np
 import skimage.measure
@@ -10,11 +27,9 @@ import xarray as xr
 import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
-from Surya.surya.utils.distributed import get_rank
-from Surya.surya.utils.log import create_logger
-from functools import cache
+from workshop_infrastructure.utils import get_rank, create_logger
 
-# Optional S3 support (required only when reading s3:// URIs)
+# Optional S3 support via fsspec/s3fs (read-through streaming)
 try:
     import fsspec
     import s3fs
@@ -22,30 +37,62 @@ except Exception:  # pragma: no cover
     fsspec = None
     s3fs = None
 
+# Optional S3 support via boto3 (recommended: faster whole-object downloads)
+try:
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config as BotoConfig
+    from boto3.s3.transfer import TransferConfig
+except Exception:  # pragma: no cover
+    boto3 = None
+    UNSIGNED = None
+    BotoConfig = None
+    TransferConfig = None
+
 from numba import njit, prange
+import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compression filters
 
-import hdf5plugin
 
+# ---------------------------------------------------------------------------
+# Signum-log transforms (module-level so numba can JIT-compile them)
+# ---------------------------------------------------------------------------
+#
+# Why signum-log?  Solar imagery (especially magnetograms and EUV channels)
+# has values that span many orders of magnitude and are symmetric around zero.
+# A plain log is undefined for negative values; a standard z-score squashes the
+# large dynamic range unevenly.  Signum-log preserves sign, compresses extreme
+# values, and then standardizes:
+#
+#   forward:  y = sign(x * s) * log1p(|x * s|)   then  (y - μ) / (σ + ε)
+#   inverse:  y_raw = y * (σ + ε) + μ             then  sign(y_raw) * expm1(|y_raw|) / s
+#
+# where s = sl_scale_factor (per-channel amplitude scaling applied before the log).
+# μ, σ, ε, and s are stored in the per-channel scaler objects built by
+# ``workshop_infrastructure/utils.py:build_scalers()``.
+#
+# Two implementations are provided:
+#   fast_transform / fast_inverse_transform — Numba JIT, parallel across channels.
+#     Faster for large arrays but may hang on some GPU clusters with dataloader workers.
+#   transform / inverse_transform_single_channel — pure NumPy, always safe.
+# ---------------------------------------------------------------------------
 
 @njit(parallel=True)
 def fast_transform(data, means, stds, sl_scale_factors, epsilons):
-    """
-    Implements signum log transform using numba for speed
-    Notes:
-    - This must reside outside the class definition from which it is called.
-    - We used this function during pretraining for faster data loading. On select
-      GPU clusters it leads to the system hanging however when data loading happens
-      outside the GPU thread. See below for a non-numba-enhanced version.
+    """Signum-log normalization, Numba parallel implementation.
+
+    See the module-level comment for the mathematical definition.
+    Must live outside class definitions (Numba requirement).
+    May hang on some GPU clusters with dataloader workers — use ``transform`` in that case.
 
     Args:
-        data: Numpy array of shape C, H, W
-        means: Numpy array of shape C. Mean per channel.
-        stds: Numpy array of shape C. Standard deviation per channel.
-        sl_scale_factors: Numpy array of shape C. Signum-log scale factors.
-        epsilons: Numpy array of shape C. Constant to avoid zero division.
+        data: NumPy array of shape (C, H, W).
+        means: Per-channel means, shape (C,).
+        stds: Per-channel standard deviations, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
 
     Returns:
-        Numpy array of shape C, H, W.
+        Normalized array of shape (C, H, W), dtype float32.
     """
     C, H, W = data.shape
     out = np.empty((C, H, W), dtype=np.float32)
@@ -56,20 +103,27 @@ def fast_transform(data, means, stds, sl_scale_factors, epsilons):
         sl_scale_factor = sl_scale_factors[c]
         for i in range(H):
             for j in range(W):
-                val = data[c, i, j]
-                val = val * sl_scale_factor
-                if val >= 0:
-                    val = np.log1p(val)
-                else:
-                    val = -np.log1p(-val)
+                val = data[c, i, j] * sl_scale_factor
+                val = np.log1p(val) if val >= 0 else -np.log1p(-val)
                 out[c, i, j] = (val - mean) / (std + eps)
     return out
 
+
 @njit(parallel=True)
 def fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons):
-    """
-    implements signum log transform using numba for speed
-        note: this must reside outside the class definition from which it is called
+    """Inverse signum-log normalization, Numba parallel implementation.
+
+    See the module-level comment for the mathematical definition.
+
+    Args:
+        data: Normalized array of shape (C, H, W).
+        means: Per-channel means, shape (C,).
+        stds: Per-channel standard deviations, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
+
+    Returns:
+        Reconstructed array of shape (C, H, W), dtype float32.
     """
     C, H, W = data.shape
     out = np.empty((C, H, W), dtype=np.float32)
@@ -80,33 +134,33 @@ def fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons):
         sl_scale_factor = sl_scale_factors[c]
         for i in range(H):
             for j in range(W):
-                val = data[c, i, j]
-                val = val * (std + eps) + mean
-
-                # Apply the inverse of log1p, which is expm1
-                abs_data = np.expm1(np.abs(val))
-
-                # Restore the original sign
-                out[c, i, j] = np.sign(val) * abs_data / sl_scale_factor
+                val = data[c, i, j] * (std + eps) + mean
+                val = np.expm1(val) if val >= 0 else -np.expm1(-val)
+                out[c, i, j] = val / sl_scale_factor
     return out
 
 
 def transform(
-    data: np.ndarray, means: np.ndarray, stds: np.ndarray, sl_scale_factors: np.ndarray, epsilons: np.ndarray
+    data: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+    sl_scale_factors: np.ndarray,
+    epsilons: np.ndarray,
 ) -> np.ndarray:
-    """
-    Implements signum log transform. Drop-in replacement for
-    `fast_transform` method above.
+    """Signum-log normalization, pure NumPy. Drop-in replacement for ``fast_transform``.
+
+    Safe to use with DataLoader workers on any platform. See the module-level comment
+    for the mathematical definition.
 
     Args:
-        data: Numpy array of shape C, H, W
-        means: Numpy array of shape C. Mean per channel.
-        stds: Numpy array of shape C. Standard deviation per channel.
-        sl_scale_factors: Numpy array of shape C. Signum-log scale factors.
-        epsilons: Numpy array of shape C. Constant to avoid zero division.
+        data: NumPy array of shape (C, H, W).
+        means: Per-channel means, shape (C,).
+        stds: Per-channel standard deviations, shape (C,).
+        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
+        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
 
     Returns:
-        Numpy array of shape C, H, W.
+        Normalized array of shape (C, H, W).
     """
     means = means.reshape(*means.shape, 1, 1)
     stds = stds.reshape(*stds.shape, 1, 1)
@@ -116,100 +170,71 @@ def transform(
     data = data * sl_scale_factors
     data = np.sign(data) * np.log1p(np.abs(data))
     data = (data - means) / (stds + epsilons)
-
     return data
-
-
-@njit(parallel=True)
-def inverse_fast_transform(data, means, stds, sl_scale_factors, epsilons):
-    """
-    Implements inverse signum log transform using numba for speed
-
-    Args:
-        data: Numpy array of shape C, H, W
-        means: Numpy array of shape C. Mean per channel.
-        stds: Numpy array of shape C. Standard deviation per channel.
-        sl_scale_factors: Numpy array of shape C. Signum-log scale factors.
-        epsilons: Numpy array of shape C. Constant to avoid zero division.
-
-    Returns:
-        Numpy array of shape C, H, W.
-    """
-    C, H, W = data.shape
-    out = np.empty((C, H, W), dtype=np.float32)
-
-    for c in prange(C):
-        mean = means[c]
-        std = stds[c]
-        eps = epsilons[c]
-        sl_scale_factor = sl_scale_factors[c]
-
-        for i in range(H):
-            for j in range(W):
-                val = data[c, i, j]
-                val = val * (std + eps) + mean
-
-                if val >= 0:
-                    val = np.expm1(val)
-                else:
-                    val = -np.expm1(-val)
-
-                val = val / sl_scale_factor
-
-                out[c, i, j] = val
-
-    return out
 
 
 def inverse_transform_single_channel(data, mean, std, sl_scale_factor, epsilon):
-    """
-    Implements inverse signum log transform.
+    """Inverse signum-log normalization for a single channel (pure NumPy).
+
+    Convenience wrapper for per-channel post-processing (e.g. model output visualization).
+    For full (C, H, W) arrays use ``fast_inverse_transform`` or invert via
+    ``HelioNetCDFDataset.inverse_transform_data()``.
 
     Args:
-        data: Numpy array of shape C, H, W
-        means: Numpy array of shape C. Mean per channel.
-        stds: Numpy array of shape C. Standard deviation per channel.
-        sl_scale_factors: Numpy array of shape C. Signum-log scale factors.
-        epsilons: Numpy array of shape C. Constant to avoid zero division.
+        data: NumPy array of shape (H, W).
+        mean: Scalar mean.
+        std: Scalar standard deviation.
+        sl_scale_factor: Scalar amplitude scaling factor.
+        epsilon: Small constant that prevents division by zero.
 
     Returns:
-        Numpy array of shape C, H, W.
+        Reconstructed array of shape (H, W).
     """
     data = data * (std + epsilon) + mean
-
     data = np.sign(data) * np.expm1(np.abs(data))
+    return data / sl_scale_factor
 
-    data = data / sl_scale_factor
 
-    return data
-
+# ---------------------------------------------------------------------------
+# Channel masking transform
+# ---------------------------------------------------------------------------
 
 class RandomChannelMaskerTransform:
-    def __init__(self, num_channels, num_mask_aia_channels, phase, drop_hmi_probability):
-        """
-        Initialize the RandomChannelMaskerTransform class as a transform.
+    """Randomly zero-out AIA channels and optionally the HMI channel.
 
-        Args:
-        - num_channels: Total number of channels in the input (3rd dimension of
-          the tensor).
-        - num_mask_aia_channels: Number of channels to randomly mask.
-        """
+    Used during pretraining to improve robustness to missing inputs.
+
+    Args:
+        num_channels: Total number of channels in the input tensor.
+        num_mask_aia_channels: Number of AIA channels to randomly zero-out per sample.
+        phase: Dataset phase (e.g., ``"train"``). Included for future phase-specific logic.
+        drop_hmi_probability: Probability of zeroing the last (HMI) channel.
+    """
+
+    def __init__(self, num_channels, num_mask_aia_channels, phase, drop_hmi_probability):
         self.num_channels = num_channels
         self.num_mask_aia_channels = num_mask_aia_channels
         self.drop_hmi_probability = drop_hmi_probability
 
     def __call__(self, input_tensor):
-        C, T, H, W = input_tensor.shape  # Unpacking the correct 5 dimensions
+        """Apply random channel masking to a (C, T, H, W) image stack.
 
-        # Randomly select channels to mask
+        Zeros out ``num_mask_aia_channels`` randomly chosen channels uniformly across all
+        timesteps, and independently drops the last channel (HMI) with probability
+        ``drop_hmi_probability``.
+
+        Args:
+            input_tensor: Array of shape (C, T, H, W).
+
+        Returns:
+            Masked array of the same shape.
+        """
+        C, T, H, W = input_tensor.shape
+
         channels_to_mask = random.sample(range(C), self.num_mask_aia_channels)
-
-        # Create an in-place mask of shape [1, 1, num_channels, 1, 1]
         mask = torch.ones((C, 1, 1, 1))
-        mask[channels_to_mask, ...] = 0  # Set selected channels to zero
-
-        # Apply the mask in-place for memory efficiency
-        masked_tensor = input_tensor * mask  # Modify input_tensor directly
+        mask[channels_to_mask, ...] = 0
+        masked_tensor = input_tensor * mask
 
         if self.drop_hmi_probability > random.random():
             masked_tensor[-1, ...] = 0
@@ -217,25 +242,70 @@ class RandomChannelMaskerTransform:
         return masked_tensor
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class HelioNetCDFDataset(Dataset):
     """
-    PyTorch dataset to load a curated dataset from the NASA Solar Dynamics
-    Observatory (SDO) mission stored as NetCDF files, with handling for variable timesteps.
+    PyTorch dataset for SDO NetCDF files, supporting both local and S3 storage.
 
-    Internally maintains two databases. The first is `self.index`. This takes the
-    form
-                                                                        path  present
-        timestep
-        2011-01-01 00:00:00  /lustre/fs0/scratch/shared/data/2011/01/Arka_2...        1
-        2011-01-01 00:12:00  /lustre/fs0/scratch/shared/data/2011/01/Arka_2...        1
-        ...                                                                ...      ...
-        2012-11-30 23:48:00  /lustre/fs0/scratch/shared/data/2012/11/Arka_2...        1
+    Loads multi-channel (AIA + HMI) solar image stacks and pairs them with
+    forecast targets for temporal prediction tasks. Handles variable input
+    timestep sampling and is compatible with downstream fine-tuning.
 
-    The second is `self.valid_indices`. This is simply a list of timesteps -- entries
-    in the index of `self.index` -- which define valid samples. A sample is valid
-    when all timestamps that can be reached by entris in
-    time_delta_input_minutes and time_delta_target_minutes can be reached from it
-    are present.
+    Index format (CSV with columns: timestep, path, present):
+
+        timestep                    path                                present
+        2011-01-01 00:00:00  s3://bucket/2011/01/sample.nc              1
+        2011-01-01 00:12:00  s3://bucket/2011/01/sample.nc              1
+        ...
+
+    Valid samples are timesteps for which all required input and target
+    offsets can be resolved in the index.
+
+    Args:
+        index_path: Path to the CSV index file.
+        time_delta_input_minutes: List of candidate input time offsets in minutes, sorted ascending.
+            The **last entry must be 0** (the "now" frame, always included). Earlier entries are the
+            pool of historical offsets from which ``n_input_timestamps - 1`` frames are sampled
+            randomly per call to ``__getitem__``.
+        time_delta_target_minutes: Step size in minutes between forecast frames.
+            Forecast targets are at offsets 1×, 2×, … (``rollout_steps + 1``)× this value.
+            Only used when ``load_forecast_frames=True``.
+        n_input_timestamps: Number of input frames to include per sample. Must be
+            ≤ ``len(time_delta_input_minutes)``.
+        rollout_steps: Number of additional forecast steps beyond the first target frame.
+            ``rollout_steps=0`` produces one target frame; ``rollout_steps=N`` produces N+1.
+            Only used when ``load_forecast_frames=True``.
+        scalers: Per-channel normalization statistics produced by
+            ``workshop_infrastructure/utils.py:build_scalers()``. Each entry must expose
+            ``.mean``, ``.std``, ``.epsilon``, and ``.sl_scale_factor``.
+        num_mask_aia_channels: Number of AIA channels to randomly mask during training.
+        drop_hmi_probability: Probability of dropping the HMI channel during training.
+        use_latitude_in_learned_flow: If True, include heliographic latitude in the output dict.
+        channels: List of NetCDF variable names to load. Defaults to 8 AIA + HMI channels.
+        phase: Dataset phase label (e.g., ``"train"``, ``"val"``).
+        pooling: Spatial downsampling factor (average pooling). ``None`` or ``1`` means no pooling.
+        random_vert_flip: If True, randomly flip images vertically during training.
+        sdo_data_root_path: Optional root directory prepended to relative local paths.
+        s3_storage_options: Options forwarded to fsspec/s3fs (e.g., ``{'anon': True}`` for public buckets).
+        s3_use_simplecache: If True, use fsspec simplecache for read-through S3 caching.
+        s3_cache_dir: **Required when reading from S3.** Local directory where S3 files are cached.
+            There is no default — you must set this explicitly. Each full-resolution SDO NetCDF file
+            is approximately 1 GB, so make sure the target filesystem has sufficient space
+            (budget ~1 GB × number of unique timesteps in your dataset).
+        s3fs_kwargs: Additional kwargs passed to ``s3fs.S3FileSystem``.
+        s3_download_to_temp: If True (recommended for NetCDF/HDF5), download each S3 object to a
+            local file before opening. Avoids seekability issues with streaming reads.
+        s3_temp_dir: Directory for downloaded S3 files. Defaults to ``s3_cache_dir``.
+        s3_boto3_max_concurrency: Number of parallel threads for boto3 multipart downloads.
+        s3_boto3_part_size_mb: Part size in MB for boto3 multipart downloads.
+        load_forecast_frames: If True (default), load both input and forecast frames and include
+            ``forecast`` and ``lead_time_delta`` in the returned sample. Set to False for downstream
+            tasks that supply their own target labels (e.g., flare intensity from a separate catalog),
+            so that future frames are never fetched from disk or S3. This also relaxes the index
+            validity check — only input-frame timestamps need to be present.
     """
 
     def __init__(
@@ -248,21 +318,25 @@ class HelioNetCDFDataset(Dataset):
         scalers=None,
         num_mask_aia_channels: int = 0,
         drop_hmi_probability: float = 0.0,
-        use_latitude_in_learned_flow=False,
+        use_latitude_in_learned_flow: bool = False,
         channels: list[str] | None = None,
-        phase="train",
+        phase: str = "train",
         pooling: int | None = None,
         random_vert_flip: bool = False,
         sdo_data_root_path: str | None = None,
-        # --- S3 options (used only if index contains s3:// URIs) ---
+        # S3 options (only used when index contains s3:// URIs)
         s3_storage_options: dict | None = None,
-        s3_use_simplecache: bool = True,
-        s3_cache_dir: str = "/tmp/helio_s3_cache",
+        s3_use_simplecache: bool = False,
+        s3_cache_dir: str | None = None,
         s3fs_kwargs: dict | None = None,
+        s3_download_to_temp: bool = True,
+        s3_temp_dir: str | None = None,
+        s3_boto3_max_concurrency: int = 4,
+        s3_boto3_part_size_mb: int = 64,
+        load_forecast_frames: bool = True,
     ):
         self.scalers = scalers
         self.phase = phase
-        self.channels = channels
         self.num_mask_aia_channels = num_mask_aia_channels
         self.drop_hmi_probability = drop_hmi_probability
         self.n_input_timestamps = n_input_timestamps
@@ -271,27 +345,23 @@ class HelioNetCDFDataset(Dataset):
         self.pooling = pooling if pooling is not None else 1
         self.random_vert_flip = random_vert_flip
         self.sdo_data_root_path = sdo_data_root_path
-        # --- S3 configuration ---
-        # These are only used when a filepath begins with 's3://'.
+
         self.s3_storage_options = s3_storage_options or {}
         self.s3_use_simplecache = s3_use_simplecache
         self.s3_cache_dir = s3_cache_dir
         self.s3fs_kwargs = s3fs_kwargs or {}
-        # Lazily-initialized S3 filesystem handle (per-process).
-        self._s3fs = None
+        self.s3_download_to_temp = s3_download_to_temp
+        self.s3_temp_dir = s3_temp_dir if s3_temp_dir is not None else s3_cache_dir
+        # Note: s3_cache_dir is intentionally left as None here. Its presence is validated
+        # lazily in _load_s3_nc_data, so users with only local paths pay no cost.
+        self.s3_boto3_max_concurrency = s3_boto3_max_concurrency
+        self.s3_boto3_part_size_mb = s3_boto3_part_size_mb
+        self._s3fs = None  # lazily initialized per process
+        self.load_forecast_frames = load_forecast_frames
 
-        if self.channels is None:
-            # AIA + HMI channels
-            self.channels = [
-                "0094",
-                "0131",
-                "0171",
-                "0193",
-                "0211",
-                "0304",
-                "0335",
-                "hmi",
-            ]
+        self.channels = channels if channels is not None else [
+            "0094", "0131", "0171", "0193", "0211", "0304", "0335", "hmi"
+        ]
         self.in_channels = len(self.channels)
 
         self.masker = RandomChannelMaskerTransform(
@@ -301,32 +371,62 @@ class HelioNetCDFDataset(Dataset):
             drop_hmi_probability=self.drop_hmi_probability,
         )
 
-        # Convert time delta to numpy timedelta64
-        self.time_delta_input_minutes = sorted(np.timedelta64(t, "m") for t in time_delta_input_minutes)
+        self.time_delta_input_minutes = sorted(
+            np.timedelta64(t, "m") for t in time_delta_input_minutes
+        )
+        # range(1, rollout_steps + 2): starts at 1× (first target), ends at (rollout_steps + 1)×.
+        # rollout_steps=0 → one target frame; rollout_steps=N → N+1 target frames.
         self.time_delta_target_minutes = [
-            np.timedelta64(iroll * time_delta_target_minutes, "m") for iroll in range(1, rollout_steps + 2)
+            np.timedelta64(iroll * time_delta_target_minutes, "m")
+            for iroll in range(1, rollout_steps + 2)
         ]
 
-        # Create the index
         self.index = pd.read_csv(index_path)
         self.index = self.index[self.index["present"] == 1]
         self.index["timestep"] = pd.to_datetime(self.index["timestep"]).values.astype("datetime64[ns]")
         self.index.set_index("timestep", inplace=True)
         self.index.sort_index(inplace=True)
 
-        # Filter out rows where the sequence is not fully present
-        self.valid_indices = self.filter_valid_indices()
+        self.valid_indices = self._filter_valid_indices()
         self.adjusted_length = len(self.valid_indices)
 
         self.rank = get_rank()
         self.logger: Logger | None = None
 
-    def create_logger(self):
+        # Pre-compute normalization arrays once (avoids repeated dict lookups per sample).
+        self._means = np.array([self.scalers[ch].mean for ch in self.channels])
+        self._stds = np.array([self.scalers[ch].std for ch in self.channels])
+        self._epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
+        self._sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
+
+    # ------------------------------------------------------------------
+    # Index filtering
+    # ------------------------------------------------------------------
+
+    def _filter_valid_indices(self) -> list:
+        """Return the list of reference timesteps for which all required offsets are present.
+
+        When ``load_forecast_frames=False``, only input-frame offsets are checked, so the
+        index does not need to contain future timestamps.
         """
-        Creates a logger attached to self.logger.
-        The logger is identified by SLURM job ID
-        as well as the data processes rank and process ID.
-        """
+        if self.load_forecast_frames:
+            # `+` concatenates two Python lists of np.timedelta64 objects before deduplication.
+            time_deltas = np.unique(self.time_delta_input_minutes + self.time_delta_target_minutes)
+        else:
+            time_deltas = np.unique(self.time_delta_input_minutes)
+        return [
+            ts for ts in self.index.index
+            if all(ts + dt in self.index.index for dt in time_deltas)
+        ]
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _ensure_logger(self):
+        """Create a per-process logger on first use."""
+        if self.logger is not None:
+            return
         os.makedirs("logs/data", exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
         pid = os.getpid()
@@ -336,320 +436,319 @@ class HelioNetCDFDataset(Dataset):
             name=f"{timestamp}_{self.rank:>03}_data_{self.phase}_{pid}",
         )
 
-    def filter_valid_indices(self):
-        """
-        Extracts timestamps from the index of self.index that define valid
-        samples.
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
 
-        Args:
-        Returns:
-            List of timestamps.
-        """
-
-        valid_indices = []
-        time_deltas = np.unique(self.time_delta_input_minutes + self.time_delta_target_minutes)
-
-        for reference_timestep in self.index.index:
-            required_timesteps = reference_timestep + time_deltas
-
-            if all(t in self.index.index for t in required_timesteps):
-                valid_indices.append(reference_timestep)
-
-        return valid_indices
-
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of valid reference timesteps in this dataset."""
         return self.adjusted_length
 
     def __getitem__(self, idx: int) -> dict:
         """
+        Load and return a single sample.
+
         Args:
-            idx: Index of sample to load. (Pytorch standard.)
+            idx: Dataset index.
+
         Returns:
-            Dictionary with following keys. The values are tensors with shape as follows:
-                ts (torch.Tensor):                C, T, H, W
-                time_delta_input (torch.Tensor):  T
-                input_latitude (torch.Tensor):    T
-                forecast (torch.Tensor):          C, L, H, W
-                lead_time_delta (torch.Tensor):   L
-                forecast_latitude (torch.Tensor): L
-            C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
+            Dictionary with keys:
+                ts (np.ndarray):               (C, T, H, W) — input frames
+                time_delta_input (np.ndarray): (T,) — input time offsets in hours (relative to "now")
+            When ``load_forecast_frames=True`` (default), also includes:
+                forecast (np.ndarray):         (C, L, H, W) — target frames
+                lead_time_delta (np.ndarray):  (L,) — lead times in hours (negative = future)
+            When ``use_latitude_in_learned_flow=True``, also includes:
+                input_latitudes (list[float])
+                forecast_latitude (list[float])  — only when ``load_forecast_frames=True``
         """
-        if self.logger is None:
-            self.create_logger()
-            self.logger.info(f"HelioNetCDFDataset of length {self.__len__()}.")
+        self._ensure_logger()
+        self.logger.info(f"Retrieving index {idx}.")
+        return self._get_index_data(idx)
 
-        exception_counter = 0
-        max_exception = 100
+    # ------------------------------------------------------------------
+    # Internal data loading
+    # ------------------------------------------------------------------
 
-        self.logger.info(f"Starting to retrieve index {idx}.")
+    def _load_and_stack_frames(self, timesteps) -> np.ndarray:
+        """Load, normalize, and stack NetCDF frames into a (C, T, H, W) array.
 
-        while True:
-            try:
-                sample = self._get_index_data(idx)
-            except Exception as e:
-                exception_counter += 1
-                if exception_counter >= max_exception:
-                    raise e
+        Args:
+            timesteps: Sequence of timestamps; one NetCDF file is loaded per entry.
 
-                reference_timestep = self.valid_indices[idx]
-                self.logger.warning(
-                    f"Failed retrieving index {idx}. Timestamp {reference_timestep}. Attempt {exception_counter}."
-                )
-
-                idx = (idx + 1) % self.__len__()
-            else:
-                self.logger.info(f"Returning index {idx}.")
-                return sample
+        Returns:
+            NumPy array of shape (C, T, H, W).
+        """
+        return np.stack(
+            [self.transform_data(self.load_nc_data(self.index.loc[ts, "path"], ts, self.channels))
+             for ts in timesteps],
+            axis=1,
+        )
 
     def _get_index_data(self, idx: int) -> dict:
-        """
-        Args:
-            idx: Index of sample to load. (Pytorch standard.)
-        Returns:
-            Dictionary with following keys. The values are tensors with shape as follows:
-                ts (torch.Tensor):                C, T, H, W
-                time_delta_input (torch.Tensor):  T
-                input_latitude (torch.Tensor):    T
-                forecast (torch.Tensor):          C, L, H, W
-                lead_time_delta (torch.Tensor):   L
-                forecast_latitude (torch.Tensor): L
-            C - Channels, T - Input times, H - Image height, W - Image width, L - Lead time.
-        """
-        # start_time = time.time()
+        """Build and return the sample dict for a single reference timestep.
 
-        time_deltas = np.array(
+        Samples historical input frames randomly from ``time_delta_input_minutes``,
+        applies channel masking and optional vertical flip, then assembles the sample
+        dict described in ``__getitem__``.
+        """
+        reference_timestep = self.valid_indices[idx]
+
+        # The last entry in time_delta_input_minutes is always the "now" frame (offset 0
+        # relative to the reference timestep). The remaining n-1 input frames are sampled
+        # randomly from the earlier offsets, giving the model varied historical context
+        # across training steps.
+        input_time_deltas = np.array(
             sorted(random.sample(self.time_delta_input_minutes[:-1], self.n_input_timestamps - 1))
             + [self.time_delta_input_minutes[-1]]
-            + self.time_delta_target_minutes
         )
-        reference_timestep = self.valid_indices[idx]
-        required_timesteps = reference_timestep + time_deltas
-
-        sequence_data = [
-            self.transform_data(self.load_nc_data(self.index.loc[timestep, "path"], timestep, self.channels))
-            for timestep in required_timesteps
-        ]
-
-        # Split sequence_data into inputs and target
-        inputs = sequence_data[: -self.rollout_steps - 1]
-        targets = sequence_data[-self.rollout_steps - 1 :]
-
-        stacked_inputs = np.stack(inputs, axis=1)
-        stacked_targets = np.stack(targets, axis=1)
-
-        timestamps_input = required_timesteps[: -self.rollout_steps - 1]
-        timestamps_targets = required_timesteps[-self.rollout_steps - 1 :]
+        input_timesteps = reference_timestep + input_time_deltas
+        stacked_inputs = self._load_and_stack_frames(input_timesteps)
 
         if self.num_mask_aia_channels > 0 or self.drop_hmi_probability:
-            # assert 0 < self.num_mask_aia_channels < self.in_channels, \
-            #     f'num_mask_aia_channels = {self.num_mask_aia_channels} should lie between 0 and {self.in_channels}'
-
             stacked_inputs = self.masker(stacked_inputs)
 
+        # All time deltas are expressed relative to "now" (the last input frame), in hours.
+        now_delta = input_time_deltas[-1]
         time_delta_input_float = (
-            time_deltas[-self.rollout_steps - 2] - time_deltas[: -self.rollout_steps - 1]
-        ) / np.timedelta64(1, "h")
-        time_delta_input_float = time_delta_input_float.astype(np.float32)
+            (now_delta - input_time_deltas) / np.timedelta64(1, "h")
+        ).astype(np.float32)
 
-        lead_time_delta_float = (
-            time_deltas[-self.rollout_steps - 2] - time_deltas[-self.rollout_steps - 1 :]
-        ) / np.timedelta64(1, "h")
-        lead_time_delta_float = lead_time_delta_float.astype(np.float32)
-
-        # print('LocalRank', int(os.environ["LOCAL_RANK"]),
-        #       'GlobalRank', int(os.environ["RANK"]),
-        #       'worker', torch.utils.data.get_worker_info().id,
-        #       f': Processed Input: {idx} ',time.time()- start_time)
-
-        metadata = {
-            "timestamps_input": timestamps_input,
-            "timestamps_targets": timestamps_targets,
+        sample = {
+            "ts": stacked_inputs,
+            "time_delta_input": time_delta_input_float,
         }
 
-        if self.random_vert_flip:
-            if torch.bernoulli(torch.ones(()) / 2) == 1:
-                stacked_inputs = torch.flip(stacked_inputs, dims=-2)
-                stacked_targets = torch.flip(stacked_inputs, dims=-2)
+        if self.load_forecast_frames:
+            target_time_deltas = np.array(self.time_delta_target_minutes)
+            target_timesteps = reference_timestep + target_time_deltas
+            sample["forecast"] = self._load_and_stack_frames(target_timesteps)
+            sample["lead_time_delta"] = (
+                (now_delta - target_time_deltas) / np.timedelta64(1, "h")
+            ).astype(np.float32)
+
+        if self.random_vert_flip and torch.bernoulli(torch.ones(()) / 2) == 1:
+            sample["ts"] = np.flip(sample["ts"], axis=-2).copy()
+            if self.load_forecast_frames:
+                sample["forecast"] = np.flip(sample["forecast"], axis=-2).copy()
 
         if self.use_latitude_in_learned_flow:
             from sunpy.coordinates.ephemeris import get_earth
 
-            sequence_latitude = [get_earth(timestep).lat.value for timestep in required_timesteps]
-            input_latitudes = sequence_latitude[: -self.rollout_steps - 1]
-            target_latitude = sequence_latitude[-self.rollout_steps - 1 :]
+            sample["input_latitudes"] = [get_earth(ts).lat.value for ts in input_timesteps]
+            if self.load_forecast_frames:
+                sample["forecast_latitude"] = [get_earth(ts).lat.value for ts in target_timesteps]
 
-            return {
-                "ts": stacked_inputs,
-                "time_delta_input": time_delta_input_float,
-                "input_latitudes": input_latitudes,
-                "forecast": stacked_targets,
-                "lead_time_delta": lead_time_delta_float,
-                "forecast_latitude": target_latitude,
-            }  # , metadata
+        return sample
 
-        return {
-            "ts": stacked_inputs,
-            "time_delta_input": time_delta_input_float,
-            "forecast": stacked_targets,
-            "lead_time_delta": lead_time_delta_float,
-        }  # , metadata
+    # ------------------------------------------------------------------
+    # NetCDF loading
+    # ------------------------------------------------------------------
+
+    def load_nc_data(self, filepath: str, timestep: pd.Timestamp, channels: list[str]) -> np.ndarray:
+        """
+        Load a NetCDF file and return channel-stacked data as a NumPy array.
+
+        Supports both local filesystem paths and S3 URIs (``s3://bucket/key``).
+        When loading from S3, files are downloaded to a local cache directory
+        before opening (controlled by ``s3_download_to_temp``).
+
+        Args:
+            filepath: Local path or S3 URI.
+            timestep: Timestamp for the file (used for logging).
+            channels: List of variable names to extract, stacked into (C, H, W).
+
+        Returns:
+            NumPy array of shape (C, H, W).
+        """
+        self._ensure_logger()
+        self.logger.info(f"Reading file {filepath}.")
+
+        if not self._is_s3_path(filepath) and self.sdo_data_root_path and not os.path.isabs(filepath):
+            filepath = os.path.join(self.sdo_data_root_path, filepath)
+
+        if self._is_s3_path(filepath):
+            return self._load_s3_nc_data(filepath, channels)
+
+        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
+            return ds[channels].to_array().load().to_numpy()
+
+    def _load_s3_nc_data(self, s3_uri: str, channels: list[str]) -> np.ndarray:
+        """Load a NetCDF file from S3 and return the requested channels as a NumPy array.
+
+        Two code paths depending on ``s3_download_to_temp`` (recommended default: True):
+
+        1. **Download-to-cache** (``s3_download_to_temp=True``): the full S3 object is
+           downloaded to ``s3_cache_dir`` before opening with xarray. Uses an atomic
+           write (partial → rename) so a crashed download never leaves a corrupt cache
+           file. Subsequent calls for the same URI are served from the local cache.
+           Requires boto3 (preferred, parallel multipart) or s3fs (fallback streaming).
+
+        2. **Streaming** (``s3_download_to_temp=False``): the file is opened in-place
+           via fsspec simplecache or direct s3fs. Avoid for NetCDF/HDF5 — these formats
+           require random seeks that streaming reads cannot always satisfy.
+        """
+        if boto3 is None and fsspec is None:
+            raise ImportError(
+                "S3 support requires either 'boto3' or 'fsspec'+'s3fs'. "
+                "Install via: pip install boto3  or  pip install s3fs fsspec"
+            )
+
+        if self.s3_cache_dir is None:
+            raise ValueError(
+                "s3_cache_dir must be set when reading data from S3. "
+                "Each full-resolution SDO NetCDF file is approximately 1 GB, so choose a "
+                "filesystem with enough free space (budget ~1 GB × number of unique timesteps). "
+                "Example: s3_cache_dir='/scratch/my_project/helio_cache'"
+            )
+
+        if self.s3_download_to_temp:
+            # Download whole object to a stable cache path, then open locally.
+            # Atomic write (partial → rename) avoids corrupted cache files on crash.
+            cache_path = self._s3_cache_path(s3_uri)
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+            if not os.path.exists(cache_path):
+                tmp_path = cache_path + ".partial"
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                self._download_s3_object(s3_uri, tmp_path)
+                os.replace(tmp_path, cache_path)
+
+            with xr.open_dataset(cache_path, engine="h5netcdf", chunks=None, cache=False) as ds:
+                return ds[channels].to_array().load().to_numpy()
+
+        # Streaming fallback (read-through via fsspec simplecache or direct s3fs)
+        if fsspec is None:
+            raise ImportError(
+                "Streaming S3 reads require 'fsspec' and 's3fs'. "
+                "Install via: pip install s3fs fsspec"
+            )
+
+        if self.s3_use_simplecache:
+            s3_options = {**self.s3_storage_options, **self.s3fs_kwargs}
+            opener = fsspec.open(
+                f"simplecache::{s3_uri}",
+                mode="rb",
+                cache_storage=self.s3_cache_dir,
+                s3=s3_options,
+            )
+        else:
+            opener = self._get_s3fs().open(s3_uri, mode="rb")
+
+        with opener as f:
+            with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
+                return ds[channels].to_array().load().to_numpy()
+
+    # ------------------------------------------------------------------
+    # S3 helpers
+    # ------------------------------------------------------------------
 
     def _is_s3_path(self, path: str) -> bool:
-        """Return True if `path` is an S3 URI (s3://...)."""
+        """Return True if ``path`` is an S3 URI (starts with ``s3://``)."""
         return isinstance(path, str) and path.startswith("s3://")
 
     def _get_s3fs(self):
-        """Lazily create and return an S3FileSystem instance.
-
-        Notes
-        -----
-        - Requires `s3fs` to be installed (imported at module import time).
-        - Uses the standard AWS credential provider chain by default (e.g.,
-          instance profile / environment variables).
-        """
+        """Lazily create and cache an ``s3fs.S3FileSystem`` instance (per process)."""
         if s3fs is None:
-            raise ImportError(
-                "S3 support requires the 's3fs' and 'fsspec' packages. " "Install them (e.g., pip install s3fs fsspec)."
-            )
+            raise ImportError("s3fs is required. Install via: pip install s3fs fsspec")
         if self._s3fs is None:
             self._s3fs = s3fs.S3FileSystem(**self.s3fs_kwargs, **self.s3_storage_options)
         return self._s3fs
 
-    def load_nc_data(self, filepath: str, timestep: pd.Timestamp, channels: list[str]) -> np.ndarray:
+    def _parse_s3_uri(self, s3_uri: str) -> tuple[str, str]:
+        """Split ``s3://bucket/key`` into ``(bucket, key)``."""
+        if not s3_uri.startswith("s3://"):
+            raise ValueError(f"Not an S3 URI: {s3_uri}")
+        bucket, key = s3_uri[5:].split("/", 1)
+        return bucket, key
+
+    def _s3_cache_path(self, s3_uri: str) -> str:
+        """Build a stable, human-readable local cache path for an S3 object."""
+        bucket, key = self._parse_s3_uri(s3_uri)
+        base = os.path.basename(key) or "object"
+        base_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "object"
+        _, ext = os.path.splitext(base_safe)
+        suffix = ext if ext else ".nc"
+        key_hash = hashlib.sha1(f"{bucket}/{key}".encode()).hexdigest()
+        fname = f"{bucket}__{key_hash}__{base_safe}"
+        if not fname.endswith(suffix):
+            fname += suffix
+        return os.path.join(self.s3_temp_dir, fname)
+
+    def _download_s3_object(self, s3_uri: str, local_path: str) -> None:
+        """Download an S3 object to ``local_path``.
+
+        Uses boto3's transfer manager when available (parallel multipart downloads),
+        otherwise falls back to streaming via s3fs.
         """
-        Load a NetCDF file from either local disk or S3 and return channel-stacked data.
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
 
-        Parameters
-        ----------
-        filepath : str
-            Path to NetCDF file. May be a local filesystem path or an S3 URI
-            (e.g., s3://bucket/key).
-        timestep : pandas.Timestamp
-            Timestamp associated with the sample (used for logging/debugging).
-        channels : list[str]
-            Variable names to extract from the dataset, stacked into (C, H, W).
+        if boto3 is not None:
+            anon = bool(self.s3_storage_options.get("anon") or self.s3fs_kwargs.get("anon"))
+            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+            pool_size = max(32, self.s3_boto3_max_concurrency * 2)
+            retry_config = {"max_attempts": 10, "mode": "adaptive"}
 
-        Returns
-        -------
-        numpy.ndarray
-            Array of shape (C, H, W).
-
-        Notes
-        -----
-        Performance recommendations (AWS):
-        - Prefer running compute in the same AWS region as the S3 bucket.
-        - Use IAM instance roles / task roles rather than static credentials.
-        - Enable `s3_use_simplecache=True` to cache objects locally and reduce
-          repeated S3 range reads. Point `s3_cache_dir` to fast ephemeral storage
-          when available (e.g., NVMe instance store).
-
-        Implementation detail:
-        - When using `simplecache::`, fsspec expects `target_protocol` and
-          `target_options` for the chained filesystem. Do not pass an S3FileSystem
-          instance in kwargs (e.g., {"s3": fs}), as that will raise a TypeError.
-        """
-        self.logger.info(f"Reading file {filepath}.")
-
-        # If a relative/local path and a root is provided, make it absolute.
-        # Do NOT rewrite S3 URIs.
-        if (not self._is_s3_path(filepath)) and self.sdo_data_root_path and not os.path.isabs(filepath):
-            filepath = os.path.join(self.sdo_data_root_path, filepath)
-
-        # ---- S3 path handling ----
-        if self._is_s3_path(filepath):
-            if fsspec is None:
-                raise ImportError(
-                    "S3 support requires the 's3fs' and 'fsspec' packages. "
-                    "Install them (e.g., pip install s3fs fsspec)."
-                )
-
-            # Optional local caching (read-through).
-            # For chained FS (simplecache), use target_protocol/target_options.
-            if self.s3_use_simplecache:
-                cached_url = f"simplecache::{filepath}"
-
-                # Options for the underlying S3 filesystem must be a *dict* (not an S3FileSystem object)
-                s3_options = {**self.s3_storage_options, **self.s3fs_kwargs}
-
-                opener = fsspec.open(
-                    cached_url,
-                    mode="rb",
-                    cache_storage=self.s3_cache_dir,
-                    s3=s3_options,          # <-- key change
+            if anon:
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=BotoConfig(
+                        signature_version=UNSIGNED,
+                        max_pool_connections=pool_size,
+                        retries=retry_config,
+                    ),
                 )
             else:
-                fs = self._get_s3fs()
-                opener = fs.open(filepath, mode="rb")
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=BotoConfig(max_pool_connections=pool_size, retries=retry_config),
+                )
 
-            with opener as f:
-                # h5netcdf/h5py require a seekable file-like object; s3fs provides this
-                # via ranged GET requests.
-                with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
-                    data = ds[channels].to_array().load().to_numpy()
+            transfer_cfg = TransferConfig(
+                multipart_threshold=self.s3_boto3_part_size_mb * 1024 * 1024,
+                multipart_chunksize=self.s3_boto3_part_size_mb * 1024 * 1024,
+                max_concurrency=self.s3_boto3_max_concurrency,
+                use_threads=True,
+                io_chunksize=1024 * 1024,
+            )
+            bucket, key = self._parse_s3_uri(s3_uri)
+            client.download_file(bucket, key, local_path, Config=transfer_cfg)
+            return
 
-            return data
+        # Fallback: stream via s3fs
+        fs = self._get_s3fs()
+        with fs.open(s3_uri, "rb") as src, open(local_path, "wb") as dst:
+            for chunk in iter(lambda: src.read(8 * 1024 * 1024), b""):
+                dst.write(chunk)
 
-        # ---- Local path handling ----
-        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
-            data = ds[channels].to_array().load().to_numpy()
-
-        return data
-
-    @cache
-    def transformation_inputs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        means = np.array([self.scalers[ch].mean for ch in self.channels])
-        stds = np.array([self.scalers[ch].std for ch in self.channels])
-        epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
-        sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
-
-        return means, stds, epsilons, sl_scale_factors
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
 
     def transform_data(self, data: np.ndarray) -> np.ndarray:
-        """
-        Applies scalers.
+        """Apply spatial pooling (if configured) then signum-log normalization.
 
         Args:
-            data: Numpy array of shape (C, H, W)
+            data: Raw channel array of shape (C, H, W).
+
         Returns:
-            Tensor of shape (C, H, W). Data type float32.
-        Uses:
-                numba to speed up transform
-                tvk-srm-heliofm  environment cloned from srm-heliofm with numba added
-                tvk_dgx_slurm.sh  shell script modified to use new environment and new jobname
-                train_spectformer_dgx.yaml new jobname
+            Normalized array of shape (C, H//pooling, W//pooling). See the module-level
+            comment for the signum-log math and the ``inverse_transform_data`` method
+            to reverse the normalization.
         """
         assert data.ndim == 3
-
         if self.pooling > 1:
             data = skimage.measure.block_reduce(data, block_size=(1, self.pooling, self.pooling), func=np.mean)
-
-        means, stds, epsilons, sl_scale_factors = self.transformation_inputs()
-        result_np = transform(data, means, stds, sl_scale_factors, epsilons)
-        return result_np
+        return transform(data, self._means, self._stds, self._sl_scale_factors, self._epsilons)
 
     def inverse_transform_data(self, data: np.ndarray) -> np.ndarray:
-        """
-        Applies scalers.
+        """Invert signum-log normalization on a (C, H, W) array.
 
-        Args:
-            data: Numpy array of shape (C, H, W)
-        Returns:
-            Tensor of shape (C, H, W). Data type float32.
-        Uses:
-                numba to speed up transform
-                tvk-srm-heliofm  environment cloned from srm-heliofm with numba added
-                tvk_dgx_slurm.sh  shell script modified to use new environment and new jobname
-                train_spectformer_dgx.yaml new jobname
+        Note: this only inverts the *normalization*, not spatial pooling.
+        Pooling (applied in ``transform_data``) is not invertible.
         """
         assert data.ndim == 3
-
-        if self.pooling > 1:
-            data = skimage.measure.block_reduce(
-                data,
-                block_size=(1, self.pooling, self.pooling),
-                func=np.mean
-            )
-
-        means, stds, epsilons, sl_scale_factors = self.transformation_inputs()
-        result_np = fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons)
-        return result_np
+        return fast_inverse_transform(data, self._means, self._stds, self._sl_scale_factors, self._epsilons)

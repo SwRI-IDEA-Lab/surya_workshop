@@ -1,59 +1,69 @@
-import torch
-import torch.nn as nn
-from einops import rearrange
-
 """
 A simple linear regression model to be used as a baseline for flare forecasting.
 """
 
+import torch
+import torch.nn as nn
+from einops import rearrange
+
+
+def inverse_transform_channels(batch: dict, channel_order: list, scalers: dict) -> dict:
+    """Return a new batch dict with 'ts' inverse-transformed to physical log space.
+
+    This converts each SDO channel from its normalized representation back to
+    the physical (signum-log) domain before feature extraction. Call this before
+    passing a batch to RegressionFlareModel.
+
+    Args:
+        batch: Batch dict containing at minimum a 'ts' key with shape (B, C, T, H, W).
+        channel_order: Channel names in the same order as the C dimension of 'ts'.
+        scalers: Dict mapping channel name -> scaler with an inverse_transform method.
+
+    Returns:
+        A new batch dict with 'ts' replaced by the inverse-transformed tensor.
+    """
+    x = batch["ts"].clone()
+    with torch.no_grad():
+        for i, channel in enumerate(channel_order):
+            x[:, i, ...] = scalers[channel].inverse_transform(x[:, i, ...])
+    return {**batch, "ts": x}
+
 
 class RegressionFlareModel(nn.Module):
-    def __init__(self, input_dim, channel_order, scalers):
+    def __init__(self, input_dim: int):
         """
         Initializes the RegressionFlareModel.
 
         Args:
             input_dim (int): The size of the input vector after channel and time dimensions are flattened.
-            channel_order (list[str]): List of channel names, defining the order in which channels appear in the input data.
-                                       This is used to ensure the inverse transform uses the correct scaler for each channel.
-            scalers (dict): A dictionary of scalers, one for each channel, used for inverse transforming the data to physical space.
+
+        Note:
+            This model expects 'ts' in the batch dict to already be in physical (log) space.
+            Use inverse_transform_channels() to pre-process normalized SDO inputs before
+            passing them here (e.g., via the preprocess_fn argument of FlareLightningModule).
         """
         super().__init__()
         self.linear = nn.Linear(input_dim, 1)
-        self.channel_order = channel_order
-        self.scalers = scalers
 
-    def forward(self, x):
+    def forward(self, x: dict) -> torch.Tensor:
         """
         Performs a forward pass through the model.
+
         Args:
-            x (torch.Tensor): Input tensor of shape (b, c, t, w, h).
+            x (dict): Batch dict with 'ts' of shape (B, C, T, H, W) in physical space.
 
-        b - Batch size
-        c - Channels
-        t - Time steps
-        w - Width
-        h - Height
+        B - Batch size
+        C - Channels
+        T - Time steps
+        H - Height
+        W - Width
         """
-
-        # Avoid mutating the caller's tensor
-        x = x['ts'].clone()
-
-        # Get dimensions
-        b, c, t, w, h = x.shape
-
-        # Invert normalization to work in physical logarithmic space
-        with torch.no_grad():
-            for channel_index, channel in enumerate(self.channel_order):
-                x[:, channel_index, ...] = self.scalers[channel].inverse_transform(
-                    x[:, channel_index, ...]
-                )
+        x = x["ts"]
 
         # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
-        x = x.abs().mean(dim=[3,4])
+        x = x.abs().mean(dim=[3, 4])
 
-        # Rearange in preparation for linear layer
+        # Rearrange in preparation for linear layer
         x = rearrange(x, "b c t -> b (c t)")
 
-        out = self.linear(x)
-        return out
+        return self.linear(x)

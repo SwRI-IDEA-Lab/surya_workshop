@@ -18,6 +18,11 @@ Key batch contract:
   - batch["ts"]       : torch.Tensor input stack (e.g., [B, C, T, H, W])
   - batch["forecast"] : torch.Tensor target values (e.g., [B] or [B,])
 
+Optional preprocessing:
+  - If ``preprocess_fn`` is provided to ``__init__``, it is called on the batch dict
+    before every model call. This is the intended hook for input transformations (such
+    as inverse-normalizing SDO channels) that should not live inside the model.
+
 Key metrics contract (the `metrics` dict passed to __init__):
   - metrics["train_loss"]    : callable(output, target) -> (loss_dict, weight_list)
   - metrics["train_metrics"] : callable(output, target) -> (metric_dict, weight_list)
@@ -80,6 +85,12 @@ class FlareLightningModule(L.LightningModule):
         Optional batch size passed to Lightning's `self.log(..., batch_size=...)`.
         This improves correct averaging behavior when using distributed settings
         or variable batch sizes.
+
+    preprocess_fn:
+        Optional callable applied to the batch dict before every model call.
+        Signature: ``(batch: dict) -> dict``. Use this to apply input
+        transformations (e.g., ``inverse_transform_channels``) without
+        embedding them in the model itself.
     """
 
     def __init__(
@@ -88,10 +99,12 @@ class FlareLightningModule(L.LightningModule):
         metrics: Dict[str, Callable[..., Tuple[Dict[str, torch.Tensor], Weights]]],
         lr: float,
         batch_size: Optional[int] = None,
+        preprocess_fn: Optional[Callable[[Dict], Dict]] = None,
     ):
         super().__init__()
         self.batch_size = batch_size
         self.model = model
+        self.preprocess_fn = preprocess_fn
 
         # Loss callable: returns (loss_dict, weight_list)
         self.training_loss = metrics["train_loss"]
@@ -102,21 +115,36 @@ class FlareLightningModule(L.LightningModule):
 
         self.lr = lr
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _combine_losses(loss_dict: LossDict, weights: Weights) -> torch.Tensor:
+        """Return a weighted sum of the losses in ``loss_dict``.
+
+        ``weights`` must be aligned with ``loss_dict.keys()`` iteration order.
+        Raises ``ValueError`` if ``loss_dict`` is empty.
+        """
+        loss = None
+        for n, key in enumerate(loss_dict.keys()):
+            component = loss_dict[key] * weights[n]
+            loss = component if loss is None else (loss + component)
+        if loss is None:
+            raise ValueError("loss_dict is empty; cannot compute a scalar loss.")
+        return loss
+
+    def forward(self, batch: dict) -> torch.Tensor:
         """
         Forward pass used by Lightning and by explicit calls in steps.
 
         Parameters
         ----------
-        x:
-            Input tensor, typically batch["ts"].
+        batch:
+            Batch dict (at minimum contains ``"ts"`` and ``"forecast"``).
 
         Returns
         -------
         torch.Tensor
             Model predictions for the batch.
         """
-        return self.model(x)
+        return self.model(batch)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
@@ -150,19 +178,11 @@ class FlareLightningModule(L.LightningModule):
         """
         target = batch["forecast"].unsqueeze(1).float()
 
+        if self.preprocess_fn is not None:
+            batch = self.preprocess_fn(batch)
         output = self(batch)
         training_losses, training_loss_weights = self.training_loss(output, target)
-
-        # Combine losses according to their weights.
-        # Assumes training_loss_weights aligns with iteration order of training_losses.keys().
-        loss = None
-        for n, key in enumerate(training_losses.keys()):
-            component = training_losses[key] * training_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        # Safety: if no losses returned, raise a clear error.
-        if loss is None:
-            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar loss.")
+        loss = self._combine_losses(training_losses, training_loss_weights)
 
         # Log aggregate loss and component losses.
         self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
@@ -200,17 +220,11 @@ class FlareLightningModule(L.LightningModule):
         """
         target = batch["forecast"].unsqueeze(1).float()
 
+        if self.preprocess_fn is not None:
+            batch = self.preprocess_fn(batch)
         output = self(batch)
         val_losses, val_loss_weights = self.training_loss(output, target)
-
-        # Combine losses according to their weights.
-        loss = None
-        for n, key in enumerate(val_losses.keys()):
-            component = val_losses[key] * val_loss_weights[n]
-            loss = component if loss is None else (loss + component)
-
-        if loss is None:
-            raise ValueError("training_loss returned an empty loss dict; cannot compute scalar val loss.")
+        loss = self._combine_losses(val_losses, val_loss_weights)
 
         # Log aggregate loss and component losses.
         self.log("val_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
