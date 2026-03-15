@@ -54,33 +54,40 @@ This repository provides a **clean, heavily documented template** that removes t
 ```
 surya_workshop/
 │
-├── Surya/                              # Git submodule — Surya core model code
-│   └── surya/models/
-│       ├── helio_spectformer.py        # HelioSpectFormer backbone
-│       ├── spectformer.py              # Spectral gating blocks
-│       └── transformer_ls.py          # Long-short attention blocks
+├── Surya/                              # Git submodule — Surya core model and tests
 │
-├── workshop_infrastructure/            # Shared utilities for all downstream apps
+├── workshop_infrastructure/            # Shared utilities used by all downstream apps
 │   ├── configs.py                      # Typed dataclasses: ModelConfig, LoraAdapterConfig, TimeEmbeddingConfig
 │   ├── utils.py                        # build_scalers(), apply_peft_lora(), load_pretrained_weights(),
 │   │                                   # UploadBestCheckpointToS3, create_logger
 │   ├── datasets/
-│   │   └── helio.py                    # HelioNetCDFDataset — base dataset (local + S3, signum-log normalization)
-│   └── models/
-│       ├── finetune_models.py          # HelioSpectformer1D / HelioSpectformer2D fine-tuning wrappers
-│       ├── helio_spectformer.py        # Full backbone wrapper
-│       ├── embedding.py                # Temporal embedding modules
-│       ├── spectformer.py              # Spectral gating
-│       └── transformer_ls.py          # Long-short attention
+│   │   ├── helio.py                    # HelioNetCDFDataset — base dataset (local + S3, signum-log normalization)
+│   │   └── transformations.py         # Additional data transformations
+│   ├── models/
+│   │   ├── finetune_models.py          # HelioSpectformer1D / HelioSpectformer2D fine-tuning wrappers
+│   │   ├── helio_spectformer.py        # Full backbone (HelioSpectFormer)
+│   │   ├── spectformer.py              # Spectral gating blocks
+│   │   ├── transformer_ls.py          # Long-short attention blocks
+│   │   ├── embedding.py                # Temporal embedding modules
+│   │   └── flow.py                     # Learned flow utilities
+│   └── data/
+│       ├── create_csv_index.py         # Build a timestep CSV index from a collection of NetCDF files
+│       └── split_csv_index.py          # Split an index into train / val / test sets
 │
 └── downstream_apps/
-    └── template/                       # Solar flare intensity regression (the template task)
+    └── template/                       # Solar flare intensity regression (the working template task)
         │
         ├── ADAPTING.md                 # Step-by-step guide for creating your own downstream app
         │
         ├── configs/
         │   └── config_script.yaml      # Single source of truth for all hyperparameters
         ├── configs.py                  # DataConfig, TrainingConfig, OutputConfig + load_config()
+        │
+        ├── assets/
+        │   ├── scalers.yaml            # Per-channel normalization statistics (downloaded on first run)
+        │   └── surya.366m.v1.pt        # Pre-trained Surya weights (downloaded on first run)
+        ├── data/
+        │   └── hek_flare_catalog.csv   # HEK flare event catalog used as regression targets
         │
         ├── datasets/
         │   └── template_dataset.py     # FlareDSDataset — extends HelioNetCDFDataset with flare labels
@@ -90,6 +97,8 @@ surya_workshop/
         │   └── template_metrics.py     # FlareMetrics — MSE loss + RRSE evaluation metrics
         ├── models/
         │   └── simple_baseline.py      # RegressionFlareModel — linear baseline (no backbone)
+        │
+        ├── download_scalers_and_weights.sh   # Download assets/ from HuggingFace (run once)
         │
         ├── 0_dataset_dataloader_template.ipynb   # Step 1: explore the dataset and DataLoader
         ├── 1_baseline_template.ipynb             # Step 2: train a linear baseline
