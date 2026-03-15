@@ -71,7 +71,6 @@ class TrainingConfig:
     data: DataConfig
     model: ModelConfig
     output: OutputConfig = field(default_factory=OutputConfig)
-    pretrained_path: Optional[str] = None
     learning_rate: float = 1e-4
     max_epochs: int = 20
     batch_size: int = 2
@@ -94,8 +93,8 @@ def load_config(path: Union[str, Path]) -> TrainingConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    # model: build ModelConfig, then extract pretrained_path (which lives here in the
-    # YAML but is stored flat on TrainingConfig, since it's used at the training level).
+    # model: build nested configs first, then construct ModelConfig.
+    # pretrained_path lives in the model: YAML section and on ModelConfig — not lifted to TrainingConfig.
     model_raw = raw["model"]
     model_kwargs = dict(model_raw)
     model_kwargs["time_embedding"] = _from_dict(TimeEmbeddingConfig, model_raw.get("time_embedding", {}))
@@ -110,7 +109,6 @@ def load_config(path: Union[str, Path]) -> TrainingConfig:
         data=_from_dict(DataConfig, raw["data"]),
         model=model_cfg,
         output=_from_dict(OutputConfig, raw.get("output", {})),
-        pretrained_path=model_raw.get("pretrained_path"),
         learning_rate=training.get("learning_rate", 1e-4),
         max_epochs=training.get("max_epochs", 20),
         batch_size=training.get("batch_size", 2),

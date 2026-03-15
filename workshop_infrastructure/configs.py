@@ -77,3 +77,8 @@ class ModelConfig:
     # --- LoRA ---
     use_lora: bool = True
     lora_config: LoraAdapterConfig = field(default_factory=LoraAdapterConfig)
+
+    # --- Checkpoint ---
+    # Path to the pretrained Surya backbone weights. Passed to load_pretrained_weights().
+    # Kept on ModelConfig (not TrainingConfig) because it describes the model, not the run.
+    pretrained_path: Optional[str] = None

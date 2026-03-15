@@ -80,9 +80,9 @@ def _ensure_assets(cfg: TrainingConfig) -> None:
     assets_to_fetch = [
         (cfg.data.scalers_path, "nasa-ibm-ai4science/core-sdo", "dataset", "scalers.yaml"),
     ]
-    if cfg.pretrained_path:
+    if cfg.model.pretrained_path:
         assets_to_fetch.append(
-            (cfg.pretrained_path, "nasa-ibm-ai4science/Surya-1.0", "model", "surya.366m.v1.pt")
+            (cfg.model.pretrained_path, "nasa-ibm-ai4science/Surya-1.0", "model", "surya.366m.v1.pt")
         )
 
     for local_path, repo_id, repo_type, filename in assets_to_fetch:
@@ -186,7 +186,7 @@ def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.Lightnin
             dtype=cfg.dtype,
             use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         )
-        load_pretrained_weights(model, cfg.pretrained_path)
+        load_pretrained_weights(model, cfg.model.pretrained_path)
         if cfg.model.use_lora:
             model = apply_peft_lora(model, cfg.model.lora_config)
 
