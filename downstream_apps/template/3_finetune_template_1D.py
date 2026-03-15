@@ -131,6 +131,8 @@ def build_datasets(cfg: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
         s3_download_to_temp=True,
         s3_storage_options={"anon": cfg.data.s3_anon},
         s3_cache_dir=cfg.data.s3_cache_dir,
+        s3_boto3_max_concurrency=cfg.data.s3_boto3_max_concurrency,
+        s3_boto3_part_size_mb=cfg.data.s3_boto3_part_size_mb,
         # Downstream-specific
         return_surya_stack=True,
         max_number_of_samples=cfg.data.max_samples,

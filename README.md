@@ -65,6 +65,7 @@ surya_workshop/
 │   ├── configs.py                      # Typed dataclasses: ModelConfig, LoraAdapterConfig, TimeEmbeddingConfig
 │   ├── utils.py                        # build_scalers(), apply_peft_lora(), load_pretrained_weights(),
 │   │                                   # UploadBestCheckpointToS3, create_logger
+│   ├── benchmark_s3.py                 # Benchmark S3 download throughput to tune transfer settings
 │   ├── datasets/
 │   │   ├── helio.py                    # HelioNetCDFDataset — base dataset (local + S3, signum-log normalization)
 │   │   └── transformations.py          # Additional data transformations
@@ -167,7 +168,26 @@ CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D
 
 Set `max_samples: 10` in the YAML during development to cap the dataset size for fast iteration.
 
-### 4. Adapt the template for your own task
+### 4. (Optional) Tune S3 download performance
+
+If your training data is read from S3, `workshop_infrastructure/benchmark_s3.py` measures download throughput across combinations of thread concurrency and part size and recommends the best settings for your connection:
+
+```bash
+python -m workshop_infrastructure.benchmark_s3 s3://bucket/path/to/file.nc --anon --quick
+```
+
+The `--quick` flag runs a 9-cell grid and finishes in about 2–3 minutes. Copy the recommended values into the `data:` section of `config_script.yaml`:
+
+```yaml
+s3_boto3_max_concurrency: 8   # suggested by benchmark
+s3_boto3_part_size_mb: 32     # suggested by benchmark
+```
+
+On EC2 in the same AWS region as the bucket, expect 500–1000+ MB/s. Over a regular internet connection, 20–150 MB/s is typical — in either case the benchmark will find the fastest achievable settings.
+
+> **EC2 users:** to ensure S3 traffic routes over the AWS internal backbone and never touches an internet or NAT gateway, confirm that a **VPC S3 Gateway Endpoint** is attached to your VPC (AWS Console → VPC → Endpoints → filter by "S3 Gateway"). It is free and takes two minutes to create. Without it, even same-region traffic passes through a gateway, reducing throughput and incurring data-transfer costs. The benchmark script will remind you of this automatically when it detects it is running on EC2.
+
+### 5. Adapt the template for your own task
 
 Read [`downstream_apps/template/ADAPTING.md`](downstream_apps/template/ADAPTING.md) for a step-by-step guide. The short version:
 

@@ -42,10 +42,26 @@ data:
 
   # -- S3 (only needed when index contains s3:// paths) --
   s3_anon: true                   # true for public buckets; false to use IAM credentials
-  s3_cache_dir: null              # Local cache directory; budget ~1 GB per unique timestep
+  s3_cache_dir: /d0/amunozj/surya_ws_cache  # Local cache directory; budget ~1 GB per unique timestep
+
+  # -- S3 transfer tuning --
+  # These control boto3's multipart download: how many threads download parts in
+  # parallel and how large each part is.  The right values depend on your network
+  # connection and where you are running (local machine vs. AWS EC2).
+  #
+  # To find the optimal values for your setup, run the benchmark script once
+  # against a representative SDO NetCDF file and copy the recommended settings here:
+  #
+  #   python -m workshop_infrastructure.benchmark_s3 s3://nasa-surya-bench/2011/01/20110131_0000.nc --anon --quick
+  #
+  # The script downloads sample data with several (concurrency, part_size) combinations
+  # and prints a throughput table.  A --quick run takes roughly 2-3 minutes;
+  # drop --quick for a broader 25-cell grid.
+  s3_boto3_max_concurrency: 4     # parallel download threads (benchmark default: 4)
+  s3_boto3_part_size_mb: 64       # part size in MB (benchmark default: 64)
 
   # -- Development --
-  max_samples: null               # Cap dataset size for quick experiments (null = all samples)
+  max_samples: 10                 # Cap dataset size for quick experiments (null = all samples)
 
 
 # -----------------------------------------------------------------------------

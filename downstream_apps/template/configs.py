@@ -50,6 +50,8 @@ class DataConfig:
     # S3
     s3_anon: bool = False
     s3_cache_dir: Optional[str] = None
+    s3_boto3_max_concurrency: int = 4   # parallel threads per multipart download
+    s3_boto3_part_size_mb: int = 64     # part size in MB for multipart downloads
     # Development
     max_samples: Optional[int] = None
 

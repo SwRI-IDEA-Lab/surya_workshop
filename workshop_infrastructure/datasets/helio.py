@@ -27,7 +27,7 @@ import xarray as xr
 import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
-from workshop_infrastructure.utils import get_rank, create_logger
+from workshop_infrastructure.utils import get_rank, create_logger, detect_ec2_region
 
 # Optional S3 support via fsspec/s3fs (read-through streaming)
 try:
@@ -50,6 +50,8 @@ except Exception:  # pragma: no cover
     TransferConfig = None
 
 from numba import njit, prange
+
+
 import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compression filters
 
 
@@ -686,7 +688,9 @@ class HelioNetCDFDataset(Dataset):
 
         if boto3 is not None:
             anon = bool(self.s3_storage_options.get("anon") or self.s3fs_kwargs.get("anon"))
-            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+            region = (os.environ.get("AWS_REGION")
+                      or os.environ.get("AWS_DEFAULT_REGION")
+                      or detect_ec2_region())
             pool_size = max(32, self.s3_boto3_max_concurrency * 2)
             retry_config = {"max_attempts": 10, "mode": "adaptive"}
 
