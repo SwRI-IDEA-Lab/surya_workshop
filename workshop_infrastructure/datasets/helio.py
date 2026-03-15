@@ -15,10 +15,13 @@ When writing a downstream task, subclass ``HelioNetCDFDataset`` and override
 ``super().__getitem__()``.
 """
 
+import functools
 import os
 import re
 import random
 import hashlib
+import urllib.request
+import urllib.error
 from datetime import datetime
 import torch
 import numpy as np
@@ -50,6 +53,33 @@ except Exception:  # pragma: no cover
     TransferConfig = None
 
 from numba import njit, prange
+
+
+@functools.lru_cache(maxsize=1)
+def _detect_ec2_region() -> str | None:
+    """Return the AWS region of the current EC2 instance, or None if not on EC2.
+
+    Queries the IMDSv2 endpoint (169.254.169.254), which is only reachable from
+    within an EC2 instance.  The 1-second timeout makes this a no-op on any
+    other machine.  Results are cached so the network round-trip happens at most
+    once per process.
+    """
+    try:
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+        )
+        with urllib.request.urlopen(token_req, timeout=1) as resp:
+            token = resp.read().decode()
+        region_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/placement/region",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        with urllib.request.urlopen(region_req, timeout=1) as resp:
+            return resp.read().decode()
+    except Exception:
+        return None
 import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compression filters
 
 
@@ -686,7 +716,9 @@ class HelioNetCDFDataset(Dataset):
 
         if boto3 is not None:
             anon = bool(self.s3_storage_options.get("anon") or self.s3fs_kwargs.get("anon"))
-            region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+            region = (os.environ.get("AWS_REGION")
+                      or os.environ.get("AWS_DEFAULT_REGION")
+                      or _detect_ec2_region())
             pool_size = max(32, self.s3_boto3_max_concurrency * 2)
             retry_config = {"max_attempts": 10, "mode": "adaptive"}
 

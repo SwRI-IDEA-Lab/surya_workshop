@@ -185,6 +185,8 @@ s3_boto3_part_size_mb: 32     # suggested by benchmark
 
 On EC2 in the same AWS region as the bucket, expect 500–1000+ MB/s. Over a regular internet connection, 20–150 MB/s is typical — in either case the benchmark will find the fastest achievable settings.
 
+> **EC2 users:** to ensure S3 traffic routes over the AWS internal backbone and never touches an internet or NAT gateway, confirm that a **VPC S3 Gateway Endpoint** is attached to your VPC (AWS Console → VPC → Endpoints → filter by "S3 Gateway"). It is free and takes two minutes to create. Without it, even same-region traffic passes through a gateway, reducing throughput and incurring data-transfer costs. The benchmark script will remind you of this automatically when it detects it is running on EC2.
+
 ### 5. Adapt the template for your own task
 
 Read [`downstream_apps/template/ADAPTING.md`](downstream_apps/template/ADAPTING.md) for a step-by-step guide. The short version:
