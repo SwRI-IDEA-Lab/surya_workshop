@@ -10,7 +10,7 @@ A template repository for fine-tuning [Surya](https://github.com/NASA-IMPACT/Sur
 
 > *Surya: A Foundation Model for Heliophysics* — [arXiv:2508.14112](https://arxiv.org/abs/2508.14112)
 
-The model ingests 13-channel SDO image stacks (8 AIA wavelengths + 5 HMI magnetic components) at native 4096×4096 resolution and has demonstrated strong performance across a range of solar physics tasks:
+The model ingests 13-channel SDO image stacks (8 AIA wavelengths + 4 HMI magnetic components + HMI doppler velocity) at native 4096×4096 resolution and has demonstrated strong performance across a range of solar physics tasks:
 
 | Task | Improvement over prior state-of-the-art |
 |---|---|
@@ -38,12 +38,12 @@ The full backbone is 2 spectral gating blocks followed by 8 long-short attention
 
 ## Purpose of This Repository
 
-Surya is a powerful foundation, but foundation models only create scientific value when researchers can adapt them to their own questions. That adaptation step — loading pre-trained weights, defining a task-specific head, wiring up data and metrics, and running a reproducible training loop — involves enough boilerplate that it can become a barrier.
+Surya is a powerful foundation, but foundation models only create scientific value when researchers can adapt them to their own questions. That adaptation step — loading pre-trained weights, defining a task-specific head, wiring up data and metrics, and running a reproducible training loop requires support when executed for the first time.
 
-This repository provides a **clean, heavily documented template** that removes that barrier. The goal is not to be a framework. It is to be a well-explained starting point that a scientist can read, understand, and modify in an afternoon:
+This repository provides a **clean, heavily documented template** that addresses that need. The goal is to provide a well-explained starting point that a scientist can read, understand, and modify in an afternoon:
 
 - Every component has a clear home and a documented interface.
-- A single YAML file controls all hyperparameters — no hunting through code to change a learning rate.
+- A single YAML file controls all hyperparameters.
 - Numbered notebooks walk through each stage of the workflow interactively before the production script ties them together.
 - The template task (solar flare intensity regression) is realistic enough to illustrate the full pattern, but simple enough that it doesn't obscure what you need to change.
 
@@ -54,7 +54,12 @@ This repository provides a **clean, heavily documented template** that removes t
 ```
 surya_workshop/
 │
-├── Surya/                              # Git submodule — Surya core model and tests
+├── data/
+│   └── indices/                        # Pre-built CSV index files for the SDO dataset
+│       ├── surya_aws_s3_full_index.csv # Complete index of all available SDO timesteps on S3
+│       ├── surya_aws_s3_train.csv      # Training split
+│       ├── surya_aws_s3_val.csv        # Validation split
+│       └── surya_aws_s3_test.csv       # Test split
 │
 ├── workshop_infrastructure/            # Shared utilities used by all downstream apps
 │   ├── configs.py                      # Typed dataclasses: ModelConfig, LoraAdapterConfig, TimeEmbeddingConfig
@@ -62,12 +67,12 @@ surya_workshop/
 │   │                                   # UploadBestCheckpointToS3, create_logger
 │   ├── datasets/
 │   │   ├── helio.py                    # HelioNetCDFDataset — base dataset (local + S3, signum-log normalization)
-│   │   └── transformations.py         # Additional data transformations
+│   │   └── transformations.py          # Additional data transformations
 │   ├── models/
 │   │   ├── finetune_models.py          # HelioSpectformer1D / HelioSpectformer2D fine-tuning wrappers
 │   │   ├── helio_spectformer.py        # Full backbone (HelioSpectFormer)
 │   │   ├── spectformer.py              # Spectral gating blocks
-│   │   ├── transformer_ls.py          # Long-short attention blocks
+│   │   ├── transformer_ls.py           # Long-short attention blocks
 │   │   ├── embedding.py                # Temporal embedding modules
 │   │   └── flow.py                     # Learned flow utilities
 │   └── data/
@@ -174,9 +179,9 @@ Read [`downstream_apps/template/ADAPTING.md`](downstream_apps/template/ADAPTING.
 
 You typically do not need to touch `workshop_infrastructure/` at all.
 
----
+<!-- --- -->
 
-## Key Design Decisions
+<!-- ## Key Design Decisions
 
 **YAML as single source of truth.** All parameters are declared once in `config_script.yaml` and nowhere else. The CLI exposes only four arguments: `--config` (required), `--no-wandb` (dev toggle), `--train_baseline` (mode switch), and `--max-epochs` (sweep override). This keeps experiment management simple and reproducible.
 
@@ -184,4 +189,4 @@ You typically do not need to touch `workshop_infrastructure/` at all.
 
 **Notebooks and script are parallel, not redundant.** The notebooks are the learning path — they expose internals and make it easy to inspect intermediate results. The script is the production path — it adds DDP, robust checkpointing, and WandB integration. Both read the same YAML.
 
-**LoRA for efficient fine-tuning.** By default, PEFT LoRA adapters are added to all attention and feed-forward layers (rank 8, alpha 8, dropout 0.1). This allows the full Surya backbone to remain effectively frozen while adapting it to a new task with a small number of trainable parameters. LoRA can be disabled in the YAML if you prefer full fine-tuning or backbone freezing.
+**LoRA for efficient fine-tuning.** By default, PEFT LoRA adapters are added to all attention and feed-forward layers (rank 8, alpha 8, dropout 0.1). This allows the full Surya backbone to remain effectively frozen while adapting it to a new task with a small number of trainable parameters. LoRA can be disabled in the YAML if you prefer full fine-tuning or backbone freezing. -->
