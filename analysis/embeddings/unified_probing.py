@@ -2307,23 +2307,16 @@ def probe_hidden_physical_spatial(
 ) -> dict:
     """Spatial visualization of hidden-physical cluster candidates.
 
-    Tests the limb-extension hypothesis for hidden-physical candidates:
-    if these clusters represent off-limb features physically associated with
-    on-disk active regions (post-flare loops, plage extending beyond the
-    limb, etc.), then their patch positions should concentrate near the
-    solar limb rather than being scattered across off-disk space.
-
-    The radial-distribution histogram is the primary diagnostic — if AR-
-    physical-dominant hidden patches show a peak just outside disk_radius,
-    that's the off-limb-AR-extension story.  If QS-physical-dominant hidden
-    patches peak right at the disk edge, that's limb-threshold confusion.
+    Renders the patch positions of clusters flagged as hidden-physical
+    candidates (NA-dominant overall but with strong agreement on a single
+    on-disk class among their non-NA members), so the user can visually
+    inspect where these patches sit and check against expectations.
 
     Outputs in <out_dir>/:
       hidden_physical_density.png            spatial heatmap, all classes
       hidden_physical_density_per_class.png  3-panel split by physical-dom class
-      hidden_physical_radial.png             radial-distribution histogram
-                                              (the diagnostic plot)
       hidden_physical_per_sample.png         per-sample maps (first 4 samples)
+      hidden_physical_last_sample.png        full-resolution view of last sample
       hidden_physical_spatial.json           summary numbers
     """
     print("\n[probe 7b] Spatial distribution of hidden-physical candidates")
@@ -2391,118 +2384,14 @@ def probe_hidden_physical_spatial(
         np.add.at(hidden_density_per_class[cls_id],
                   (flat_rows[mask], flat_cols[mask]), 1)
 
-    # ---- Estimate disk geometry from mask labels --------------------------
-    # We need a robust disk-radius estimator that doesn't get pulled outward
-    # by SPoCA's flickering limb labels.  The earlier percentile-based
-    # approach (99th percentile of distances to "majority-on-disk" positions)
-    # was too sensitive to a handful of noisy positions right at the limb
-    # that get on/off labels across samples.
-    #
-    # Approach: build a per-position "fraction of samples non-NA" map, bin
-    # those values by radial distance from a provisional center, and find
-    # the radius at which the binned mean crosses 0.5 (half-max of the
-    # radial on-disk profile).  This averages over many positions per bin,
-    # so individual flickering patches can't dominate.
-    rows_f = rows.astype(np.float64)
-    cols_f = cols.astype(np.float64)
-    frac_on_disk = (ab.mask_labels != -1).mean(axis=0)   # (n_keep,)
-
-    # Provisional center from high-confidence on-disk positions only (≥80%
-    # of samples).  Falls back gracefully if N is too small for that
-    # threshold to leave any positions.
-    high_conf = frac_on_disk > 0.8
-    if not high_conf.any():
-        high_conf = frac_on_disk > 0.5
-    if not high_conf.any():
-        high_conf = frac_on_disk > 0.0
-    if high_conf.any():
-        center_row = float(np.median(rows_f[high_conf]))
-        center_col = float(np.median(cols_f[high_conf]))
-    else:
-        center_row = center_col = float(PATCH_GRID) / 2.0
-
-    dists = np.sqrt((rows_f - center_row)**2 + (cols_f - center_col)**2)
-
-    # Radial half-max: bin the fraction-on-disk by distance from center,
-    # then find where the binned mean crosses 0.5.
-    if dists.max() > 0:
-        N_BINS = 80
-        bin_edges = np.linspace(0.0, float(dists.max()), N_BINS + 1)
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        sum_frac, _ = np.histogram(dists, bins=bin_edges, weights=frac_on_disk)
-        count, _ = np.histogram(dists, bins=bin_edges)
-        # Bins with zero positions get NaN — ignore those.
-        with np.errstate(invalid="ignore"):
-            mean_frac = np.where(count > 0,
-                                  sum_frac / count.clip(min=1),
-                                  np.nan)
-        # Find the largest bin index where mean_frac >= 0.5 (the inside of
-        # the transition).  Then linearly interpolate to the half-max point.
-        valid = ~np.isnan(mean_frac)
-        above = valid & (mean_frac >= 0.5)
-        if above.any():
-            idx_above = np.where(above)[0]
-            idx = int(idx_above[-1])
-            r1 = float(bin_centers[idx])
-            f1 = float(mean_frac[idx])
-            # Walk forward to the next valid bin
-            j = idx + 1
-            while j < N_BINS and not valid[j]:
-                j += 1
-            if j < N_BINS and mean_frac[j] < 0.5:
-                r2 = float(bin_centers[j])
-                f2 = float(mean_frac[j])
-                if f1 > f2:
-                    disk_radius = r1 + (0.5 - f1) * (r2 - r1) / (f2 - f1)
-                else:
-                    disk_radius = r1
-            else:
-                disk_radius = r1
-        else:
-            disk_radius = float(PATCH_GRID) / 2.0 * 0.7
-    else:
-        disk_radius = float(PATCH_GRID) / 2.0 * 0.7
-
-    # How sharp is the transition?  Useful diagnostic: the "limb-uncertain"
-    # zone where the radial on-disk fraction is between 0.1 and 0.9.
-    transition_zone = (float("nan"), float("nan"))
-    try:
-        if dists.max() > 0:
-            inner_above = valid & (mean_frac >= 0.9)
-            outer_below = valid & (mean_frac <= 0.1)
-            if inner_above.any() and outer_below.any():
-                r_inner = float(bin_centers[int(np.where(inner_above)[0][-1])])
-                r_outer = float(bin_centers[int(np.where(outer_below)[0][0])])
-                transition_zone = (r_inner, r_outer)
-    except NameError:
-        pass
-
-    print(f"   disk geometry: center ≈ ({center_row:.1f}, {center_col:.1f}), "
-          f"radius ≈ {disk_radius:.1f} patches "
-          f"(half-max of radial on-disk fraction)")
-    if not np.isnan(transition_zone[0]):
-        print(f"     limb-uncertain zone: r ∈ "
-              f"[{transition_zone[0]:.1f}, {transition_zone[1]:.1f}] "
-              f"(where on-disk fraction is between 0.1 and 0.9)")
-
-    # Patch-grid radial map (computed once)
-    rgrid, cgrid = np.meshgrid(np.arange(PATCH_GRID), np.arange(PATCH_GRID),
-                                 indexing="ij")
-    pos_radius = np.sqrt((rgrid - center_row)**2 + (cgrid - center_col)**2)
-
     # ---- Plot 1: overall density heatmap ----------------------------------
-    theta = np.linspace(0, 2 * np.pi, 200)
     fig, ax = plt.subplots(figsize=(8, 7))
     log_density = np.log1p(hidden_density.astype(np.float64))
     vmax = float(log_density.max()) if log_density.max() > 0 else 1.0
     im = ax.imshow(log_density, origin="upper", cmap="viridis",
                     vmin=0, vmax=vmax, interpolation="nearest")
-    ax.plot(center_col + disk_radius * np.cos(theta),
-             center_row + disk_radius * np.sin(theta),
-             "r--", linewidth=1.5, alpha=0.7, label="solar disk edge")
     ax.set_xlim(-0.5, PATCH_GRID - 0.5)
     ax.set_ylim(PATCH_GRID - 0.5, -0.5)
-    ax.legend(loc="upper right", fontsize=9)
     plt.colorbar(im, ax=ax, label="log(1 + count)", fraction=0.046, pad=0.02)
     ax.set_title(
         f"Hidden-physical patches — spatial density across {ab.N} samples\n"
@@ -2525,9 +2414,6 @@ def probe_hidden_physical_spatial(
             local_vmax = max(float(log_d.max()), 0.5)
             im = ax.imshow(log_d, origin="upper", cmap="viridis",
                             vmin=0, vmax=local_vmax, interpolation="nearest")
-            ax.plot(center_col + disk_radius * np.cos(theta),
-                     center_row + disk_radius * np.sin(theta),
-                     "r--", linewidth=1.2, alpha=0.7)
             n_clusters_this_class = sum(
                 1 for cid, pd in hidden_id_to_phys_dom.items() if pd == cls_id
             )
@@ -2543,72 +2429,7 @@ def probe_hidden_physical_spatial(
         fig.tight_layout()
         _save_fig(fig, out_dir / "hidden_physical_density_per_class.png")
 
-    # ---- Plot 3: RADIAL DISTRIBUTION (the diagnostic) --------------------
-    # For each radius bin: (#hidden patches at that radius) / (#patch-positions
-    # at that radius * N_samples).  This is the per-sample, per-position rate
-    # of being a hidden-physical patch.
-    n_bins = 50
-    max_radius_plot = float(pos_radius.max())
-    bin_edges = np.linspace(0, max_radius_plot * 1.02, n_bins + 1)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-
-    pos_radius_flat = pos_radius.flatten()
-    pos_in_bin, _ = np.histogram(pos_radius_flat, bins=bin_edges)
-    # Avoid division by zero in empty bins
-    norm = pos_in_bin.clip(min=1) * ab.N
-
-    fig, (ax_main, ax_count) = plt.subplots(
-        2, 1, figsize=(10, 7), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]},
-    )
-    palette_local = MASK_PALETTE
-    for cls_id in (0, 1, 2):
-        density_flat = hidden_density_per_class[cls_id].flatten()
-        if density_flat.sum() == 0:
-            continue
-        weighted_count, _ = np.histogram(
-            pos_radius_flat, bins=bin_edges, weights=density_flat,
-        )
-        rate = weighted_count.astype(np.float64) / norm
-        ax_main.plot(
-            bin_centers, rate, "-", color=palette_local[cls_id],
-            label=f"hidden physical = {MASK_CLASS_NAMES[cls_id]}  "
-                  f"(n={int(density_flat.sum()):,})",
-            linewidth=2.0,
-        )
-    # Total hidden across all classes
-    total_count, _ = np.histogram(
-        pos_radius_flat, bins=bin_edges, weights=hidden_density.flatten(),
-    )
-    ax_main.plot(bin_centers, total_count / norm, "--", color="black",
-                  label="all hidden physical", linewidth=1.0, alpha=0.6)
-
-    ax_main.axvline(disk_radius, color="red", linestyle=":", alpha=0.7,
-                     linewidth=1.5,
-                     label=f"disk edge ({disk_radius:.0f} patches)")
-    ax_main.set_ylabel("Hidden-physical rate per (position, sample)")
-    ax_main.set_title(
-        "Radial distribution of hidden-physical patches\n"
-        "(rate at radius r = fraction of (position × sample) cells "
-        "labeled hidden physical)"
-    )
-    ax_main.legend(loc="best", fontsize=9)
-    ax_main.grid(alpha=0.3)
-
-    # Sub-panel: how many positions fall in each radius bin (denominator).
-    # Helps the reader interpret rate noise: bins with few positions have
-    # noisier rates.
-    ax_count.bar(bin_centers, pos_in_bin, width=np.diff(bin_edges),
-                  color="gray", alpha=0.6)
-    ax_count.axvline(disk_radius, color="red", linestyle=":", alpha=0.7,
-                      linewidth=1.5)
-    ax_count.set_xlabel("Radial distance from disk center (patches)")
-    ax_count.set_ylabel("# positions in bin")
-    ax_count.grid(alpha=0.3, axis="y")
-    fig.tight_layout()
-    _save_fig(fig, out_dir / "hidden_physical_radial.png")
-
-    # ---- Plot 4: per-sample maps (first 4 samples) ------------------------
+    # ---- Plot 3: per-sample maps (first 4 samples) ------------------------
     n_show = min(4, ab.N)
     sample_indices = np.linspace(0, ab.N - 1, n_show, dtype=int)
     cluster_labels_2d = cluster_labels.reshape(ab.N, ab.n_keep)
@@ -2632,9 +2453,6 @@ def probe_hidden_physical_spatial(
                 color_hex = MASK_PALETTE.get(phys_dom, "#888888")
                 img[r, c] = np.array(mcolors.to_rgba(color_hex))
         ax.imshow(img, origin="upper", interpolation="nearest")
-        ax.plot(center_col + disk_radius * np.cos(theta),
-                 center_row + disk_radius * np.sin(theta),
-                 "r--", linewidth=0.8, alpha=0.5)
         ax.set_title(f"Sample {t}")
         ax.set_xlim(-0.5, PATCH_GRID - 0.5)
         ax.set_ylim(PATCH_GRID - 0.5, -0.5)
@@ -2657,17 +2475,10 @@ def probe_hidden_physical_spatial(
     fig.tight_layout()
     _save_fig(fig, out_dir / "hidden_physical_per_sample.png")
 
-    # ---- Plot 4b: full-resolution view of just the last sample -----------
-    # The 2x2 grid above is a quick overview; this is the close-up the user
-    # asked for — one sample at full figure size to enable visual sanity-
-    # checking against expected solar morphology at that timestamp.
+    # ---- Plot 3b: full-resolution view of just the last sample -----------
     last_t = ab.N - 1
     img = np.tile(bg_color, (PATCH_GRID, PATCH_GRID, 1))
 
-    # Vectorized assembly (the per-sample loop above iterates 65,536 times
-    # per sample in Python; here we keep the slow path for the 2x2 grid since
-    # rendering 4 of these isn't a bottleneck, but for the standalone view
-    # we go vectorized so adding more single-sample plots later is cheap).
     on_disk_this = ab.mask_labels[last_t] != -1
     img[rows[on_disk_this], cols[on_disk_this]] = on_disk_color
 
@@ -2694,9 +2505,6 @@ def probe_hidden_physical_spatial(
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(img, origin="upper", interpolation="nearest")
-    ax.plot(center_col + disk_radius * np.cos(theta),
-             center_row + disk_radius * np.sin(theta),
-             "r--", linewidth=1.0, alpha=0.6)
     ax.set_xlim(-0.5, PATCH_GRID - 0.5)
     ax.set_ylim(PATCH_GRID - 0.5, -0.5)
     title = f"Hidden-physical patches — sample {last_t} (last sample of {ab.N})"
@@ -2705,7 +2513,6 @@ def probe_hidden_physical_spatial(
     ax.set_title(title)
     ax.set_xlabel("Patch column")
     ax.set_ylabel("Patch row")
-    # Per-sample legend with hidden-class counts
     n_hidden_this = {
         cls_id: int((phys_dom_this == cls_id).sum()) for cls_id in (0, 1, 2)
     }
@@ -2718,9 +2525,6 @@ def probe_hidden_physical_spatial(
                 label=f"hidden = {MASK_CLASS_NAMES[cls_id]} "
                       f"(n={n_hidden_this[cls_id]:,})",
             ))
-    legend_handles.append(plt.Line2D([], [], color="red", linestyle="--",
-                                       linewidth=1.0,
-                                       label=f"disk edge (r≈{disk_radius:.0f})"))
     ax.legend(handles=legend_handles, loc="upper right", fontsize=10,
                framealpha=0.85)
     fig.tight_layout()
@@ -2730,39 +2534,25 @@ def probe_hidden_physical_spatial(
           f"CH={n_hidden_this[0]:,}, QS={n_hidden_this[1]:,}, "
           f"AR={n_hidden_this[2]:,}")
 
-    # ---- Compute summary stats — fraction of hidden patches inside vs ----
-    # outside disk, per class.
-    outside_disk = pos_radius_flat > disk_radius
-    inside_disk  = ~outside_disk
+    # ---- Per-class summary counts -----------------------------------------
     summary_per_class: dict[str, dict] = {}
     for cls_id in (0, 1, 2):
         d = hidden_density_per_class[cls_id].flatten()
         if d.sum() == 0:
             continue
-        n_outside = int(d[outside_disk].sum())
-        n_inside  = int(d[inside_disk].sum())
         summary_per_class[MASK_CLASS_NAMES[cls_id]] = {
             "n_clusters": sum(1 for cid, pd in hidden_id_to_phys_dom.items()
                               if pd == cls_id),
             "n_hidden_patches": int(d.sum()),
-            "n_inside_disk":   n_inside,
-            "n_outside_disk":  n_outside,
-            "frac_outside_disk": float(n_outside / max(d.sum(), 1)),
         }
         print(f"   {MASK_CLASS_NAMES[cls_id]:14s}: "
-              f"{int(d.sum()):>7,} patches, "
-              f"{100*summary_per_class[MASK_CLASS_NAMES[cls_id]]['frac_outside_disk']:.1f}% "
-              f"outside disk edge")
+              f"{int(d.sum()):>7,} patches across "
+              f"{summary_per_class[MASK_CLASS_NAMES[cls_id]]['n_clusters']} "
+              f"clusters")
 
     results = {
         "n_hidden_clusters": n_hidden,
         "total_hidden_patches": int(hidden_density.sum()),
-        "disk_center_row": float(center_row),
-        "disk_center_col": float(center_col),
-        "disk_radius_patches": float(disk_radius),
-        "disk_radius_method": "radial half-max of on-disk fraction profile",
-        "limb_uncertain_zone": [float(transition_zone[0]),
-                                  float(transition_zone[1])],
         "by_physical_class": summary_per_class,
         "hidden_purity_threshold": purity_thresh,
         "hidden_physical_frac_min": frac_min,
@@ -3411,53 +3201,24 @@ def write_unified_report(results: dict, ab: AblationOutputs,
             lines.append(f"- {n_hidden} hidden-physical clusters, "
                           f"{int(h.get('total_hidden_patches', 0)):,} total "
                           f"patches across all samples")
-            lines.append(f"- Estimated disk geometry: center ≈ "
-                          f"({h.get('disk_center_row', 0):.1f}, "
-                          f"{h.get('disk_center_col', 0):.1f}), "
-                          f"radius ≈ {h.get('disk_radius_patches', 0):.1f} patches")
             lines.append("")
-            lines.append("### Inside-vs-outside-disk breakdown by physical "
-                          "class")
+            lines.append("### Hidden-physical patch counts by physical class")
             lines.append("")
-            lines.append("This table is the headline diagnostic for the "
-                          "limb-extension hypothesis.  If hidden-physical "
-                          "candidates are off-limb features physically "
-                          "associated with on-disk active regions, the "
-                          "AR row should show a substantial fraction "
-                          "outside the disk edge.")
-            lines.append("")
-            lines.append("| physical class | n clusters | n patches | "
-                          "inside disk | outside disk | % outside |")
-            lines.append("|----------------|-----------:|----------:|"
-                          "------------:|-------------:|----------:|")
+            lines.append("| physical class | n clusters | n patches |")
+            lines.append("|----------------|-----------:|----------:|")
             by_cls = h.get("by_physical_class", {})
             for cls_name in ("Coronal Hole", "Quiet Sun", "Active Region"):
                 if cls_name in by_cls:
                     s = by_cls[cls_name]
-                    pct = 100 * s.get("frac_outside_disk", 0.0)
                     lines.append(
                         f"| {cls_name} | {s.get('n_clusters', 0)} "
-                        f"| {s.get('n_hidden_patches', 0):,} "
-                        f"| {s.get('n_inside_disk', 0):,} "
-                        f"| {s.get('n_outside_disk', 0):,} "
-                        f"| {pct:.1f}% |"
+                        f"| {s.get('n_hidden_patches', 0):,} |"
                     )
-            lines.append("")
-            lines.append("**Reading the radial-distribution plot below:**  "
-                          "the x-axis is radial distance from the estimated "
-                          "disk center in patch units; the dotted red vertical "
-                          "line marks the disk edge.  A peak just *outside* "
-                          "the disk edge in the AR curve supports the off-"
-                          "limb-AR hypothesis.  A peak *at* the disk edge "
-                          "in the QS or CH curves is consistent with limb-"
-                          "threshold confusion in SPoCA.")
             lines.append("")
             lines.append(f"![hidden-physical density]"
                           f"(hidden_physical_spatial/hidden_physical_density.png)")
             lines.append(f"![hidden-physical density per class]"
                           f"(hidden_physical_spatial/hidden_physical_density_per_class.png)")
-            lines.append(f"![hidden-physical radial distribution]"
-                          f"(hidden_physical_spatial/hidden_physical_radial.png)")
             lines.append(f"![hidden-physical per-sample maps]"
                           f"(hidden_physical_spatial/hidden_physical_per_sample.png)")
             # Single-sample close-up of the last sample
