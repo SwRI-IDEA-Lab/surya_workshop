@@ -228,3 +228,6 @@ wandb/
 *.gz
 *.7z
 *.rar
+*.json
+*.txt
+*.md
