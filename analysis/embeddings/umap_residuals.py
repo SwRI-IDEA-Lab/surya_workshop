@@ -86,6 +86,20 @@ def parse_args() -> argparse.Namespace:
                         "clustering feature space. Yields a hard label for "
                         "every point (no -1 class). The unmodified labels are "
                         "still saved alongside.")
+    p.add_argument("--reassign-metric", choices=["euclidean", "mahalanobis"],
+                   default="euclidean",
+                   help="Distance metric for noise reassignment. 'euclidean' "
+                        "uses centroid distance — fast, but biased toward "
+                        "spherical clusters. 'mahalanobis' accounts for each "
+                        "cluster's covariance — robust to elongated clusters, "
+                        "more expensive. Use mahalanobis if the elongated "
+                        "satellite filaments need to be respected.")
+    p.add_argument("--mahalanobis-shrinkage", type=float, default=0.05,
+                   help="Mahalanobis only: Ledoit-Wolf-style shrinkage toward "
+                        "diag(Σ) to stabilize singular/near-singular cluster "
+                        "covariances. Σ_reg = (1-λ)·Σ + λ·diag(Σ). Default 0.05. "
+                        "Increase to 0.1-0.3 if you see numerical warnings or "
+                        "if small clusters give strange reassignments.")
     p.add_argument("--cluster-on", choices=["raw", "pca", "umap2d"], default="umap2d",
                    help="Feature space for clustering. 'raw' = 1280-d residuals "
                         "(suffers high-dim distance concentration; often fails). "
@@ -195,8 +209,8 @@ def main() -> None:
             min_cluster_size = args.hdbscan_min_cluster_size,
             min_samples      = args.hdbscan_min_samples,
             cluster_selection_method = "leaf",
-            cluster_selection_epsilon = 1.0,
-            alpha = 1.0
+            cluster_selection_epsilon = 2.0,
+            alpha = 1.5
         )
 
         if args.reassign_noise:
@@ -210,38 +224,129 @@ def main() -> None:
             elif n_noise == 0:
                 print("  reassign-noise: nothing to do — no noise points.")
             else:
-                # Save the unmodified labels before overwriting.
                 np.save(args.out_dir / "patch_residuals_clusters_with_noise.npy",
                         cluster_labels.copy())
 
-                print(f"  reassign-noise: {n_noise:,} of {len(cluster_labels):,} "
-                      f"points ({100*n_noise/len(cluster_labels):.1f}%) → "
-                      f"nearest of {len(uniq)} centroids")
+                print(f"  reassign-noise ({args.reassign_metric}): "
+                      f"{n_noise:,} of {len(cluster_labels):,} points "
+                      f"({100*n_noise/len(cluster_labels):.1f}%) → nearest of "
+                      f"{len(uniq)} clusters")
 
-                # Centroid per cluster in the clustering feature space.
+                noise_pts = cluster_input[noise_mask].astype(np.float32)
+                F         = noise_pts.shape[1]   # feature dim of clustering space
+                CHUNK     = 50_000
+
+                # ----- Per-cluster centroids (used by both metrics) ----------
                 centroids = np.stack([
                     cluster_input[cluster_labels == k].mean(axis=0).astype(np.float32)
                     for k in uniq
                 ])
 
-                # Chunked nearest-centroid assignment to bound peak memory.
-                # noise_pts: (M, F);  centroids: (K, F)  → distances: (M, K).
-                # We process in chunks of CHUNK rows to keep the temporary
-                # array small even when M and F are both large.
-                noise_pts = cluster_input[noise_mask].astype(np.float32)
-                CHUNK = 50_000
-                assigned = np.empty(n_noise, dtype=np.int32)
-                # Pre-compute centroid squared norms for the (a-b)² expansion.
-                cent_sq  = (centroids ** 2).sum(axis=1)
-                for start in range(0, n_noise, CHUNK):
-                    chunk = noise_pts[start:start + CHUNK]
-                    # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ
-                    # ‖x‖² is constant per row, so we omit it for the argmin.
-                    d2 = cent_sq[None, :] - 2.0 * chunk @ centroids.T
-                    assigned[start:start + CHUNK] = uniq[d2.argmin(axis=1)]
+                if args.reassign_metric == "euclidean":
+                    # Argmin over ‖c‖² − 2·x·cᵀ  (the ‖x‖² term is row-constant).
+                    cent_sq  = (centroids ** 2).sum(axis=1)
+                    assigned = np.empty(n_noise, dtype=np.int32)
+                    for start in range(0, n_noise, CHUNK):
+                        chunk = noise_pts[start:start + CHUNK]
+                        d2 = cent_sq[None, :] - 2.0 * chunk @ centroids.T
+                        assigned[start:start + CHUNK] = uniq[d2.argmin(axis=1)]
+
+                else:  # mahalanobis
+                    from scipy.linalg import solve_triangular, LinAlgError
+
+                    K       = len(uniq)
+                    lam     = float(args.mahalanobis_shrinkage)
+                    cluster_sizes = np.array(
+                        [int((cluster_labels == k).sum()) for k in uniq]
+                    )
+
+                    # Build Cholesky factor and log-det per cluster.
+                    chol_factors = []         # list of L_k, lower-triangular (F, F)
+                    log_dets     = np.empty(K, dtype=np.float64)
+                    valid_k      = np.ones(K, dtype=bool)
+
+                    for i, k in enumerate(uniq):
+                        members = cluster_input[cluster_labels == k].astype(np.float32)
+                        n_k     = len(members)
+
+                        if n_k <= F:
+                            # Rank-deficient: cannot estimate full-cov; fall back
+                            # to a diagonal-covariance approximation for this
+                            # cluster.  log|Σ| = Σ log σ²_d.
+                            var_d = members.var(axis=0, ddof=1) + 1e-6
+                            # Encode "diagonal cluster" as a 1-D vector flag via
+                            # a None Cholesky factor + the variance vector.
+                            chol_factors.append(("diag", var_d))
+                            log_dets[i] = np.log(var_d).sum()
+                            continue
+
+                        cov = np.cov(members, rowvar=False).astype(np.float64)  # (F, F)
+
+                        # Ledoit-Wolf-style shrinkage toward diag(cov):
+                        # Σ_reg = (1-λ)·Σ + λ·diag(Σ).  Preserves marginal
+                        # variances, dampens off-diagonal correlations.
+                        diag_cov = np.diag(np.diag(cov))
+                        cov_reg  = (1.0 - lam) * cov + lam * diag_cov
+
+                        # Add a tiny ridge so Cholesky always succeeds even on
+                        # numerically singular cov_reg.
+                        ridge = 1e-6 * np.trace(cov_reg) / F
+                        cov_reg.flat[:: F + 1] += ridge
+
+                        try:
+                            L = np.linalg.cholesky(cov_reg)
+                        except LinAlgError:
+                            # Last resort: pure diagonal approximation.
+                            var_d = np.diag(cov_reg) + 1e-6
+                            chol_factors.append(("diag", var_d))
+                            log_dets[i] = np.log(var_d).sum()
+                            print(f"    warning: cluster {k} (n={n_k}) "
+                                  f"Cholesky failed; using diagonal Σ.")
+                            continue
+
+                        chol_factors.append(("full", L))
+                        # log|Σ| = 2·Σ log diag(L)
+                        log_dets[i] = 2.0 * np.log(np.diag(L)).sum()
+
+                    n_diag = sum(1 for kind, _ in chol_factors if kind == "diag")
+                    if n_diag:
+                        print(f"    {n_diag}/{K} clusters used diagonal-Σ "
+                              f"fallback (small or rank-deficient).")
+
+                    # Score each noise point against each cluster, in chunks.
+                    # score_k(x) = d²_M(x, μ_k) + log|Σ_k|
+                    # (equivalent to −2·log p(x | cluster k) under Gaussian
+                    #  cluster model, up to a constant.)
+                    assigned = np.empty(n_noise, dtype=np.int32)
+                    for start in range(0, n_noise, CHUNK):
+                        chunk = noise_pts[start:start + CHUNK]
+                        M     = chunk.shape[0]
+                        scores = np.empty((M, K), dtype=np.float64)
+                        for i in range(K):
+                            delta = (chunk - centroids[i]).astype(np.float64)  # (M, F)
+                            kind, factor = chol_factors[i]
+                            if kind == "full":
+                                # Solve L · y = δᵀ, then d²_M = ‖y‖²_col.
+                                y = solve_triangular(
+                                    factor, delta.T, lower=True, check_finite=False
+                                )
+                                d2 = (y * y).sum(axis=0)
+                            else:  # diag
+                                d2 = ((delta * delta) / factor).sum(axis=1)
+                            scores[:, i] = d2 + log_dets[i]
+                        assigned[start:start + CHUNK] = uniq[scores.argmin(axis=1)]
 
                 cluster_labels = cluster_labels.copy()
                 cluster_labels[noise_mask] = assigned
+
+                # Diagnostic: how much did each cluster grow?
+                pre  = np.array([int((np.load(
+                            args.out_dir / "patch_residuals_clusters_with_noise.npy"
+                       ) == k).sum()) for k in uniq])
+                post = np.array([int((cluster_labels == k).sum()) for k in uniq])
+                growth = (post - pre) / np.maximum(pre, 1) * 100.0
+                print(f"    cluster growth from reassignment: "
+                      f"{[f'{g:+.1f}%' for g in growth]}")
     elif args.cluster_method == "kmeans":
         from cuml.cluster import KMeans
         print(f"  K-means: n_clusters={args.n_clusters}")
