@@ -58,6 +58,27 @@
               // "--no-wandb",
               // "--train_baseline"
             ]
-        }              
+        },
+        {
+            "name": "Embedding analysis",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:extension.commandvariable.file.relativeFileDotsNoExtension}",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3"
+              },
+            "justMyCode": false,
+            // All hyperparameters (batch_size, max_samples, s3_cache_dir, etc.) are set
+            // in config_script.yaml. Only the three CLI overrides are accepted here:
+            //   --max-epochs  override training.max_epochs for quick debug runs
+            //   --no-wandb    skip WandB logging during local development
+            //   --train_baseline  switch to the simple linear baseline model
+            // "args": [
+            //   "--config", "/d0/amunozj/git_repos/surya_workshop/downstream_apps/template/configs/config_script.yaml",
+            // ]
+        }                      
+        
     ]
 }
