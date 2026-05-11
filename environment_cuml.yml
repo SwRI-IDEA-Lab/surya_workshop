@@ -1,0 +1,31 @@
+name: surya_ws_cuml
+channels:
+  - rapidsai
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ipykernel
+  - ipywidgets
+  - jupyter_contrib_nbextensions
+  - wandb
+  - numba
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - scikit-learn
+  - scikit-image
+  - sunpy
+  - xarray
+  - bottleneck
+  - h5netcdf
+  - hdf5plugin
+  - opencv
+  - umap-learn
+  - rapids
+  - cuml
+  - cuda-version=12.8
+  - cuda-python=12
+  - libstdcxx-ng>=13
+  - pip
