@@ -59,14 +59,14 @@ from workshop_infrastructure.utils import load_pretrained_weights, build_scalers
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-INDEX_PATH           = "/d0/amunozj/git_repos/surya_workshop/data/indices/surya_aws_s3_full_index.csv"
-MASKS_DIR            = Path("/d0/amunozj/segmentation_masks")
+INDEX_PATH           = "/nobackupnfs1/sroy14/processed_data/Helio/csv_files/full_data_201006_to_202412_with_priority.csv"
+MASKS_DIR            = Path("/nobackupnfs1/sroy14/processed_data/Helio/segment_vu")
 MASKS_TIME_TOLERANCE = pd.Timedelta("6min")
 MASK_KEY             = "feature_mask"
 
 SCALERS_PATH    = str(_repo_root / "downstream_apps/template/assets/scalers.yaml")
-CHECKPOINT_PATH = str(_repo_root / "downstream_apps/template/assets/surya.366m.v1.pt")
-CACHE_PATH = str("/d0/amunozj/surya_ws_cache")
+CHECKPOINT_PATH = "/nobackupp17/amunozja/surya.366m.v1.pt"
+CACHE_PATH = "/nobackupp17/amunozja/surya_ws_cache"
 
 START_DATE  = "2013-01-01"
 END_DATE    = "2020-12-31"
