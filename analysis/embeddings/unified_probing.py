@@ -258,6 +258,13 @@ def parse_args() -> argparse.Namespace:
     # UMAP / clustering
     p.add_argument("--umap-n-neighbors", type=int, default=30)
     p.add_argument("--umap-min-dist", type=float, default=0.1)
+    p.add_argument("--umap-n-points", type=int, default=None,
+                   help="Randomly subsample this many patches before UMAP "
+                        "fit+transform.  Default: use all on-disk patches. "
+                        "Strongly recommended for large runs: a 650-sample × "
+                        "65536-patch ablation has ~20M on-disk patches, which "
+                        "stresses even cuML UMAP.  500_000–1_000_000 gives "
+                        "accurate 2D structure at manageable cost.")
     p.add_argument("--cluster-method", choices=["hdbscan", "kmeans", "gmm"],
                    default="hdbscan",
                    help="Clustering algorithm.  Default 'hdbscan' is the "
@@ -345,7 +352,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--anyup-resolution", type=int, default=512)
 
     p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+
+    # Probe-group shortcuts (mutually exclusive with each other; both
+    # override --probes if given).
+    _CLUSTERING_PROBES = ["umap_cluster", "cluster_purity", "hidden_physical_spatial"]
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument("--no-clustering", action="store_true",
+                     help="Run all probes except umap_cluster, cluster_purity, "
+                          "and hidden_physical_spatial.  Useful for a fast first "
+                          "pass: PCA, linear probes, spatial correlation, and "
+                          "PCA visualisation, without the expensive UMAP step.")
+    grp.add_argument("--clustering-only", action="store_true",
+                     help="Run only umap_cluster, cluster_purity, and "
+                          "hidden_physical_spatial.  cluster_purity and "
+                          "hidden_physical_spatial will load cluster_labels.npy "
+                          "from a previous umap_cluster run if it exists.")
+
+    args = p.parse_args()
+
+    # Apply group shortcuts to args.probes so downstream code sees a plain list.
+    if args.no_clustering:
+        args.probes = [pr for pr in args.probes if pr not in _CLUSTERING_PROBES]
+    elif args.clustering_only:
+        args.probes = [pr for pr in _CLUSTERING_PROBES if pr in args.probes]
+
+    return args
 
 
 # ============================================================================
@@ -374,10 +405,10 @@ class AblationOutputs:
 def load_ablation_outputs(ablation_dir: Path) -> AblationOutputs:
     """Load all artifacts produced by embedding_ablation.py."""
     print(f"\n[load] Reading ablation outputs from {ablation_dir}")
-    residuals   = np.load(ablation_dir / "patch_residuals.npy")
+    residuals   = np.load(ablation_dir / "patch_residuals.npy",   mmap_mode="r")
     mu          = np.load(ablation_dir / "patch_pos_mean.npy")
     positions   = np.load(ablation_dir / "patch_residuals_positions.npy")
-    mask_labels = np.load(ablation_dir / "patch_mask_labels.npy")
+    mask_labels = np.load(ablation_dir / "patch_mask_labels.npy", mmap_mode="r")
     timestamps  = np.load(ablation_dir / "timestamps.npy", allow_pickle=True)
 
     # Reconstruct keep_idx from positions (raster row * grid + col).
@@ -386,7 +417,7 @@ def load_ablation_outputs(ablation_dir: Path) -> AblationOutputs:
 
     # Optional PCA file (used to speed up UMAP)
     pca_path = ablation_dir / "patch_residuals_pca.npy"
-    pca = np.load(pca_path) if pca_path.exists() else None
+    pca = np.load(pca_path, mmap_mode="r") if pca_path.exists() else None
 
     print(f"       residuals    : {residuals.shape} {residuals.dtype}")
     print(f"       mu           : {mu.shape} {mu.dtype}")
@@ -823,6 +854,7 @@ def probe_effective_rank(raw: np.ndarray, residuals: np.ndarray,
     flat_res = residuals.reshape(-1, residuals.shape[-1])
 
     results = {}
+    cap = args.rank_subsample
     classes = [(None, "overall", flat_raw, flat_res, flat_lbl)]
     for cls_id in (-1, 0, 1, 2):
         if cls_id == -1:   # NA: keep separately, mostly for sanity
@@ -833,9 +865,14 @@ def probe_effective_rank(raw: np.ndarray, residuals: np.ndarray,
         if m.sum() < 100:
             print(f"   {tag:14s}: only {m.sum()} samples, skipping")
             continue
-        classes.append((cls_id, tag, flat_raw[m], flat_res[m], flat_lbl[m]))
+        # Subsample indices before extracting from the memmap to avoid
+        # materialising hundreds of GiB for large classes (e.g. NA ~32M patches).
+        idx = np.where(m)[0]
+        if len(idx) > cap:
+            idx = rng.choice(idx, cap, replace=False)
+            idx.sort()
+        classes.append((cls_id, tag, flat_raw[idx], flat_res[idx], flat_lbl[idx]))
 
-    cap = args.rank_subsample
     for _cls_id, tag, R, Rr, _lbl in classes:
         R_sub  = _subsample_rows(R,  cap, rng)
         Rr_sub = _subsample_rows(Rr, cap, rng)
@@ -912,7 +949,12 @@ def probe_pca_ev(raw: np.ndarray, residuals: np.ndarray,
         m = flat_lbl == cls_id
         if m.sum() < nc + 100:
             continue
-        panels.append((tag, flat_raw[m], flat_res[m]))
+        # Subsample indices first to avoid materialising large memmap slices.
+        idx = np.where(m)[0]
+        if len(idx) > cap:
+            idx = rng.choice(idx, cap, replace=False)
+            idx.sort()
+        panels.append((tag, flat_raw[idx], flat_res[idx]))
 
     results = {}
     for tag, R, Rr in panels:
@@ -1647,6 +1689,34 @@ def probe_umap_cluster(ab: AblationOutputs, args: argparse.Namespace,
 
     raw_flat_clu = raw_flat[keep_mask]
     pca_flat_clu = pca_flat[keep_mask] if pca_flat is not None else None
+    # Keep references to the full kept arrays before optional subsampling so
+    # that cluster labels can later be extended to all n_kept patches.
+    raw_flat_clu_full = raw_flat_clu
+    pca_flat_clu_full = pca_flat_clu
+
+    # --- Optional point-count cap for UMAP -----------------------------------
+    # Without this, a 650-sample × 65536-patch run has ~20M on-disk patches —
+    # intractable even for GPU-accelerated cuML UMAP.  Subsampling to 500K–1M
+    # preserves the global density structure at manageable cost.
+    rng_umap = np.random.default_rng(args.seed)
+    umap_sel = None
+    if args.umap_n_points is not None and n_kept > args.umap_n_points:
+        umap_sel = rng_umap.choice(n_kept, size=args.umap_n_points, replace=False)
+        umap_sel.sort()  # sorted access is friendlier to cache/mmap
+        raw_flat_clu = raw_flat_clu[umap_sel]
+        if pca_flat_clu is not None:
+            pca_flat_clu = pca_flat_clu[umap_sel]
+        print(f"   --umap-n-points: subsampled {args.umap_n_points:,} of "
+              f"{n_kept:,} on-disk patches for UMAP")
+
+    # Build a mask covering exactly the points that entered UMAP+clustering.
+    # When subsampling was applied, this is a strict subset of keep_mask.
+    if umap_sel is not None:
+        keep_idx = np.where(keep_mask)[0]
+        umap_keep_mask = np.zeros(n_total, dtype=bool)
+        umap_keep_mask[keep_idx[umap_sel]] = True
+    else:
+        umap_keep_mask = keep_mask
 
     # UMAP fit always uses the highest-D representation available — purely
     # for the 2D projection used in scatter plots.
@@ -1700,6 +1770,20 @@ def probe_umap_cluster(ab: AblationOutputs, args: argparse.Namespace,
         cluster_space_tag = f"raw residuals ({raw_flat_clu.shape[1]}-d)"
     print(f"   Clustering feature space: {cluster_space_tag}")
 
+    # Determine the full (non-subsampled) cluster feature space used after
+    # clustering to extend labels to all n_kept patches, so the spatial map
+    # and cluster_purity probe cover the whole solar disk.
+    if umap_sel is not None:
+        if args.cluster_on == "pca" and pca_flat_clu_full is not None:
+            cluster_input_full = pca_flat_clu_full
+        elif args.cluster_on == "raw":
+            cluster_input_full = raw_flat_clu_full
+        else:  # umap2d: coords unavailable for non-sampled points; fall back
+            cluster_input_full = (pca_flat_clu_full if pca_flat_clu_full is not None
+                                  else raw_flat_clu_full)
+    else:
+        cluster_input_full = cluster_input  # no subsampling, already complete
+
     # --- Run the chosen clustering algorithm -------------------------------
     print(f"   Clustering ({args.cluster_method})")
     cluster_info: dict = {}
@@ -1743,17 +1827,57 @@ def probe_umap_cluster(ab: AblationOutputs, args: argparse.Namespace,
         clu_labels_filt = gmm.predict(cluster_input).astype(np.int32)
         clu_labels_filt_noise = None
 
+    # --- Extend cluster labels to ALL n_kept patches -------------------------
+    # When --umap-n-points subsampled the data, clu_labels_filt only covers
+    # the UMAP-sampled subset.  Extend to all n_kept patches so the spatial
+    # map and cluster_purity probe see a fully coloured solar disk.
+    if umap_sel is None:
+        clu_labels_all = clu_labels_filt   # no subsampling: already complete
+    elif args.cluster_method == "kmeans":
+        clu_labels_all = km.predict(cluster_input_full).astype(np.int32)
+        print(f"   k-means label extension: predicted {n_kept:,} patches")
+    elif args.cluster_method == "gmm":
+        clu_labels_all = gmm.predict(cluster_input_full).astype(np.int32)
+        print(f"   GMM label extension: predicted {n_kept:,} patches")
+    else:   # hdbscan: UMAP-sampled points keep their labels; remaining patches
+            # get nearest-centroid assignment in the clustering feature space.
+        clu_labels_all = np.full(n_kept, -1, dtype=np.int32)
+        clu_labels_all[umap_sel] = clu_labels_filt
+        non_umap_mask_ext = np.ones(n_kept, dtype=bool)
+        non_umap_mask_ext[umap_sel] = False
+        non_umap_idx = np.where(non_umap_mask_ext)[0]
+        if len(non_umap_idx) > 0 and K_real > 0:
+            unique_k = np.array(
+                sorted(k for k in set(clu_labels_filt.tolist()) if k >= 0),
+                dtype=np.int32)
+            centroids_ext = np.stack([
+                cluster_input[clu_labels_filt == k].mean(axis=0)
+                for k in unique_k
+            ]).astype(np.float32)
+            X_non = cluster_input_full[non_umap_idx].astype(np.float32)
+            assigned_ext = np.empty(len(non_umap_idx), dtype=np.int32)
+            CHUNK_EXT = 50_000
+            print(f"   HDBSCAN label extension: nearest-centroid for "
+                  f"{len(non_umap_idx):,} non-UMAP patches ...")
+            for start in range(0, len(non_umap_idx), CHUNK_EXT):
+                ch = X_non[start:start + CHUNK_EXT]
+                dists = np.linalg.norm(
+                    ch[:, None, :] - centroids_ext[None, :, :], axis=2)
+                assigned_ext[start:start + CHUNK_EXT] = (
+                    unique_k[dists.argmin(axis=1)])
+            clu_labels_all[non_umap_idx] = assigned_ext
+
     # --- Expand cluster labels back to full length -------------------------
     # -2 marks patches that were excluded from clustering (NA when
     # --exclude-na-from-clustering was set).  Downstream probes (cluster_purity,
     # spatial map) detect the sentinel and skip those points.
     EXCLUDED = -2
     cluster_labels = np.full(n_total, EXCLUDED, dtype=np.int32)
-    cluster_labels[keep_mask] = clu_labels_filt
+    cluster_labels[keep_mask] = clu_labels_all
     np.save(out_dir / "cluster_labels.npy", cluster_labels)
     if clu_labels_filt_noise is not None:
         cluster_labels_with_noise = np.full(n_total, EXCLUDED, dtype=np.int32)
-        cluster_labels_with_noise[keep_mask] = clu_labels_filt_noise
+        cluster_labels_with_noise[umap_keep_mask] = clu_labels_filt_noise
         np.save(out_dir / "cluster_labels_with_noise.npy", cluster_labels_with_noise)
     else:
         cluster_labels_with_noise = None
@@ -1761,13 +1885,13 @@ def probe_umap_cluster(ab: AblationOutputs, args: argparse.Namespace,
     # ----- Plots: UMAP scatter colored three ways --------------------------
     # Plots use the filtered arrays directly — emb2d is already only the
     # clustered points, so all UMAP scatters live in clustered-only space.
-    flat_lbl_filt  = full_flat_lbl[keep_mask]
+    flat_lbl_filt  = full_flat_lbl[umap_keep_mask]
     flat_rows_full = np.broadcast_to(ab.positions[None, :, 0],
                                        (ab.N, ab.n_keep)).reshape(-1)
     flat_cols_full = np.broadcast_to(ab.positions[None, :, 1],
                                        (ab.N, ab.n_keep)).reshape(-1)
-    flat_rows = flat_rows_full[keep_mask]
-    flat_cols = flat_cols_full[keep_mask]
+    flat_rows = flat_rows_full[umap_keep_mask]
+    flat_cols = flat_cols_full[umap_keep_mask]
 
     title_suffix = (f"\nResiduals — {ab.N} samples × {ab.n_keep:,} patches "
                     f"= {emb2d.shape[0]:,} points")
@@ -3310,8 +3434,11 @@ def main() -> None:
     else:
         raw = reconstruct_raw_from_residuals(ab)
         # Sanity check: raw - mu[keep_idx] should equal residuals exactly.
-        diff = np.abs((raw - ab.mu[ab.keep_idx][None, :, :])
-                       - ab.residuals).max()
+        # Done per-sample to avoid a 203 GB intermediate temporary.
+        mu_kept = ab.mu[ab.keep_idx]  # (n_keep, D), already in RAM
+        diff = 0.0
+        for _t in range(ab.N):
+            diff = max(diff, float(np.abs(raw[_t] - mu_kept - ab.residuals[_t]).max()))
         print(f"      reconstruction max abs residual: {diff:.2e}")
         if diff > 1e-3:
             warnings.warn(f"Raw reconstruction mismatch ({diff:.2e}); "
