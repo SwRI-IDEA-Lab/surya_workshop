@@ -658,6 +658,109 @@ def _pca_reduce_for_probe(raw: np.ndarray, residuals: np.ndarray,
 # label.  Mahalanobis reassignment turns the noise label into a covariance-
 # aware hard assignment when needed for downstream comparisons.
 
+def _build_cluster_mahalanobis_model(
+    X: np.ndarray,
+    labels: np.ndarray,
+    lam: float,
+) -> tuple:
+    """Build per-cluster Cholesky covariance factors for Mahalanobis scoring.
+
+    Parameters
+    ----------
+    X      : (N, F) float32 — feature matrix (only labelled points, no noise).
+    labels : (N,) int32     — cluster IDs (must all be ≥ 0).
+    lam    : float          — Ledoit-Wolf shrinkage λ for
+                             Σ_reg = (1−λ)·Σ + λ·diag(Σ).
+
+    Returns
+    -------
+    uniq         : (K,) int32  sorted cluster IDs present in labels.
+    centroids    : (K, F) float32 cluster means.
+    chol_factors : list of ("full", L) or ("diag", var_d) — one per cluster.
+    log_dets     : (K,) float64 log|Σ_reg| per cluster.
+    n_diag       : int  number of clusters that fell back to diagonal Σ.
+    """
+    from scipy.linalg import LinAlgError
+    X = np.ascontiguousarray(X.astype(np.float32, copy=False))
+    _N, F = X.shape
+    lam = float(lam)
+    uniq = np.array(sorted({int(k) for k in labels if k >= 0}), dtype=np.int32)
+    K = len(uniq)
+    centroids = np.stack([X[labels == k].mean(axis=0) for k in uniq])
+    chol_factors: list = []
+    log_dets = np.empty(K, dtype=np.float64)
+    n_diag = 0
+    for i, k in enumerate(uniq):
+        members = X[labels == k]
+        n_k = len(members)
+        if n_k <= F:
+            var_d = members.var(axis=0, ddof=1) + 1e-6
+            chol_factors.append(("diag", var_d))
+            log_dets[i] = float(np.log(var_d).sum())
+            n_diag += 1
+            continue
+        cov = np.cov(members, rowvar=False).astype(np.float64)
+        diag_cov = np.diag(np.diag(cov))
+        cov_reg = (1.0 - lam) * cov + lam * diag_cov
+        ridge = 1e-6 * np.trace(cov_reg) / F
+        cov_reg.flat[:: F + 1] += ridge
+        try:
+            L = np.linalg.cholesky(cov_reg)
+            chol_factors.append(("full", L))
+            log_dets[i] = float(2.0 * np.log(np.diag(L)).sum())
+        except LinAlgError:
+            var_d = np.diag(cov_reg) + 1e-6
+            chol_factors.append(("diag", var_d))
+            log_dets[i] = float(np.log(var_d).sum())
+            n_diag += 1
+    return uniq, centroids, chol_factors, log_dets, n_diag
+
+
+def _mahalanobis_assign_chunks(
+    X_query: np.ndarray,
+    uniq: np.ndarray,
+    centroids: np.ndarray,
+    chol_factors: list,
+    log_dets: np.ndarray,
+    chunk_size: int = 50_000,
+) -> np.ndarray:
+    """Assign each row of X_query to the nearest cluster by Mahalanobis distance.
+
+    Score = Mahalanobis²(x, k) + log|Σ_k| (Gaussian log-density surrogate;
+    lower = closer).  Chunked to keep peak memory bounded.
+
+    Parameters
+    ----------
+    X_query      : (M, F) — points to assign.
+    uniq / centroids / chol_factors / log_dets — from _build_cluster_mahalanobis_model.
+    chunk_size   : rows processed per iteration.
+
+    Returns
+    -------
+    assigned : (M,) int32 cluster IDs drawn from uniq.
+    """
+    from scipy.linalg import solve_triangular
+    X_query = np.ascontiguousarray(X_query.astype(np.float32, copy=False))
+    M = len(X_query)
+    K = len(uniq)
+    assigned = np.empty(M, dtype=np.int32)
+    for start in range(0, M, chunk_size):
+        chunk = X_query[start:start + chunk_size]
+        scores = np.empty((len(chunk), K), dtype=np.float64)
+        for i in range(K):
+            delta = (chunk - centroids[i]).astype(np.float64)
+            kind, factor = chol_factors[i]
+            if kind == "full":
+                y = solve_triangular(factor, delta.T, lower=True,
+                                     check_finite=False)
+                d2 = (y * y).sum(axis=0)
+            else:   # diag
+                d2 = ((delta * delta) / factor).sum(axis=1)
+            scores[:, i] = d2 + log_dets[i]
+        assigned[start:start + chunk_size] = uniq[scores.argmin(axis=1)]
+    return assigned
+
+
 def _hdbscan_with_mahalanobis_reassignment(
     X: np.ndarray,
     min_cluster_size: int,
@@ -692,7 +795,6 @@ def _hdbscan_with_mahalanobis_reassignment(
     except ImportError:
         raise ImportError("cuML required for HDBSCAN; install via "
                           "`conda install -c rapidsai cuml`")
-    from scipy.linalg import solve_triangular, LinAlgError
 
     X = np.ascontiguousarray(X.astype(np.float32, copy=False))
     N, F = X.shape
@@ -731,72 +833,25 @@ def _hdbscan_with_mahalanobis_reassignment(
         }
 
     # --- Mahalanobis-aware reassignment of noise points ---------------------
-    uniq = np.array(sorted({int(k) for k in labels_with_noise if k >= 0}),
-                    dtype=np.int32)
-    K_real = len(uniq)
-    centroids = np.stack([X[labels_with_noise == k].mean(axis=0)
-                           for k in uniq])                       # (K_real, F)
-
-    # Per-cluster Cholesky factor of regularized covariance + log|Σ|.
-    chol_factors = []     # list of ("full", L) or ("diag", var_d)
-    log_dets = np.empty(K_real, dtype=np.float64)
-    n_diag = 0
+    # Build model on the labelled (non-noise) subset; reuses the two helpers
+    # so the same distance metric applies here and in the label-extension step.
     lam = float(mahalanobis_shrinkage)
-
-    for i, k in enumerate(uniq):
-        members = X[labels_with_noise == k]
-        n_k = len(members)
-        if n_k <= F:
-            # Rank-deficient cluster -> diagonal-Σ approximation.
-            var_d = members.var(axis=0, ddof=1) + 1e-6
-            chol_factors.append(("diag", var_d))
-            log_dets[i] = float(np.log(var_d).sum())
-            n_diag += 1
-            continue
-
-        cov = np.cov(members, rowvar=False).astype(np.float64)
-        diag_cov = np.diag(np.diag(cov))
-        cov_reg  = (1.0 - lam) * cov + lam * diag_cov
-        ridge    = 1e-6 * np.trace(cov_reg) / F
-        cov_reg.flat[:: F + 1] += ridge
-
-        try:
-            L = np.linalg.cholesky(cov_reg)
-            chol_factors.append(("full", L))
-            log_dets[i] = float(2.0 * np.log(np.diag(L)).sum())
-        except LinAlgError:
-            var_d = np.diag(cov_reg) + 1e-6
-            chol_factors.append(("diag", var_d))
-            log_dets[i] = float(np.log(var_d).sum())
-            n_diag += 1
+    non_noise_mask = labels_with_noise >= 0
+    uniq, centroids, chol_factors, log_dets, n_diag = _build_cluster_mahalanobis_model(
+        X[non_noise_mask], labels_with_noise[non_noise_mask], lam,
+    )
+    K_real = len(uniq)
 
     if n_diag:
         print(f"   {n_diag}/{K_real} clusters used diagonal-Σ fallback "
               f"(small or rank-deficient).")
 
-    # Score each noise point against each cluster.  Chunked for memory.
     noise_mask = labels_with_noise == -1
     noise_pts  = X[noise_mask]
-    M          = len(noise_pts)
-    CHUNK      = 50_000
-    assigned   = np.empty(M, dtype=np.int32)
-
-    print(f"   reassigning {M:,} noise points (mahalanobis, λ={lam}) ...")
-    for start in range(0, M, CHUNK):
-        chunk = noise_pts[start:start + CHUNK]
-        scores = np.empty((len(chunk), K_real), dtype=np.float64)
-        for i in range(K_real):
-            delta = (chunk - centroids[i]).astype(np.float64)
-            kind, factor = chol_factors[i]
-            if kind == "full":
-                # Solve L · y = δᵀ; d²_M = ||y||²_col
-                y = solve_triangular(factor, delta.T, lower=True,
-                                      check_finite=False)
-                d2 = (y * y).sum(axis=0)
-            else:   # diag
-                d2 = ((delta * delta) / factor).sum(axis=1)
-            scores[:, i] = d2 + log_dets[i]
-        assigned[start:start + CHUNK] = uniq[scores.argmin(axis=1)]
+    print(f"   reassigning {len(noise_pts):,} noise points (mahalanobis, λ={lam}) ...")
+    assigned = _mahalanobis_assign_chunks(
+        noise_pts, uniq, centroids, chol_factors, log_dets,
+    )
 
     labels_assigned = labels_with_noise.copy()
     labels_assigned[noise_mask] = assigned
@@ -1839,32 +1894,32 @@ def probe_umap_cluster(ab: AblationOutputs, args: argparse.Namespace,
     elif args.cluster_method == "gmm":
         clu_labels_all = gmm.predict(cluster_input_full).astype(np.int32)
         print(f"   GMM label extension: predicted {n_kept:,} patches")
-    else:   # hdbscan: UMAP-sampled points keep their labels; remaining patches
-            # get nearest-centroid assignment in the clustering feature space.
+    else:   # hdbscan: UMAP-sampled points keep their Mahalanobis-reassigned
+            # labels; remaining patches are assigned via the same metric.
         clu_labels_all = np.full(n_kept, -1, dtype=np.int32)
         clu_labels_all[umap_sel] = clu_labels_filt
         non_umap_mask_ext = np.ones(n_kept, dtype=bool)
         non_umap_mask_ext[umap_sel] = False
         non_umap_idx = np.where(non_umap_mask_ext)[0]
         if len(non_umap_idx) > 0 and K_real > 0:
-            unique_k = np.array(
-                sorted(k for k in set(clu_labels_filt.tolist()) if k >= 0),
-                dtype=np.int32)
-            centroids_ext = np.stack([
-                cluster_input[clu_labels_filt == k].mean(axis=0)
-                for k in unique_k
-            ]).astype(np.float32)
-            X_non = cluster_input_full[non_umap_idx].astype(np.float32)
-            assigned_ext = np.empty(len(non_umap_idx), dtype=np.int32)
-            CHUNK_EXT = 50_000
-            print(f"   HDBSCAN label extension: nearest-centroid for "
+            # Build model from all UMAP-sampled points using post-reassignment
+            # labels — covariances reflect the full (reassigned) cluster shapes.
+            uniq_m, centroids_m, chol_m, logdet_m, n_diag_m = (
+                _build_cluster_mahalanobis_model(
+                    cluster_input.astype(np.float32, copy=False),
+                    clu_labels_filt,
+                    args.mahalanobis_shrinkage,
+                )
+            )
+            if n_diag_m:
+                print(f"   label extension: {n_diag_m}/{len(uniq_m)} clusters "
+                      f"used diagonal-Σ fallback.")
+            X_non = cluster_input_full[non_umap_idx].astype(np.float32, copy=False)
+            print(f"   HDBSCAN label extension: Mahalanobis assignment for "
                   f"{len(non_umap_idx):,} non-UMAP patches ...")
-            for start in range(0, len(non_umap_idx), CHUNK_EXT):
-                ch = X_non[start:start + CHUNK_EXT]
-                dists = np.linalg.norm(
-                    ch[:, None, :] - centroids_ext[None, :, :], axis=2)
-                assigned_ext[start:start + CHUNK_EXT] = (
-                    unique_k[dists.argmin(axis=1)])
+            assigned_ext = _mahalanobis_assign_chunks(
+                X_non, uniq_m, centroids_m, chol_m, logdet_m,
+            )
             clu_labels_all[non_umap_idx] = assigned_ext
 
     # --- Expand cluster labels back to full length -------------------------
