@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N probing_no_clustering
+#PBS -q gpu_normal
+#PBS -l select=1:model=mil_a100:ncpus=12:ngpus=4:mem=480G
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o /nobackupp17/amunozja/git_repos/surya_workshop/logs/probing_no_clustering.log
+
+# All probes except UMAP/clustering: effective_rank, pca_ev, linear probes,
+# spatial_corr, pca_viz.  No cuML needed; runs purely on CPU + sklearn.
+
+set -euo pipefail
+
+REPO=/nobackupp17/amunozja/git_repos/surya_workshop
+PYTHON=/nobackupnfs1/sroy14/rohit/envs/.a100_env/bin/python
+ABLATION_DIR=/nobackupp17/amunozja/ablation_outputs_full
+OUT_DIR=/nobackupp17/amunozja/unified_probing_full
+
+cd "$REPO"
+
+echo "======================================================"
+echo "Job:        $PBS_JOBID"
+echo "Node:       $(hostname)"
+echo "Start:      $(date)"
+echo "Ablation:   $ABLATION_DIR"
+echo "Output:     $OUT_DIR"
+echo "======================================================"
+
+$PYTHON analysis/embeddings/unified_probing.py \
+    --ablation-dir  "$ABLATION_DIR" \
+    --out-dir       "$OUT_DIR" \
+    --no-clustering \
+    --cv-folds 10 \
+    --linear-probe-n-patches 2048 \
+    --rank-subsample 200000 \
+    --use-pca-for-linear-probe \
+    --ridge-alpha-sweep auto \
+    --seed 42
+
+echo "======================================================"
+echo "Done: $(date)"
+echo "======================================================"
