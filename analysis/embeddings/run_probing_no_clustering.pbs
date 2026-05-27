@@ -34,7 +34,9 @@ $PYTHON analysis/embeddings/unified_probing.py \
     --linear-probe-n-patches 2048 \
     --rank-subsample 200000 \
     --use-pca-for-linear-probe \
-    --ridge-alpha-sweep auto \
+    --pca-viz-on both \
+    --pca-viz-norm both \
+    --ridge-alpha-sweep 0.001,0.01,0.1,1,10,100,1000,10000,100000,1000000 \
     --seed 42
 
 echo "======================================================"

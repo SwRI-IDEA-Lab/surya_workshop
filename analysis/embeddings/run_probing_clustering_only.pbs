@@ -31,10 +31,14 @@ $PYTHON analysis/embeddings/unified_probing.py \
     --ablation-dir  "$ABLATION_DIR" \
     --out-dir       "$OUT_DIR" \
     --clustering-only \
-    --hdbscan-min-cluster-size 200 \
-    --hdbscan-min-samples 100 \
     --umap-n-points 500000 \
     --exclude-na-from-clustering \
+    --hdbscan-min-cluster-size 15 \
+    --hdbscan-min-samples 15 \
+    --hdbscan-cluster-selection-method leaf \
+    --hdbscan-cluster-selection-epsilon 2.0 \
+    --hdbscan-alpha 1.5 \
+    --mahalanobis-shrinkage 0.05 \
     --seed 42
 
 echo "======================================================"
