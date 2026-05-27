@@ -11,8 +11,6 @@ import torch
 import torch.distributed as dist
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
-from peft import LoraConfig, get_peft_model
-
 from workshop_infrastructure.configs import LoraAdapterConfig
 
 
@@ -141,6 +139,7 @@ def apply_peft_lora(
         f"dropout={lora_config.lora_dropout}, modules={lora_config.target_modules}"
     )
 
+    from peft import LoraConfig, get_peft_model
     peft_config = LoraConfig(
         r=lora_config.r,
         lora_alpha=lora_config.lora_alpha,
