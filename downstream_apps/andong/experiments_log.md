@@ -1335,3 +1335,10 @@ Decision rule triggered -> reported both variants to user. Options:
     (no leak either way — all selection is on validation data);
 (b) adopt per-fold at all scales and lose the G3+ CI-excludes-zero claim.
 Artifacts: runs/v14_agc_loocv_ensemble/loocv_pipeb_perfoldtau.csv
+
+### [2026-07-15 decision] tau-perfold — option (a) adopted
+User selected: keep fixed tau=30/46 numbers (canonical), amend the
+manuscript protocol text (per-fold G1+, frozen pre-cutoff G2+/G3+) and
+add the sample-size-floor finding to the Threshold Selection subsection
+(sec:disc_tau). Manuscript commit d592cf0. The per-fold variant remains
+archived in loocv_pipeb_perfoldtau.csv as the robustness reference.
