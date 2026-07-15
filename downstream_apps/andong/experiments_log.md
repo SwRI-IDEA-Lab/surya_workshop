@@ -1098,3 +1098,74 @@ the PARIS val set to storm-window leads or weight residuals by the
 canonical storm weights) — a different experiment requiring its own
 preflight. Artifacts: runs/v14_agc_ap_emu_paris/fold_20_Event_22/
 (perscale_paris.csv, paris_prune_indices.csv, fold_info.json, fold20.log*).
+
+## [2026-07-15 11:57 UTC] v14agc-tau-perday @ 314a873
+
+### Hypothesis
+If the Pipeline-B decision thresholds are selected per forecast day
+(D1/D2/D3) instead of one global τ per G-scale — selection on the same
+cutoff-run validation split (5,744 samples) used for the canonical
+τ=26/30/46 — then D2 strict TSS on the OOS forward window should improve
+by at least +0.03 at G1+ (from +0.041) without degrading D1 or D3 by more
+than 0.02, because the AR decoder's amplitude compression grows with lead,
+so a single τ is mis-calibrated at mid-leads.
+
+### Falsification
+Falsified if the D2 G1+ strict improvement is < +0.03, or if the
+issue-bootstrap 95% CI of the D2 delta includes zero (per-day τ won on
+val but not OOS → 6 extra parameters overfit the val split), or if D1/D3
+degrade by > 0.02.
+
+### Data flow audit
+- No training. Post-hoc decision-layer change only.
+- τ selection: val split ONLY (split.npz val_indices, pre-cutoff,
+  disjoint from OOS test window and from the regression's train pool).
+- OOS window (issue_time > 2024-08-31) used exclusively for final scoring;
+  never touched during τ selection.
+- Same NOAA bounds [39,67,111], same storm-window definition (peak over
+  all 24 leads ≥ 39), same day slices (D1=leads 0-7, D2=8-15, D3=16-23),
+  same within-day tolerance kernel 5 as the existing per-day analysis.
+
+### Comparison alignment
+Global-τ rule, per-day-τ rule, and SWPC-Ap are scored on identical OOS
+storm-window issues, identical day slices, identical TSS code. Alignment
+checks (must pass before the new numbers count):
+1. Reproduce val-selected global τ = 26/30/46 (tau_val.log).
+2. Reproduce manuscript per-day global-τ rule strict TSS
+   (tab:v14agc_perday: G1+ +0.249/+0.041/+0.074 etc.).
+
+### Sanity checks
+- [ ] Global τ reproduction (26/30/46)
+- [ ] Manuscript per-day table reproduction under global τ
+- [ ] n_pos per (day, scale) on val printed; cells with < 10 positives
+      fall back to global τ and are flagged
+- [ ] FPR/TPR reported alongside TSS for D2 (guard against FA explosion)
+
+### Stop conditions
+1. Alignment check 1 or 2 fails → protocol bug, numbers void.
+2. Any selected per-day τ sits at a sweep boundary (2 or 198) → sweep
+   range artifact, do not report that cell.
+3. Val n_pos < 10 in a cell → no per-day τ for that cell (fallback).
+
+### Launch command
+`conda run -n dst_longterm_forecast python -u v14_agc_tau_perday.py --gpu 7`
+
+### [2026-07-15 RESULTS] v14agc-tau-perday — FALSIFIED
+Checks 1+2 passed (global tau 26/30/46 reproduced; manuscript per-day table
+reproduced within 0.005). Val-selected per-day taus: D1 26/28/46,
+D2 28/28/46, D3 32/46/52 — validation wants HIGHER taus at longer leads.
+OOS deltas (per-day minus global, strict, issue-bootstrap 95% CI):
+  D2 G1+ -0.018 [-0.036, -0.002]  — significantly WORSE
+  D2 G2+ +0.005 [-0.016, +0.027]  — null
+  D3 G1+ -0.016 [-0.036, +0.005]; D3 G2+ -0.033 [-0.079, +0.010] — null-to-worse
+  D1 G2+ +0.020 [-0.011, +0.059] — null; all other cells tau unchanged.
+VERDICT: falsified (needed D2 G1+ >= +0.03; got -0.018 with CI excluding 0
+in the wrong direction). Two readings: (1) the val split (pre-2024-09)
+prefers higher long-lead taus but the SC25-max OOS window punishes them —
+the same distribution shift documented in sec:limitations; (2) D2 TPR at
+G1+ is only 0.13-0.21 for ANY tau near the operating range — the mid-lead
+deficit is discrimination (drift/information), not operating-point
+calibration. No decision-layer fix available; day-2 improvement requires
+backbone work (e.g. direct non-AR heads for leads 9-16), a separate
+preflighted experiment. Global tau 26/30/46 remains canonical.
+Artifacts: runs/v14_agc_cutoff20240831/tau_perday/tau_perday_oos.csv
