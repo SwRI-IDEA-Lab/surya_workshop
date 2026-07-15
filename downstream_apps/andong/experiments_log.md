@@ -978,3 +978,123 @@ tensor via kp10_to_ap_lookup — same code path.
   runs/v14_agc_loocv_ensemble/loocv_perscale_ensemble_pre2015.csv,
   loocv_trivial_baselines_pre2015.csv, eval.log. Canonical 26-fold
   CSVs untouched.
+
+## [2026-07-15 02:46 UTC] v14agc-paris-prune-fold20 @ a90ccdf
+
+### Hypothesis
+If we remove the 10% of fold-20 (Gannon) training samples that PARIS
+(representer-theorem influence, `paris_pruner.py`, λ=1e-2 as in the
+2026-06 V12 diagnostics) flags as most harmful to validation loss at the
+72-h lead, and retrain with the otherwise-identical canonical protocol
+(30 ep, seed 42, PDF sampler, STORM_W=10/SEVERE_W=30), then G1+ strict
+TSS on the held-out Gannon window should improve by at least +0.02 over
+the canonical fold-20 model (+0.089), because pruning quiet-time samples
+whose kernel influence pushes validation predictions away from targets
+should reduce fit noise without touching the rare storm samples.
+
+### Falsification
+Falsified if pruned-retrain G1+ strict TSS < +0.07 (worse than canonical
+by >0.02) — meaning influence-based pruning removes information the storm
+task needs — or if >30% of pruned samples are storm leads (ap@72h ≥ 48 nT)
+while storms are only ~2% of the pool, meaning PARIS is mis-specified for
+this imbalanced target and the retrain result is moot. Single fold,
+single seed: effects smaller than ±0.02 are below detection; this run is
+a gate for a multi-fold extension, not a headline.
+
+### Data flow audit
+- Pool: canonical fold-20 exclusion (Gannon window + seq_len+horizon
+  lookback buffer removed) — identical indices to canonical run
+  (same np.random.seed(42) shuffle, 85/15 split).
+- PARIS validation = the canonical 15% val split, NOT the held-out event
+  (the 2026-06 V12 diagnostic used the Gannon window as PARIS val; that
+  was a diagnostic and would be leaky here — explicitly avoided).
+- φ = decoder GRU hidden at lead index 23 (72 h); w,b = dec_proj
+  weight/bias. Target = normalized ap at lead 23, same tensor the loss
+  sees. No new features; no future info (targets only used to rank
+  training samples, never enters the model input).
+- CACHE_EMBEDDINGS=1 for the retrain: RAM copy of the same H5 rows,
+  I/O path only, no data change.
+- Normalization: dataset-internal fixed AP_SCALE=400, unchanged.
+
+### Comparison alignment
+| Aspect | Pruned retrain | Canonical fold 20 |
+|---|---|---|
+| Fold / test set | fold 20 Gannon window (manuscript Event #27) | same |
+| Train pool | canonical minus PARIS-pruned 10% | canonical |
+| Epochs/seed/sampler/loss | 30 / 42 / PDF weights (pool-lookup subset) / storm-weighted MSE | same |
+| H5 / img slice | Model_B_AIA_GONG_C3_2011_2025.h5, all_three | same |
+| Scorer | v14_agc_loocv_ensemble.run_fold (τ from val split, NOAA bounds, kernel 9) | same |
+| SWPC baseline | leak-free publication-cutoff | same |
+Only difference: training subset (and I/O cache path).
+
+### Sanity checks
+- [ ] paris_pruner mock demo runs in dst_longterm_forecast env
+- [ ] Head reconstruction: Phi@w+b == model forward at lead 23 (max |Δ| < 1e-4)
+- [ ] Prune diagnostic: storm-vs-quiet prune shares logged
+- [ ] λ estimate logged alongside the 1e-2 override
+- [ ] Retrain first-epoch loss finite; val_loss comparable to canonical
+- Skipped: single-batch overfit / shuffled-label (architecture and
+  pipeline unchanged from canonical LOOCV where both were validated)
+
+### Stop conditions
+1. >30% of pruned samples are storm leads (ap72 ≥ 48) → method
+   mis-specified, do not trust retrain result.
+2. Cholesky downdate failure rate >5% of iterations → numerics distrust.
+3. Pruned val_loss > 2× canonical fold-20 best val_loss → training broken.
+4. run_fold n_storm ≠ 204 or pos_leads ≠ 816/504/360 → eval misalignment.
+
+### Launch command
+`conda run -n dst_longterm_forecast python -u v14_agc_paris_prune_fold20.py --gpu 7`
+
+### [2026-07-15 amendment] v14agc-paris-prune-fold20 — mid-run stop + method fix
+First launch stopped at PARIS iter ~1,680/3,363: in-loop val r² diverged to
+~1e13 (normalized units ≤1) with one validation point pinned as "hardest"
+for thousands of iterations. Root cause: `paris_pruner.py` recomputed
+α = Φw* inside the loop while initializing it in the canonical dual form
+α = (Y_c − Φw*)/λ — self-inconsistent state that compounds per deletion.
+Fixed the loop to the canonical form (matches the file's own header note).
+Mock demo after fix: bounded r² (64 vs 66,788) and 0/100 injected storm
+samples pruned (was 47/100). Prior V12-era PARIS prune sets (2026-06
+diagnostics) were produced with the buggy recomputation and should not be
+reused. Relaunched from scratch; first-launch log kept as fold20.log.diverged.
+
+### [2026-07-15 amendment 2] v14agc-paris-prune-fold20 — second stop, downdate impl
+Rerun with the canonical-α fix ALSO diverged at the same scale (r²~1e15 by
+iter 1680). Second root cause: `cholesky_downdate` (the 'givens' path)
+applies circular Givens rotations where a downdate requires hyperbolic
+rotations — it computes an update, not a downdate, so L drifts every
+iteration; the drifted w* is amplified 1/λ (=100x) through α. This also
+explains the "impossible" positive-definiteness failures (A minus a member
+column is always PD when λ>0). The pruner's own demo is annotated
+downdate_impl='naive'  # known correct — switched the fold-20 script to
+'naive' (exact re-Cholesky per deletion; D=128, ~50 µs each) and added a
+divergence guard to PARISPruner (raise if max|r_val| grows 1e3x over the
+initial fit). Third launch from scratch.
+
+### [2026-07-15 RESULTS] v14agc-paris-prune-fold20 — FALSIFIED
+Third launch clean (naive downdate + canonical alpha; in-loop r² stable at
+0.241 throughout; no downdate failures). Prune diagnostic: 0.30% of pruned
+samples are storm leads vs 1.87% pool share — PARIS avoided the rare class
+as intended (stop 1 clear). Retrain 603 s with CACHE_EMBEDDINGS=1 (vs
+~15,100 s uncached canonical), full 30 epochs, best val_loss 0.001918 vs
+canonical 0.002105 (stop 3 clear). Eval alignment exact: n_storm=204,
+pos=816/504/360 (stop 4 clear). tau_G1 28 (canonical 26).
+
+Storm-window TSS on held-out Gannon (fold 20), pruned vs canonical vs SWPC:
+  G1+ strict -0.008 / +0.089 / +0.061    tol +0.030 / +0.121 / +0.121
+  G2+ strict +0.006 / +0.153 / +0.040    tol -0.103 / +0.104 / +0.135
+  G3+ strict -0.006 / +0.151 / -0.003    tol -0.048 / +0.168 / -0.011
+
+VERDICT: falsified (G1+ strict -0.008 << +0.07 bar). Removing the 10% of
+quiet samples ranked most harmful to the 72-h val MSE IMPROVES val loss but
+collapses storm-window TSS at every G-scale to ~0. The PARIS objective
+(pointwise MSE on a quiet-dominated val split) does not track the
+storm-decision metric — same failure family as the classifier deficit
+(proxy objective vs decision skill). The quiet-time samples PARIS calls
+"unrepresentative" evidently carry context the storm task needs.
+Do not extend to more folds with this objective. If PARIS is retried, the
+validation loss must be re-targeted at storm-window skill (e.g. restrict
+the PARIS val set to storm-window leads or weight residuals by the
+canonical storm weights) — a different experiment requiring its own
+preflight. Artifacts: runs/v14_agc_ap_emu_paris/fold_20_Event_22/
+(perscale_paris.csv, paris_prune_indices.csv, fold_info.json, fold20.log*).
