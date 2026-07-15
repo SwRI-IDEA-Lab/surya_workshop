@@ -1388,3 +1388,8 @@ none overlap corrected SWPC (~0.000) — the headline claim holds under
 either convention. Decision rule triggered on the G2+ paired CI ->
 reported to user. Artifacts: runs/v14_agc_ap_emu_aplag/ (32 folds),
 runs/v14_agc_loocv_ensemble/loocv_perscale_aplag.csv.
+
+### [2026-07-15 decision] aplag-32fold — canonical + full disclosure adopted
+User selected: keep canonical numbers; Data-section disclosure upgraded
+to the 32-fold paired result (manuscript commit follows d592cf0).
+Lagged run archived: runs/v14_agc_ap_emu_aplag/ + loocv_perscale_aplag.csv.
