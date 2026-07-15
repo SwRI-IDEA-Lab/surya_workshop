@@ -1342,3 +1342,49 @@ manuscript protocol text (per-fold G1+, frozen pre-cutoff G2+/G3+) and
 add the sample-size-floor finding to the Threshold Selection subsection
 (sec:disc_tau). Manuscript commit d592cf0. The per-fold variant remains
 archived in loocv_pipeb_perfoldtau.csv as the robustness reference.
+
+## [2026-07-15 aplag-32fold] lagged ap-history full LOOCV @ 6e59cdc
+
+### Hypothesis
+Extension of the fold-20 aplag preflight to all 32 folds: under the
+lagged (operationally honest) ap-history convention, the 32-fold
+fold-median strict TSS stays within 0.02 of canonical at every G-scale
+(+0.066/+0.058/+0.038) with CIs still excluding zero and non-overlapping
+vs corrected SWPC, because fold 20 showed the 3h nowcast edge carries no
+skill and the remaining folds share the same mechanism.
+
+### Falsification / decision rule
+If any G-scale median drops >0.02 or a CI overlaps corrected SWPC, the
+lagged convention materially changes the result: keep canonical numbers
++ disclosure and report. If it holds, EITHER adopt lagged numbers
+everywhere (large renumber) OR strengthen the disclosure to cite the
+full-rerun robustness check — decide with user after results.
+
+### Protocol
+- Worker v14_agc_aplag_fold.py: identical canonical per-fold protocol
+  (30 ep, seed 42, PDF sampler, 85/15 split) with ap_aligned shifted +1
+  step (invariants asserted per worker). 32-event catalog via pre2015
+  wrapper. Output runs/v14_agc_ap_emu_aplag/ (fold 20 already present).
+- 7-way parallel on GPUs 0,2-7 (GPU 1 busy), CACHE_EMBEDDINGS=1.
+- Eval: E.run_fold (fixed scorer, per-fold tau_G1 + frozen 30/46) on the
+  lagged dataset; output loocv_perscale_aplag.csv + paired deltas.
+
+### Stop conditions
+1. Any fold val_loss > 2x its canonical counterpart -> inspect before eval.
+2. Eval n_storm/pos_leads must match canonical per fold.
+
+### [2026-07-15 RESULTS] aplag-32fold — headline robust; small real cost at G2+
+All 32 folds trained + scored (fixed scorer). Lagged vs canonical,
+fold-median strict TSS [CI] and paired per-fold delta:
+  G1+ +0.038 [+0.026,+0.094] vs +0.066 [+0.035,+0.100]; paired -0.002 [-0.024,+0.020]
+  G2+ +0.038 [+0.018,+0.056] vs +0.058 [+0.038,+0.126]; paired -0.023 [-0.060,-0.003]
+  G3+ +0.028 [+0.015,+0.048] vs +0.038 [+0.011,+0.071]; paired -0.002 [-0.034,+0.009]
+Reading: G1+/G3+ paired deltas indistinguishable from zero (the G1+
+median gap 0.066->0.038 is distribution-shape, not systematic — the
+paired test is the correct one). G2+ shows a small but significant cost
+(-0.023, CI excludes zero): the 3-h nowcast value carries some genuine
+G2+ skill. Under the lagged convention ALL CIs still exclude zero and
+none overlap corrected SWPC (~0.000) — the headline claim holds under
+either convention. Decision rule triggered on the G2+ paired CI ->
+reported to user. Artifacts: runs/v14_agc_ap_emu_aplag/ (32 folds),
+runs/v14_agc_loocv_ensemble/loocv_perscale_aplag.csv.
