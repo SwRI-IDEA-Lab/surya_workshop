@@ -157,7 +157,7 @@ class PARISPruner:
                  b_NN: float,
                  prune_fraction: float = 0.10,
                  device: str = 'cpu',
-                 downdate_impl: str = 'givens',
+                 downdate_impl: str = 'naive',
                  verbose: bool = True,
                  lambda_override: Optional[float] = None):
         assert downdate_impl in ('givens', 'naive')

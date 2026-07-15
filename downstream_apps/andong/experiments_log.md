@@ -1169,3 +1169,70 @@ calibration. No decision-layer fix available; day-2 improvement requires
 backbone work (e.g. direct non-AR heads for leads 9-16), a separate
 preflighted experiment. Global tau 26/30/46 remains canonical.
 Artifacts: runs/v14_agc_cutoff20240831/tau_perday/tau_perday_oos.csv
+
+## [2026-07-15 SWPC-rescore] fix swpc index bug @ 481f110
+
+### Hypothesis
+Fixing the SWPC lookup from sample-index to issue-row (idx + seq_len - 1)
+in the V14-AGC-era scorers will RAISE the SWPC-Ap baseline's storm-window
+TSS (currently scored on 165-h-stale bulletins) by an unknown amount;
+model columns are untouched. The manuscript's model-vs-SWPC margins
+shrink accordingly and must be re-derived from the rescored CSVs.
+
+### Falsification / decision rule
+This is a bug-fix rescore, not a model claim. Decision: whatever the
+corrected SWPC numbers are, they replace the old ones everywhere
+(LOOCV table, OOS table, per-day table). If corrected SWPC medians
+exceed the rule's, the manuscript's headline claim is dead and the PI
+must be informed before any further manuscript work.
+
+### Alignment checks (must pass before new numbers count)
+1. Equivalence: swpc tensor at idx+seq_len-1 must equal the y_swpc that
+   dataset __getitem__(idx) returns, for 100 random samples.
+2. Reproduction: recomputing SWPC TSS with the OLD buggy index inside the
+   new rescore harness must match the canonical CSV swpc columns
+   (proves the harness itself is aligned; only then is the fixed-index
+   delta attributable to the fix).
+3. Physical spot check: corrected SWPC forecast during the Gannon window
+   must show elevated (G3+-range) values at short leads — SWPC famously
+   forecast Gannon at high activity; the stale-index version shows quiet.
+
+### Scope
+- v14_agc_loocv_ensemble.py run_fold: fixed index (future runs).
+- v14_agc_swpc_rescore.py: standalone SWPC-only rescore of all 32 folds
+  (canonical 26 + pre2015 6); writes loocv_swpc_rescored.csv; canonical
+  CSVs untouched.
+- v14_agc_temporal_cutoff_predict.py: same fix; oos_predictions.csv swpc
+  columns regenerated into oos_predictions_swpcfix.csv; OOS + per-day
+  tables recomputed.
+- dataset_leakfree.py: additive swpc_valid mask (coverage-masked SWPC TSS
+  reported as sensitivity alongside the zero-fill-as-quiet convention).
+- paris_pruner.py: default downdate_impl -> 'naive'.
+
+### [2026-07-15 RESULTS] SWPC-rescore — conclusions SURVIVE; OOS SWPC was inflated, not deflated
+All 3 gates passed (100-sample __getitem__ equivalence; stale-index
+reproduction matched all 96 canonical CSV cells within 0.005; corrected
+Gannon SWPC max 236 nT).
+
+LOOCV (32-fold): corrected SWPC strict medians remain +0.000 at every
+G-scale (G1+ CI widens to [-0.014,+0.013]); tol G1+ +0.034 (was +0.036).
+Rule/ensemble columns unchanged. Paired per-fold rule-minus-SWPCfixed
+strict: G1+ +0.068 [+0.039,+0.104] (32 folds), G2+ +0.069 [+0.047,+0.127]
+(30 folds), G3+ +0.042 [+0.011,+0.071] (23 folds; degenerate-SWPC folds
+dropped). Headline claim intact.
+
+OOS window: the stale keying had INFLATED SWPC (7-day-old bulletins
+correlate with the SC25-max recurrent activity): pooled strict SWPC
+fixed/stale = G1+ +0.025/+0.041, G2+ +0.007/+0.064, G3+ -0.005/+0.016;
+rule unchanged (+0.120/+0.119/+0.082). Per-day SWPC fixed:
+D1 +0.024/+0.022/-0.013, D2 +0.044/-0.001/-0.000, D3 +0.008/0/0.
+Model-vs-SWPC OOS margins WIDEN with the fix at every scale and day
+except D2 G1+, where corrected SWPC (+0.044) still edges the rule
+(+0.041) — day-2 soft spot narrative survives.
+
+Manuscript actions required: refresh SWPC columns in tab:v14agc_oos,
+tab:v14agc_perday, and the LOOCV table (tiny tol change); coverage-masked
+sensitivity strict median also +0.000. Cov-mask column in
+loocv_swpc_rescored.csv. Fixed scorers: v14_agc_loocv_ensemble.py,
+v14_agc_temporal_cutoff_predict.py (future runs); dataset_leakfree.py
+now exposes swpc_valid; paris_pruner default now 'naive'.
