@@ -64,19 +64,28 @@ def tss_pair(yp_2d, yt_2d):
     return strict, tol
 
 
-def sweep_g1_tau(pred_2d, actual_2d):
+def sweep_tau_for(pred_2d, actual_2d, thr, fallback, min_pos=10):
+    """Val-split argmax-strict-TSS tau at G-scale entry point `thr`.
+    Falls back to the global default when the val storm windows carry
+    fewer than `min_pos` positive leads at this threshold."""
     peak = actual_2d.max(axis=1); storm = peak >= NOAA_G[0]
     if storm.sum() == 0:
-        return 26  # fallback
+        return fallback
     p_s = pred_2d[storm]; a_s = actual_2d[storm]
-    yt = (a_s >= NOAA_G[0]).astype(np.int8)
-    best = (-999, 26)
+    yt = (a_s >= thr).astype(np.int8)
+    if int(yt.sum()) < min_pos:
+        return fallback
+    best = (-999, fallback)
     for tau in TAU_SWEEP:
         yp = (p_s >= tau).astype(np.int8)
         s = tss(yp, yt)
         if not np.isnan(s) and s > best[0]:
             best = (s, tau)
     return best[1]
+
+
+def sweep_g1_tau(pred_2d, actual_2d):
+    return sweep_tau_for(pred_2d, actual_2d, NOAA_G[0], fallback=26)
 
 
 def run_fold(fold_id, ds, event_to_idx, device):
@@ -96,6 +105,12 @@ def run_fold(fold_id, ds, event_to_idx, device):
     test_indices = event_to_idx[event_name]
     if not test_indices:
         return None, f'no test indices for {event_name}'
+    # Positional SWPC pairing below assumes strictly increasing, unique
+    # timestamps over the test slice (matches issue_time sort order).
+    ts = ds.timestamps
+    assert all(ts[test_indices[i]] < ts[test_indices[i + 1]]
+               for i in range(len(test_indices) - 1)), \
+        f'non-monotonic timestamps in test slice for {event_name}'
     excl = lookback_overlap_indices(ds, event_name)
     train_pool = sorted(set(range(len(ds))) - excl)
     np.random.seed(SEED)
@@ -134,7 +149,9 @@ def run_fold(fold_id, ds, event_to_idx, device):
     n_va = len(dfv) // HORIZON
     pred_va_win = dfv['pred_ap_v14'].values.reshape(n_va, HORIZON)
     act_va_win = dfv['actual_ap'].values.reshape(n_va, HORIZON)
-    tau_g1 = sweep_g1_tau(pred_va_win, act_va_win)
+    tau_g1 = sweep_tau_for(pred_va_win, act_va_win, NOAA_G[0], fallback=26)
+    tau_g2 = sweep_tau_for(pred_va_win, act_va_win, NOAA_G[1], fallback=30)
+    tau_g3 = sweep_tau_for(pred_va_win, act_va_win, NOAA_G[2], fallback=46)
 
     # Apply to held-out storm
     dfte = pd.DataFrame(mte).sort_values(['issue_time', 'lead_h']).reset_index(drop=True)
@@ -189,14 +206,13 @@ def run_fold(fold_id, ds, event_to_idx, device):
         else:
             yp_ens = (lr_s >= 3).astype(np.int8)
         s_ens, t_ens = tss_pair(yp_ens, yt)
-        # Pipeline B baseline (val-τ for G1+ only; for G2+/G3+ we use best-guess proxies 30/46 nT)
-        tau_g2_default, tau_g3_default = 30, 46
+        # Pipeline B: per-fold val-selected tau at every G-scale
         if lbl == 'G1+':
             yp_pb = (p_s >= tau_g1).astype(np.int8)
         elif lbl == 'G2+':
-            yp_pb = (p_s >= tau_g2_default).astype(np.int8)
+            yp_pb = (p_s >= tau_g2).astype(np.int8)
         else:
-            yp_pb = (p_s >= tau_g3_default).astype(np.int8)
+            yp_pb = (p_s >= tau_g3).astype(np.int8)
         s_pb, t_pb = tss_pair(yp_pb, yt)
         rows.append(dict(fold=fold_id, event=event_name, threshold=lbl,
                           swpc_strict=s_swpc, swpc_tol=t_swpc,
@@ -204,7 +220,7 @@ def run_fold(fold_id, ds, event_to_idx, device):
                           ens_strict=s_ens, ens_tol=t_ens,
                           n_storm=int(storm.sum()),
                           pos_leads=int(yt.sum()),
-                          tau_g1=tau_g1,
+                          tau_g1=tau_g1, tau_g2=tau_g2, tau_g3=tau_g3,
                           fx_time=fx_time, lr_time=lr_time))
     return rows, None
 

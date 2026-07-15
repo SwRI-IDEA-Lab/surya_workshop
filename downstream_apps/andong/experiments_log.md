@@ -1287,3 +1287,51 @@ inflate short leads, which moved the other way). Action: disclosure
 sentence added to the manuscript Data section; full 32-fold rerun with
 the lagged convention is optional hygiene for a future revision, not a
 correctness requirement. Artifacts: runs/v14_agc_ap_emu_aplag/.
+
+## [2026-07-15 tau-perfold] per-fold val-selected G2+/G3+ tau @ 7f493ec
+
+### Hypothesis
+If tau_G2/tau_G3 are selected per fold on each fold's own val split
+(same sweep as tau_G1) instead of the hardcoded cutoff-run constants
+30/46, the 32-fold pipeb G2+/G3+ medians change by less than 0.02 and
+all CIs still exclude zero / stay non-overlapping vs corrected SWPC,
+because val-optimal taus cluster near the global values. This makes the
+manuscript's "validation-selected tau per fold" protocol statement
+literally true at all three scales.
+
+### Falsification / decision rule
+If a G2+/G3+ median drops by >0.02 or a CI starts overlapping the
+corrected SWPC CI, the protocol change is material: report both
+variants to the user before touching the manuscript.
+
+### Alignment checks
+1. Reproduction: fixed-tau (30/46) pipeb recomputation in the new
+   harness must match canonical CSV pipeb columns within 0.005.
+2. n_storm / pos_leads per fold match canonical.
+3. Fold-level fallback to global tau when val positives < 10 at a scale
+   (recorded per fold).
+
+### Scope
+- v14_agc_loocv_ensemble.py: per-fold tau_g2/tau_g3 selection replaces
+  the hardcoded constants (future runs); timestamp-monotonicity assert.
+- v14_agc_tau_perfold_rescore.py: regression-only rescore of all 32
+  folds (no LR refit; ens columns unchanged); writes
+  runs/v14_agc_loocv_ensemble/loocv_pipeb_perfoldtau.csv.
+
+### [2026-07-15 RESULTS] tau-perfold — MATERIAL at G3+; decision needed
+Gates passed (tau_g1 reproduction + fixed-tau pipeb reproduction, 96
+cells). Per-fold vs fixed tau, 32-fold medians [CI]:
+  G1+ strict +0.066 [+0.035,+0.101] vs +0.066 [+0.035,+0.099]  — unchanged
+  G2+ strict +0.054 [+0.022,+0.104] vs +0.058 [+0.038,+0.126]  — minor
+  G3+ strict +0.017 [-0.005,+0.060] vs +0.038 [+0.027,+0.069]  — MATERIAL:
+      drop 0.021, CI now includes zero. G3+ tol likewise
+      (+0.069 [-0.003,+0.134] vs +0.073 [+0.028,+0.140]).
+Cause: per-fold tau_G3 selection is unstable on scarce val positives
+(selected taus span 36-66 across folds; G2+ spans 22-44); the fixed
+tau=46 chosen once on the large cutoff-run val split generalizes better.
+Decision rule triggered -> reported both variants to user. Options:
+(a) keep fixed 30/46 numbers, amend manuscript protocol text to state
+    tau_G1 per-fold / tau_G2,G3 frozen from the cutoff-run val split
+    (no leak either way — all selection is on validation data);
+(b) adopt per-fold at all scales and lose the G3+ CI-excludes-zero claim.
+Artifacts: runs/v14_agc_loocv_ensemble/loocv_pipeb_perfoldtau.csv
