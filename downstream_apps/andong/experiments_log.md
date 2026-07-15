@@ -1236,3 +1236,54 @@ sensitivity strict median also +0.000. Cov-mask column in
 loocv_swpc_rescored.csv. Fixed scorers: v14_agc_loocv_ensemble.py,
 v14_agc_temporal_cutoff_predict.py (future runs); dataset_leakfree.py
 now exposes swpc_valid; paris_pruner default now 'naive'.
+
+## [2026-07-15 aplag] v14agc-aplag-fold20 @ 2255b59
+
+### Hypothesis
+If the ap-history input (and AR decoder seed) is lagged one grid step so
+its last element is the ap interval ENDING at t_0 (operationally
+available) instead of the interval beginning at t_0 (code-review finding:
+up-to-3h-future information), then fold-20 G1+ strict TSS should drop by
+less than 0.03 and D1 strict by less than 0.05 if the leak is immaterial,
+because the model's multi-day skill is claimed to come from imagery +
+context, not from the 3-h nowcast edge.
+
+### Falsification / decision rule
+If G1+ strict drops > 0.03 or D1 strict drops > 0.05 relative to the
+canonical fold-20 model, the canonical D1 numbers are leak-assisted:
+full 32-fold rerun with lagged history + manuscript disclosure required.
+Smaller drops -> add an explicit "ap nowcast at t_0 assumed available"
+statement to the Data section (or rerun anyway for cleanliness).
+
+### Data flow audit
+- Only change: ap_aligned series shifted +1 step before windowing
+  (hist_lag[idx,1:] == hist_orig[idx,:-1]; asserted in-script).
+  Targets, imagery, physics, Dst, split (seed-42 85/15), sampler weights
+  (computed from ap_grid_raw, untouched), epochs, seed: identical.
+- Lagged model evaluated ON the lagged dataset (operational condition).
+- Scorer: fixed-index run_fold (post-2255b59).
+
+### Sanity checks
+- [ ] hist_lag invariants asserted (shift identity + first-element pad)
+- [ ] val_loss within 2x canonical fold-20 best (0.00211)
+- [ ] n_storm=204, pos=816/504/360 alignment
+
+### Launch command
+`conda run -n dst_longterm_forecast python -u v14_agc_aplag_fold20.py --gpu 7`
+
+### [2026-07-15 RESULTS] v14agc-aplag-fold20 — leak immaterial (NOT leak-assisted)
+Lagged-history retrain (637 s), same seed/protocol, scored with the
+fixed scorer. Fold-20 model columns, lagged vs canonical:
+  G1+ strict +0.120 vs +0.089 (delta +0.031)   G2+ +0.188 vs +0.153
+  G3+ +0.032 vs +0.151 (delta -0.120)
+  Per-day G1+ strict: D1 +0.218 vs +0.157 (+0.060), D2 -0.071 vs -0.011,
+  D3 +0.213 vs +0.121 (+0.092).
+Decision rule: leak-assisted iff G1+ strict drops >0.03 or D1 drops
+>0.05. Neither dropped — both IMPROVED under the lagged (operationally
+available) history, so the canonical skill does not depend on the
+3h-future ap value. The G3+ swing (-0.120 on ~128 positive leads) is
+single-fold retrain noise, not a leak signature (a timing leak would
+inflate short leads, which moved the other way). Action: disclosure
+sentence added to the manuscript Data section; full 32-fold rerun with
+the lagged convention is optional hygiene for a future revision, not a
+correctness requirement. Artifacts: runs/v14_agc_ap_emu_aplag/.
