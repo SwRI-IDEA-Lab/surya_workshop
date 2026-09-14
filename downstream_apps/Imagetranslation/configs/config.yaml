@@ -94,4 +94,4 @@ parallelism: "ddp" # Valid options: "ddp" and "fsdp"
 # Finetuning config fields
 #pretrained_path: "/home/dineshahegde/surya_workshop/downstream_apps/Imagetranslation/assets/surya.366m.v1.pt"
 pretrained_path: "/data001/finetuning_dh/surya_workshop/downstream_apps/Imagetranslation/assets/surya.366m.v1.pt"
-freeze_backbone: Falsem
+freeze_backbone: False
