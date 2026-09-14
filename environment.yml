@@ -22,6 +22,7 @@ dependencies:
   - h5netcdf
   - hdf5plugin
   - opencv
+  - pyarrow=23.*
   - pip
   - pip:
     - torch
@@ -29,10 +30,11 @@ dependencies:
     - lightning
     - peft
     - torchmetrics
-    - s3fs
+    - s3fs==2024.6.1
     - einops
     - huggingface_hub
-    - datasets
+    - datasets==2.21.0
+    - fsspec==2024.6.1
     - hf_transfer
     - timm
-    - boto3
+    - boto3==1.41.5
