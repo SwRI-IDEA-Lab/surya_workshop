@@ -1,5 +1,6 @@
 """
-A simple linear regression model to be used as a baseline for flare forecasting.
+A simple linear regression model to be used as a baseline for SEP intensity (Jlinlin)
+forecasting from PSP-aligned SHARP data.
 """
 
 import torch
@@ -35,10 +36,10 @@ def destandardize_channels(batch: dict, channel_order: list, scalers: dict) -> d
     return {**batch, "ts": x}
 
 
-class RegressionFlareModel(nn.Module):
+class RegressionSepPspModel(nn.Module):
     def __init__(self, input_dim: int):
         """
-        Initializes the RegressionFlareModel.
+        Initializes the RegressionSepPspModel.
 
         Args:
             input_dim (int): The size of the input vector after channel and time dimensions are flattened.
@@ -47,7 +48,7 @@ class RegressionFlareModel(nn.Module):
             This model expects 'ts' in the batch dict to already be in **signum-log** space
             (channel z-scores undone, log compression retained). Use
             destandardize_channels() to pre-process normalized SDO inputs before passing
-            them here (e.g., via the preprocess_fn argument of FlareLightningModule).
+            them here (e.g., via the preprocess_fn argument of SepPspLightningModule).
         """
         super().__init__()
         self.linear = nn.Linear(input_dim, 1)
@@ -67,7 +68,7 @@ class RegressionFlareModel(nn.Module):
         """
         x = x["ts"]
 
-        # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
+        # Collapse input stack spatially and take absolute value for strictly positive SEP intensities
         x = x.abs().mean(dim=[3, 4])
 
         # Rearrange in preparation for linear layer

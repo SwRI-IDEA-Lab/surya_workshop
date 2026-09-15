@@ -24,7 +24,7 @@
 #   --deterministic warn   (reproducible run; see training.deterministic below)
 # =============================================================================
 
-job_id: solar_flare_forecasting
+job_id: sep_pred_psp
 
 
 # -----------------------------------------------------------------------------
@@ -42,11 +42,12 @@ data:
   time_delta_input_minutes: [0]   # Offsets (minutes) of input frames relative to reference timestep
   time_delta_target_minutes: 60   # Step size (minutes) between forecast frames
 
-  # -- Downstream label alignment (flare catalog → Surya index) --
-  flare_index_path: ../data/hek_flare_catalog.csv
-  ds_time_column: start_time      # Column in the flare catalog used as the event timestamp
+  # -- Downstream label alignment (SHARP-to-PSP catalog → Surya index) --
+  sep_psp_index_path: ../data/SHARP_to_PSP_times.csv
+  ds_time_column: SHARP time      # Column in the SEP/PSP catalog used as the event timestamp
+                                   # (solar-surface time — used to pick the SDO/Surya frame)
   ds_time_tolerance: 4d           # Max allowed gap between catalog and Surya timestamps
-  ds_match_direction: forward     # "forward": use solar state *before* the flare (causal)
+  ds_match_direction: forward     # "forward": use solar state *before* the event (causal)
 
   # -- Local data (only needed when the index contains relative local paths) --
   # sdo_data_root_path: /path/to/sdo   # Prepended to relative local paths; ignored for s3://
@@ -79,7 +80,7 @@ data:
   #
   # If none is set and the index contains s3:// paths, the run fails immediately with a
   # suggested path — not part-way through the first epoch. ~ and $ENV_VARS are expanded.
-  s3_cache_dir: null
+  s3_cache_dir: /home/jovyan/scratch_space/surya_cache
 
   # -- S3 transfer tuning --
   # These control boto3's multipart download: how many threads download parts in
@@ -208,5 +209,5 @@ output:
 # Logging
 # -----------------------------------------------------------------------------
 logging:
-  wandb_project: template_flare_regression
-  wandb_entity: null      # WandB team/org name; null to log to your personal account
+  wandb_project: sep_pred_psp
+  wandb_entity: surya-ws2      # WandB team/org name; null to log to your personal account

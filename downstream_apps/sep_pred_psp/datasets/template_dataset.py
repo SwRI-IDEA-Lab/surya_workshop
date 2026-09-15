@@ -4,34 +4,34 @@ from typing import Callable, Literal
 from workshop_infrastructure.datasets.helio import HelioNetCDFDataset
 
 
-class FlareDSDataset(HelioNetCDFDataset):
+class SepPspDSDataset(HelioNetCDFDataset):
     """
-    Template child class of HelioNetCDFDataset showing how to build a downstream dataset.
-    Extends the base class with a flare intensity label aligned to the Surya index.
+    Child class of HelioNetCDFDataset for SEP prediction from PSP-aligned SHARP data.
+    Extends the base class with a Jlinlin label aligned to the Surya index.
 
     All ``HelioNetCDFDataset`` keyword arguments (``index_path``, ``scalers``, ``channels``,
     ``s3_cache_dir``, etc.) are accepted via ``**kwargs`` and forwarded to the base class.
-    ``load_forecast_frames`` defaults to ``False`` here (flare forecasting supplies its own
-    labels, so future Surya frames are never fetched); pass it explicitly to override.
+    ``load_forecast_frames`` defaults to ``False`` here (this task supplies its own labels,
+    so future Surya frames are never fetched); pass it explicitly to override.
 
     Additional Args:
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
-            Set to False to return only the flare intensity label (useful for label inspection).
+            Set to False to return only the Jlinlin label (useful for label inspection).
         max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
-        label_transform: Optional callable applied to the ``intensity`` column of the flare index
+        label_transform: Optional callable applied to the ``Jlinlin`` column of the SEP/PSP index
             to produce the ``normalized_intensity`` label. Signature:
-            ``(series: pd.Series) -> pd.Series``.  If ``None``, the raw intensity values are
+            ``(series: pd.Series) -> pd.Series``.  If ``None``, the raw Jlinlin values are
             used as-is. Define this at the call site (e.g., in ``build_datasets()``) to keep
             normalization logic out of the dataset class.
-        ds_flare_index_path: Path to the downstream flare intensity CSV index.
-        ds_time_column: Column name in the flare index to use as the event timestamp.
+        ds_sep_psp_index_path: Path to the downstream SHARP-to-PSP CSV index.
+        ds_time_column: Column name in the SEP/PSP index to use as the event timestamp.
         ds_time_tolerance: Maximum allowed time offset when matching Surya and DS indices
             (e.g., ``"15min"``). Unmatched entries are dropped.
         ds_match_direction: Merge direction passed to ``pd.merge_asof``. Use ``"forward"``
-            for causal prediction (predict flares from prior solar state).
+            for causal prediction (predict from prior solar state).
 
     Raises:
-        ValueError: If ``ds_flare_index_path`` is not provided, or if no overlap exists
+        ValueError: If ``ds_sep_psp_index_path`` is not provided, or if no overlap exists
             between the Surya and DS indices within the specified tolerance.
     """
 
@@ -41,7 +41,7 @@ class FlareDSDataset(HelioNetCDFDataset):
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
         label_transform: Callable[[pd.Series], pd.Series] | None = None,
-        ds_flare_index_path: str | None = None,
+        ds_sep_psp_index_path: str | None = None,
         ds_time_column: str | None = None,
         ds_time_tolerance: str | None = None,
         ds_match_direction: Literal["forward", "backward", "nearest"] = "forward",
@@ -51,29 +51,32 @@ class FlareDSDataset(HelioNetCDFDataset):
         if ds_match_direction not in ["forward", "backward", "nearest"]:
             raise ValueError("ds_match_direction must be one of 'forward', 'backward', or 'nearest'")
 
-        # load_forecast_frames defaults to False here: flare forecasting supplies its
-        # own labels, so future Surya frames never need to be fetched from disk/S3.
+        # load_forecast_frames defaults to False here: this task supplies its own
+        # labels, so future Surya frames never need to be fetched from disk/S3.
         kwargs.setdefault("load_forecast_frames", False)
         super().__init__(**kwargs)
 
         self.return_surya_stack = return_surya_stack
 
         # Load ds index and find intersection with Surya index
-        if ds_flare_index_path is not None:
-            self.ds_index = pd.read_csv(ds_flare_index_path)
+        if ds_sep_psp_index_path is not None:
+            self.ds_index = pd.read_csv(ds_sep_psp_index_path)
         else:
-            raise ValueError("ds_flare_index_path must be provided for FlareDSDataset")
+            raise ValueError("ds_sep_psp_index_path must be provided for SepPspDSDataset")
 
+        # format="ISO8601": this catalog mixes full-nanosecond-precision timestamps with
+        # plain-seconds ones (both valid ISO 8601, different precision). A bare
+        # pd.to_datetime() infers one format from the first row and raises on the other.
         self.ds_index["ds_index"] = pd.to_datetime(
-            self.ds_index[ds_time_column]
+            self.ds_index[ds_time_column], format="ISO8601"
         ).values.astype("datetime64[ns]")
         self.ds_index.sort_values("ds_index", inplace=True)
 
-        # Apply label transform if provided; otherwise use raw intensity values.
+        # Apply label transform if provided; otherwise use raw Jlinlin values.
         if label_transform is not None:
-            self.ds_index["normalized_intensity"] = label_transform(self.ds_index["intensity"])
+            self.ds_index["normalized_intensity"] = label_transform(self.ds_index["Jlinlin"])
         else:
-            self.ds_index["normalized_intensity"] = self.ds_index["intensity"]
+            self.ds_index["normalized_intensity"] = self.ds_index["Jlinlin"]
 
         # Create Surya valid indices and find closest match to DS index
         self.df_valid_indices = pd.DataFrame(

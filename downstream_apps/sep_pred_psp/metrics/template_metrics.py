@@ -1,7 +1,7 @@
 """
-Template metrics for flare forecasting.
+Template metrics for SEP (Jlinlin) intensity forecasting.
 
-FlareMetrics defines four metric sets:
+SepPspMetrics defines four metric sets:
 - "train_loss"    — differentiable loss that drives backpropagation (MSE).
 - "val_loss"      — the quantity logged as `val_loss` and used to select checkpoints.
                     Defaults to the same MSE as "train_loss"; override it when your task
@@ -22,10 +22,10 @@ import torchmetrics as tm  # Lots of possible metrics in here https://lightning.
 # linear baseline, while targets are always (B, 1). Every metric below flattens both with
 # reshape(-1) rather than squeeze(-1): squeeze is shape-dependent and collapses a
 # batch of one to a 0-d scalar, which then fails to broadcast against a (1,) target.
-class FlareMetrics:
+class SepPspMetrics:
     def __init__(self, mode: str):
         """
-        Initialize FlareMetrics class.
+        Initialize SepPspMetrics class.
 
         Args:
             mode (str): Mode to use for metric evaluation. One of "train_loss",
@@ -165,7 +165,7 @@ class FlareMetrics:
             tuple[dict[str, torch.Tensor], list[float]]:
                 - Metric dictionary. Keys become logger metric names; values are
                   scalar tensors aggregated over the batch.
-                - List of per-metric weights (used by FlareLightningModule to
+                - List of per-metric weights (used by SepPspLightningModule to
                   combine multiple loss terms into a single scalar).
         """
 
