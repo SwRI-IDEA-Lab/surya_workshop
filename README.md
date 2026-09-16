@@ -1,6 +1,6 @@
 # Surya Workshop
 
-A template repository for fine-tuning [Surya](https://github.com/NASA-IMPACT/Surya), the first foundation model for heliophysics, on your own downstream solar science tasks.
+A template repository for fine-tuning [Surya](https://github.com/NASA-IMPACT/Surya), the first foundation model for heliophysics, on your own downstream solar science tasks. 
 
 ---
 
@@ -64,8 +64,9 @@ surya_workshop/
 ├── workshop_infrastructure/            # Shared utilities used by all downstream apps
 │   ├── configs.py                      # All typed config + load_config(): DataConfig, TrainingConfig,
 │   │                                   # OutputConfig, ModelConfig, LoraAdapterConfig, TimeEmbeddingConfig
-│   ├── utils.py                        # build_scalers(), apply_peft_lora(), load_pretrained_weights(),
-│   │                                   # UploadBestCheckpointToS3, create_logger, S3 client helpers
+│   ├── utils.py                        # build_scalers(), apply_peft_lora(), discover_head_modules(),
+│   │                                   # load_pretrained_weights(), UploadBestCheckpointToS3,
+│   │                                   # create_logger, S3 client helpers
 │   ├── benchmark_s3.py                 # Benchmark S3 download throughput to tune transfer settings
 │   ├── assets.py                       # ensure_assets() — fetch scalers + weights from HuggingFace
 │   ├── datasets/
@@ -152,7 +153,7 @@ Each notebook is self-contained and builds directly on the previous one. They ar
 |---|---|
 | `0_dataset_dataloader_template.ipynb` | How SDO data is indexed, loaded, and normalized; what a sample dict looks like |
 | `1_baseline_template.ipynb` | Training a simple linear model end-to-end; defines the metric and evaluation baseline |
-| `2_finetune_template_1D.ipynb` | Loading Surya weights, applying LoRA, and fine-tuning interactively |
+| `2_finetune_template_1D.ipynb` | Loading Surya weights, applying LoRA to the backbone while the head trains, and fine-tuning interactively |
 
 ### 3. Run the production training script
 
@@ -244,4 +245,10 @@ its config or dataset-wiring code. Your app subclasses `DataConfig` and calls
 
 **Notebooks and script are parallel, not redundant.** The notebooks are the learning path — they expose internals and make it easy to inspect intermediate results. The script is the production path — it adds DDP, robust checkpointing, and WandB integration. Both call the same `load_config()` on the same YAML, so there is no notebook-versus-script divergence to debug.
 
-**Three fine-tuning regimes, one switch.** By default, PEFT LoRA adapters are added to all attention and feed-forward layers (rank 8, alpha 8, dropout 0.1), leaving the 366M backbone effectively frozen while training ~1M parameters. Setting `use_lora: false` with `freeze_backbone: true` gives a linear probe; both false gives full fine-tuning. The training script prints the trainable/total parameter count so you can confirm which one you got.
+**Three fine-tuning regimes, one switch.** By default, PEFT LoRA adapters (rank 8, alpha 8, dropout 0.1) are added to the feed-forward layers `fc1`/`fc2` in all ten blocks and to the fused attention projection `attn.qkv` and output projection `attn.proj` in the eight attention blocks. Alongside them, **the whole fine-tuning head trains too**, giving 3,157,761 trainable parameters — 1,515,520 of adapters plus 1,642,241 of head — against an otherwise frozen 366M backbone. Setting `use_lora: false` with `freeze_backbone: true` gives a linear probe (head only, 1,642,241); both false gives full fine-tuning. The training script prints the trainable/total parameter count, the adapted module list, and the trainable head modules, so you can confirm which one you got.
+
+Three parts of the backbone are deliberately **never** adapted: the spectral blocks' `complex_weight`, the attention blocks' `to_dynamic_projection`, and the patch embedding.
+
+> **Note on `attn.qkv`.** Surya fuses the query, key and value projections into one `nn.Linear(1280, 3840)`, so a single adapter covers all three. The update is ΔW = B·A with B of shape 3840×8 and A of shape 8×1280: q, k and v **share A**, so they respond to the same 8 input directions, while each gets its own 1280×8 slice of B. Their combined rank is at most 8. This is not equivalent to three separate rank-8 adapters.
+
+> **⚠️ Results from before this was fixed are invalid.** Earlier `use_lora: true` runs passed no `modules_to_save` to PEFT, so the head was frozen at its random initialisation — with `cls_token` stuck at zeros — and the adapters were fitted to a random readout. Loss still decreased, so the training curves looked normal. The same runs also targeted layer names (`q_proj`/`k_proj`/`v_proj`/`out_proj`) that do not exist in this backbone, so attention was never adapted at all. Re-run any LoRA experiment, including any comparison between regimes.

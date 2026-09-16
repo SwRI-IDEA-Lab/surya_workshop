@@ -125,26 +125,32 @@ model:
   init_weights: false
   checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   ensemble: null
-  nglo: 1
   time_embedding:
     type: linear        # Options: linear | fourier | perceiver
     n_queries: null     # Required for perceiver; unused otherwise
-    time_dim: 1         # Number of input timesteps (must match time_delta_input_minutes length)
+    time_dim: 1         # Number of input timesteps (must be <= time_delta_input_minutes length)
 
   # -- Fine-tuning head --
+  # Head layers live on the model as head_* attributes; see ADAPTING.md before adding one.
   pooling: class_token  # Options: class_token | global_average | global_max | attention | transformer
   penultimate_linear_layer: true
   dropout: 0.2
   freeze_backbone: false
 
   # -- LoRA adapters --
+  # Trainable under use_lora: true = these adapters + every head_* module.
+  # The head is discovered automatically from the head_ naming convention.
   use_lora: true
   lora_config:
     r: 8
     lora_alpha: 8
     lora_dropout: 0.1
     bias: none
-    target_modules: [q_proj, v_proj, k_proj, out_proj, fc1, fc2]
+    # fc1/fc2 in all 10 blocks; attn.qkv/attn.proj in the 8 attention blocks.
+    # Dotted names are required: a bare "proj" would also match the Conv2d
+    # patch-embedding tokeniser. Never adapted: the spectral complex_weight,
+    # attn.to_dynamic_projection, and the patch embedding.
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
 
 
 # -----------------------------------------------------------------------------

@@ -43,7 +43,7 @@ And what it *imports* rather than owning:
 | `datasets/helio.py` | `HelioNetCDFDataset` — NetCDF loading, local + S3, normalization, frame sampling |
 | `datasets/builders.py` | `build_helio_dataloaders()` — maps your config onto ~20 dataset arguments |
 | `models/finetune_models.py` | `HelioSpectformer1D` / `HelioSpectformer2D` — backbone plus a configurable head |
-| `utils.py` | `build_scalers()`, `apply_peft_lora()`, `load_pretrained_weights()`, S3 checkpoint upload |
+| `utils.py` | `build_scalers()`, `apply_peft_lora()`, `discover_head_modules()`, `load_pretrained_weights()`, S3 checkpoint upload |
 
 ---
 
@@ -211,22 +211,63 @@ model:
   lora_config:
     r: 8
     lora_alpha: 8
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
     ...
 ```
 
 `use_lora` and `freeze_backbone` together select the fine-tuning regime:
 
-| `use_lora` | `freeze_backbone` | Regime |
-|---|---|---|
-| `true` | — | LoRA adapters on attention + FFN (default; small trainable count) |
-| `false` | `true` | Linear probe — only the head trains |
-| `false` | `false` | Full fine-tuning of all 366M parameters |
+| `use_lora` | `freeze_backbone` | Regime | Trainable |
+|---|---|---|---|
+| `true` | ignored | LoRA adapters on FFN + attention, **plus the whole head** (default) | 3,157,761 |
+| `false` | `true` | Linear probe — only the head trains | 1,642,241 |
+| `false` | `false` | Full fine-tuning of all 366M parameters | ~366M |
 
-The training script prints the trainable/total parameter count so you can confirm which
-regime you actually got.
+`freeze_backbone` has no effect when `use_lora: true`: PEFT freezes every parameter and
+then re-enables the adapters and the head regardless.
+
+Adapters go on `fc1`/`fc2` in all ten blocks and on `attn.qkv`/`attn.proj` in the eight
+attention blocks. The spectral `complex_weight`, `attn.to_dynamic_projection`, and the
+patch embedding are never adapted. Because Surya fuses q/k/v into a single
+`nn.Linear(1280, 3840)`, one adapter covers all three: they share the `8×1280` matrix `A`
+and each takes its own `1280×8` slice of `B`, so their combined rank is at most 8 — not
+three independent rank-8 adapters.
+
+The training script prints the trainable/total parameter count, the list of adapted
+modules, and the trainable head modules, so you can confirm which regime you actually got.
+
+> **⚠️ LoRA results from before this was fixed are invalid.** Earlier runs passed no
+> `modules_to_save` to PEFT, so the head stayed frozen at its random initialisation and the
+> adapters were fitted to a random readout; the loss still went down. Those runs also
+> targeted `q_proj`/`k_proj`/`v_proj`/`out_proj`, which do not exist in this backbone, so
+> attention was never adapted. Re-run any LoRA experiment, including regime comparisons.
+> Fine-tuned checkpoints from before the fix can no longer be loaded, because the head
+> attributes were renamed (`linear` → `head_linear`, and so on). Pretrained Surya weights
+> are unaffected — that checkpoint contains only backbone keys.
+
+### Adding your own head layers: the `head_` rule
 
 If your task needs a custom head (e.g. multi-head output, auxiliary losses), create a new
 class in `models/` following the `RegressionFlareModel` pattern in `simple_baseline.py`.
+
+**Any trainable head component must be a direct attribute of the top-level model whose
+name starts with `head_`** — `self.head_linear`, `self.head_unembed`, `self.head_cls_token`.
+The backbone stays at `self.backbone`. `apply_peft_lora()` discovers everything with that
+prefix and tells PEFT to keep it trainable; a head layer without the prefix is silently
+frozen, which is exactly the bug described above. The rule is enforced at startup, and the
+error names the attribute to rename, so you will not discover this from a loss curve.
+
+Two consequences worth knowing:
+
+- **Never use a bare `nn.Parameter` at the top level.** PEFT matches module *names*, so a
+  loose parameter cannot be kept trainable. Wrap it in a small module — see `ClassToken` in
+  `workshop_infrastructure/models/finetune_models.py` — and read it by **calling** the
+  module (`self.head_cls_token(batch_size)`). Attribute access on the PEFT wrapper can hand
+  back the frozen original. For the same reason, call head modules with **positional**
+  arguments: PEFT's wrapper requires at least one.
+- **Do not reuse a name that ends a backbone module's name.** PEFT matches with a bare
+  `endswith` and no dot boundary, so a head called `head_linear` would also capture a
+  backbone module named `my_head_linear`. This is checked at startup too.
 
 ---
 
@@ -239,7 +280,7 @@ Only two of its four functions have task-specific content:
 | Function | What it does | What to change |
 |---|---|---|
 | `build_datasets` | Calls `build_helio_dataloaders()` | Swap `FlareDSDataset` for your subclass and replace the task-specific kwargs below it |
-| `build_model` | Builds `HelioSpectformer1D`, loads weights, applies LoRA / freezing | Usually nothing — driven by `cfg.model` |
+| `build_model` | Builds `HelioSpectformer1D`, loads weights, applies LoRA / freezing | Usually nothing — driven by `cfg.model`. A custom head must follow the `head_` rule above |
 | `build_trainer` | Loggers, checkpointing, Lightning Trainer | Nothing |
 | `main` | Calls the above in order | Nothing |
 
