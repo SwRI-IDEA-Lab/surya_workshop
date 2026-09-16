@@ -225,12 +225,93 @@ def build_scalers(info) -> Dict:
     return ret_dict
 
 
+HEAD_PREFIX = "head_"
+
+
+def discover_head_modules(model: torch.nn.Module) -> list[str]:
+    """Find the fine-tuning head modules to keep trainable under LoRA.
+
+    Convention: every trainable component of a fine-tuning head is a **direct
+    child** of the top-level model whose attribute name starts with ``head_``
+    (e.g. ``head_linear``, ``head_unembed``, ``head_cls_token``).  The backbone
+    stays at ``backbone``.  Learners therefore never hand-maintain a list of
+    head layers -- adding ``self.head_foo = nn.Linear(...)`` is enough.
+
+    Only modules that own parameters are returned, so parameter-free layers
+    such as ``head_dropout`` are not needlessly duplicated by PEFT.
+
+    Raises:
+        ValueError: if the model violates the convention, with a message
+            naming the exact attribute to rename.
+    """
+    head_names = []
+    missing_prefix = []
+    for name, module in model.named_children():
+        has_params = any(True for _ in module.parameters())
+        if name.startswith(HEAD_PREFIX):
+            if has_params:
+                head_names.append(name)
+        elif name != "backbone" and has_params:
+            missing_prefix.append(name)
+
+    if missing_prefix:
+        raise ValueError(
+            "Fine-tuning head modules must be named with the "
+            f"{HEAD_PREFIX!r} prefix so LoRA can keep them trainable.\n"
+            f"Rename these top-level attributes: "
+            + ", ".join(f"self.{n} -> self.{HEAD_PREFIX}{n}" for n in missing_prefix)
+            + "\nWithout the prefix they are frozen during LoRA fine-tuning and "
+            "the model trains against a random readout."
+        )
+
+    # PEFT's modules_to_save cannot cover a bare nn.Parameter on the top-level
+    # model -- it would stay frozen.  Wrap it in a tiny module instead.
+    bare = [n for n, _ in model.named_parameters(recurse=False)]
+    if bare:
+        raise ValueError(
+            "Top-level bare parameters cannot be kept trainable by PEFT, which "
+            "matches module names only, so these would be silently frozen: "
+            + ", ".join(bare)
+            + "\nWrap each one in a small nn.Module (see ClassToken in "
+            "workshop_infrastructure/models/finetune_models.py) and name the "
+            f"attribute with the {HEAD_PREFIX!r} prefix."
+        )
+
+    # PEFT matches modules_to_save entries with a bare ``key.endswith(name)``
+    # -- no dot boundary -- so a head name that happens to be a suffix of any
+    # backbone module name would wrap that backbone module too.
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None:
+        collisions = [
+            (head, f"backbone.{qualified}")
+            for head in head_names
+            for qualified, _ in backbone.named_modules()
+            if qualified and f"backbone.{qualified}".endswith(head)
+        ]
+        if collisions:
+            raise ValueError(
+                "Head module names must not be a suffix of any backbone module "
+                "name, because PEFT would make the backbone module trainable "
+                "too:\n"
+                + "\n".join(f"  {h} collides with {q}" for h, q in collisions)
+                + "\nRename the head attribute to something more specific."
+            )
+
+    return head_names
+
+
 def apply_peft_lora(
     model: torch.nn.Module,
     lora_config: LoraAdapterConfig,
 ) -> torch.nn.Module:
     """
     Applies PEFT LoRA adapters to a model.
+
+    Adapters go on the modules named by ``lora_config.target_modules``.  Every
+    fine-tuning head module (see :func:`discover_head_modules`) is passed to
+    PEFT as ``modules_to_save``, so it stays **trainable** -- without this the
+    head is frozen at its random initialisation and LoRA fits adapters to a
+    random readout.
 
     Args:
         model: The model to apply LoRA to.
@@ -239,6 +320,8 @@ def apply_peft_lora(
     Returns:
         Model with PEFT LoRA adapters applied.
     """
+    modules_to_save = discover_head_modules(model)
+
     print(
         f"Applying PEFT LoRA: r={lora_config.r}, alpha={lora_config.lora_alpha}, "
         f"dropout={lora_config.lora_dropout}, modules={lora_config.target_modules}"
@@ -251,9 +334,34 @@ def apply_peft_lora(
         target_modules=lora_config.target_modules,
         lora_dropout=lora_config.lora_dropout,
         bias=lora_config.bias,
+        modules_to_save=modules_to_save,
     )
 
     model = get_peft_model(model, peft_config)
+
+    # Show exactly what is being trained, so a misconfigured run is visible
+    # in the log instead of only in the loss curve.
+    adapted = sorted(
+        {
+            name.split(".lora_A")[0].replace("base_model.model.", "")
+            for name, _ in model.named_parameters()
+            if ".lora_A" in name
+        }
+    )
+    print(f"[LoRA] Adapted modules ({len(adapted)}):")
+    for name in adapted:
+        print(f"[LoRA]   {name}")
+    print(f"[LoRA] Trainable head modules (modules_to_save): {modules_to_save}")
+
+    # Defensive: current PEFT excludes modules_to_save from adapter injection.
+    # If that ever changes, a head module would get both, so fail loudly.
+    head_adapted = [n for n in adapted if n.split(".")[0].startswith(HEAD_PREFIX)]
+    if head_adapted:
+        raise RuntimeError(
+            "PEFT applied LoRA adapters to fine-tuning head modules, which "
+            f"should be fully trainable instead: {head_adapted}. "
+            "Narrow lora_config.target_modules so it cannot match head layers."
+        )
 
     # Log the number of trainable parameters
     trainable_params = 0

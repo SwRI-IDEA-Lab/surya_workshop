@@ -228,3 +228,8 @@ wandb/
 *.gz
 *.7z
 *.rar
+
+# Analysis files
+*.json
+unified_report.md
+variance_accounting.txt

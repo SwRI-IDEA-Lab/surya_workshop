@@ -52,7 +52,7 @@ isort .
 mypy .
 ```
 
-`pytest` is installed in the environment, but no test suite exists yet — verify changes by running the training script with `max_samples` capped (see above).
+Run the test suite with `pytest tests/ -v` (currently `tests/test_lora_setup.py`, which is CPU-only and fast). For changes not covered by tests, verify by running the training script with `max_samples` capped (see above).
 
 ## Architecture
 
@@ -81,12 +81,28 @@ Dataset and DataLoader construction is **not** re-implemented per app: `build_he
 
 ### LoRA Fine-tuning
 
-PEFT LoRA is applied to attention and feed-forward layers (rank=8, alpha=8, dropout=0.1, target modules: q/k/v/out_proj, fc1/fc2). The `workshop_infrastructure/utils.py` `apply_peft_lora()` helper handles this.
+PEFT LoRA is applied (rank=8, alpha=8, dropout=0.1) by `apply_peft_lora()` in `workshop_infrastructure/utils.py`.
 
-Three regimes, both selected from the `model:` config section:
-- `use_lora: true` — LoRA adapters (default)
+**Adapted:** `fc1`/`fc2` in all 10 blocks, plus `attn.qkv` and `attn.proj` in the 8 attention blocks — `target_modules: [fc1, fc2, attn.qkv, attn.proj]`. The dotted forms are required: a bare `proj` would also match the Conv2d patch-embedding tokenizer at `embedding.patch_embed.proj`. **Never adapted:** the spectral blocks' `complex_weight`, `attn.to_dynamic_projection`, and the patch embedding.
+
+Surya fuses q/k/v into one `nn.Linear(1280, 3840)`, so one adapter covers all three: ΔW = B·A with B 3840×8 and A 8×1280. q, k and v **share A** and each owns a 1280×8 slice of B, for a combined rank of at most 8 — *not* three independent rank-8 adapters.
+
+PEFT only raises when *no* `target_modules` entry matches anything, so a misspelt name is silently ignored. Verify with the `[LoRA] Adapted modules` list the helper prints at startup.
+
+**The `head_` naming convention.** Every trainable component of a fine-tuning head must be a direct child of the top-level model whose attribute name starts with `head_` (`head_linear`, `head_unembed`, `head_cls_token`, …); the backbone stays at `backbone`. `apply_peft_lora()` discovers those modules and passes them to PEFT as `modules_to_save` so they stay trainable — without this the head is frozen at its random initialization and the adapters fit a random readout. There is no YAML override; the convention *is* the interface. `discover_head_modules()` enforces it at startup and raises an actionable error naming the attribute to rename.
+
+Two constraints follow from how PEFT works, both covered by that validation:
+- `modules_to_save` matches module **names**, so a bare `nn.Parameter` on the top-level model cannot be kept trainable. Wrap it in a module — see `ClassToken` in `finetune_models.py` — and read it by **calling** the module, never via attribute access, which under the PEFT wrapper can return the frozen original.
+- PEFT matches `modules_to_save` entries with a bare `key.endswith(name)` and **no dot boundary**, so a head name that is a suffix of any backbone module name would wrap that backbone module too.
+
+Three regimes, selected from the `model:` config section:
+- `use_lora: true` — LoRA adapters **plus all `head_*` modules** (default). `freeze_backbone` is a no-op here: PEFT freezes everything and then re-enables only adapters and head.
 - `use_lora: false, freeze_backbone: true` — linear probe, head only
 - `use_lora: false, freeze_backbone: false` — full fine-tuning
+
+Trainable counts for the template config: LoRA 3,157,761 (1,515,520 adapters + 1,642,241 head); probe 1,642,241; full 366M. `tests/test_lora_setup.py` pins all of this.
+
+`HelioSpectformer1D` derives the backbone's `nglo` argument from `pooling` internally (`1` for `class_token`, `0` otherwise) — it is not a config field. `ModelConfig`/`TrainingConfig` also validate several other cross-field invariants at config-load time (`img_size` vs `patch_size`, `spectral_blocks`/`checkpoint_layers` vs `depth`, `time_embedding.time_dim` vs `data.time_delta_input_minutes`, `training.deterministic` vs `model.learned_flow`, and `model.learned_flow` vs `time_embedding.type`) — see `ModelConfig.__post_init__` and `TrainingConfig.__post_init__` in `workshop_infrastructure/configs.py` for the current list, and add new ones there rather than leaving them as documentation-only footguns.
 
 ### Data Pipeline
 
@@ -116,7 +132,7 @@ Two properties matter when editing configs:
 - **Unknown keys raise.** A key not present on the target dataclass is an error naming the valid alternatives, never a silent no-op. Task-specific keys require a field on the app's `DataConfig` subclass.
 - **Paths are relative to the config file** and resolved at load time, so a checked-in config works from any working directory. `s3_cache_dir` is the exception — it expands `~`/`$VARS` but is never anchored to the repo.
 
-**Reproducibility.** `training.seed` and `training.deterministic` (`false` | `warn` | `true`, **default `false`** for throughput — determinism costs ~20% wall time) control it. Results are therefore NOT reproducible out of the box; `warn` is the setting to use when comparing runs. `3_finetune_template_1D.py` sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` **before importing torch** — this is required for deterministic cuBLAS and is inert if moved after the import, so do not "tidy" it into the other imports. The notebooks' first cell does the same. `build_helio_dataloaders()` passes an explicit `generator` and `worker_init_fn`; without them the shuffle order depends on ambient global RNG state. `deterministic: true` is incompatible with `model.learned_flow: true` (`F.grid_sample` has no deterministic CUDA backward).
+**Reproducibility.** `training.seed` and `training.deterministic` (`false` | `warn` | `true`, **default `false`** for throughput — determinism costs ~20% wall time) control it. Results are therefore NOT reproducible out of the box; `warn` is the setting to use when comparing runs. `3_finetune_template_1D.py` sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` **before importing torch** — this is required for deterministic cuBLAS and is inert if moved after the import, so do not "tidy" it into the other imports. The notebooks' first cell does the same. `build_helio_dataloaders()` passes an explicit `generator` and `worker_init_fn`; without them the shuffle order depends on ambient global RNG state. `deterministic: true` is incompatible with `model.learned_flow: true` (`F.grid_sample` has no deterministic CUDA backward); `TrainingConfig.__post_init__` rejects that combination at config-load time.
 
 CLI overrides are deliberately limited to what varies between runs of one config: `--max-epochs`, `--batch-size`, `--s3-cache-dir`, `--deterministic {false,warn,true}`, plus the `--no-wandb` and `--train_baseline` toggles.
 
@@ -133,7 +149,8 @@ DDP via PyTorch Lightning. Use `CUDA_VISIBLE_DEVICES` to select GPUs. Logging is
 | Dataset/DataLoader builders | `workshop_infrastructure/datasets/builders.py` |
 | Config dataclasses + `load_config()` | `workshop_infrastructure/configs.py` |
 | Asset download (scalers, weights) | `workshop_infrastructure/assets.py` |
-| LoRA application utility | `workshop_infrastructure/utils.py` |
+| LoRA application + `head_` discovery | `workshop_infrastructure/utils.py` |
+| LoRA setup tests | `tests/test_lora_setup.py` |
 | Downstream adapter model | `workshop_infrastructure/models/finetune_models.py` |
 | Fine-tuning entry point | `downstream_apps/template/3_finetune_template_1D.py` |
 | Model weights (HuggingFace) | `nasa-impact/surya` |

@@ -167,9 +167,14 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
         load_pretrained_weights(model, cfg.model.pretrained_path)
 
         # Three fine-tuning regimes, selected from the model: section of the YAML:
-        #   use_lora: true                        -> LoRA adapters (default)
+        #   use_lora: true                          -> LoRA adapters + the whole head
         #   use_lora: false, freeze_backbone: true  -> linear probe (head only)
         #   use_lora: false, freeze_backbone: false -> full fine-tuning
+        #
+        # freeze_backbone is ignored when use_lora is true: PEFT freezes every
+        # parameter, then re-enables the adapters and every head_* module.
+        # apply_peft_lora() finds the head by the head_ naming convention, so a
+        # custom head layer must carry that prefix or it is silently frozen.
         if cfg.model.freeze_backbone:
             for name, param in model.named_parameters():
                 if name.startswith("backbone."):

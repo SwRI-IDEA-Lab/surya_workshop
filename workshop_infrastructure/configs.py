@@ -67,11 +67,23 @@ class LoraAdapterConfig:
 
     Passed to apply_peft_lora(); mirrors the fields of peft.LoraConfig.
     Named LoraAdapterConfig to avoid confusion with peft.LoraConfig.
+
+    The default target_modules match the Surya backbone's actual layer names:
+    the feed-forward layers (fc1/fc2) in all blocks, plus the fused attention
+    projection (attn.qkv) and output projection (attn.proj) in the attention
+    blocks.  The dotted forms are deliberate -- a bare "proj" would also match
+    the Conv2d patch-embedding tokeniser at embedding.patch_embed.proj.
+
+    PEFT only errors when *no* entry matches anything, so a misspelt name is
+    silently ignored; keep this list in sync with the backbone.
+
+    There is no modules_to_save field: apply_peft_lora() discovers the
+    fine-tuning head automatically from the ``head_`` naming convention.
     """
     r: int = 8
     lora_alpha: int = 8
     target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
+        default_factory=lambda: ["fc1", "fc2", "attn.qkv", "attn.proj"]
     )
     lora_dropout: float = 0.1
     bias: str = "none"
@@ -102,7 +114,6 @@ class ModelConfig:
     init_weights: bool = False
     checkpoint_layers: List[int] = field(default_factory=lambda: list(range(10)))
     ensemble: Optional[int] = None
-    nglo: int = 1
     time_embedding: TimeEmbeddingConfig = field(default_factory=TimeEmbeddingConfig)
 
     # --- Fine-tuning head ---
@@ -120,6 +131,34 @@ class ModelConfig:
     # Path to the pretrained Surya backbone weights. Passed to load_pretrained_weights().
     # Kept on ModelConfig (not TrainingConfig) because it describes the model, not the run.
     pretrained_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.img_size % self.patch_size != 0:
+            raise ValueError(
+                f"model.img_size ({self.img_size}) must be divisible by model.patch_size "
+                f"({self.patch_size}); patch embedding silently crops the remainder otherwise."
+            )
+        if not 0 <= self.spectral_blocks <= self.depth:
+            raise ValueError(
+                f"model.spectral_blocks ({self.spectral_blocks}) must be between 0 and "
+                f"model.depth ({self.depth}) inclusive: spectral_blocks is the cutoff within "
+                f"the depth blocks, not an additional count."
+            )
+        bad_layers = [i for i in self.checkpoint_layers if not 0 <= i < self.depth]
+        if bad_layers:
+            raise ValueError(
+                f"model.checkpoint_layers contains out-of-range index(es) {bad_layers}; "
+                f"each entry must satisfy 0 <= i < model.depth ({self.depth}). Out-of-range "
+                "entries are silently ignored at runtime rather than erroring, so they are "
+                "rejected here instead."
+            )
+        if self.learned_flow and self.time_embedding.type != "linear":
+            raise ValueError(
+                f"model.learned_flow is only supported with model.time_embedding.type "
+                f'"linear"; got type={self.time_embedding.type!r}. The vendored backbone\'s '
+                "\"linear\" embedding adjusts its channel count for the extra learned-flow "
+                "frame, but the other embedding types do not."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +271,20 @@ class TrainingConfig:
             raise ValueError(
                 f"training.seed must be an integer, got {self.seed!r} "
                 f"({type(self.seed).__name__}). Write it unquoted in the YAML, e.g. seed: 42."
+            )
+        if self.deterministic is True and self.model.learned_flow:
+            raise ValueError(
+                "training.deterministic: true is incompatible with model.learned_flow: true "
+                "(F.grid_sample has no deterministic CUDA backward). Use "
+                'training.deterministic: "warn" instead, or set model.learned_flow: false.'
+            )
+        time_dim = self.model.time_embedding.time_dim
+        n_available = len(self.data.time_delta_input_minutes)
+        if time_dim > n_available:
+            raise ValueError(
+                f"model.time_embedding.time_dim ({time_dim}) must be <= "
+                f"len(data.time_delta_input_minutes) ({n_available}): the dataset samples "
+                "time_dim frames from that list and cannot sample more than it contains."
             )
 
 

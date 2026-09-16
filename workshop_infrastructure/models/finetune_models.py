@@ -16,6 +16,40 @@ from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDec
 _VALID_POOLINGS = {"global_average", "global_max", "attention", "transformer", "class_token"}
 
 
+class ClassToken(nn.Module):
+    """A learnable CLS token, wrapped in a Module so PEFT can keep it trainable.
+
+    PEFT's ``modules_to_save`` accepts module *names* only, so a bare
+    ``nn.Parameter`` on the top-level model would stay frozen in the LoRA
+    regime.  Wrapping the token in a module lets the ``head_`` convention in
+    ``apply_peft_lora()`` cover it like any other head component.
+
+    Always read the token by **calling** the module (``self.head_cls_token(B)``).
+    Under PEFT the module is replaced by a wrapper that dispatches ``forward``
+    to the trainable copy; reaching for the ``.token`` attribute instead
+    delegates in version-dependent ways and can silently hand back the frozen
+    original.
+    """
+
+    def __init__(self, embed_dim: int, init: str = "zeros"):
+        super().__init__()
+        if init == "zeros":
+            data = torch.zeros(1, 1, embed_dim)
+        elif init == "randn":
+            data = torch.randn(1, 1, embed_dim)
+        else:
+            raise ValueError(f"init must be 'zeros' or 'randn', got {init!r}")
+        self.token = nn.Parameter(data)
+
+    def forward(self, batch_size: int = 1) -> torch.Tensor:
+        """Return the token expanded to ``batch_size``, shape (batch_size, 1, embed_dim).
+
+        The argument is required: PEFT's wrapper forwards at least one
+        positional argument, so a zero-argument ``forward()`` would raise.
+        """
+        return self.token.expand(batch_size, -1, -1)
+
+
 class HelioSpectformer1D(nn.Module):
     """
     Fine-tuning wrapper for 1D outputs (e.g. regression or classification).
@@ -23,6 +57,11 @@ class HelioSpectformer1D(nn.Module):
     Holds a frozen-or-trainable HelioSpectFormer backbone and adds a pooling
     layer plus a linear head on top. Only the head-specific parameters are
     defined here; all backbone parameters are forwarded to HelioSpectFormer.
+
+    Every trainable head component is a direct child whose name starts with
+    ``head_``.  ``apply_peft_lora()`` discovers them by that prefix and keeps
+    them trainable via ``modules_to_save``; see its docstring before adding a
+    new head layer.
     """
 
     def __init__(
@@ -46,7 +85,6 @@ class HelioSpectformer1D(nn.Module):
         checkpoint_layers: list[int] | None = None,
         rpe: bool = False,
         ensemble: int | None = None,
-        nglo: int = 0,
         dtype: torch.dtype = torch.bfloat16,
         # --- Fine-tuning head ---
         dropout: float = 0.1,
@@ -60,6 +98,12 @@ class HelioSpectformer1D(nn.Module):
 
         if pooling not in _VALID_POOLINGS:
             raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
+
+        # Only "class_token" pooling prepends a global token to the backbone input (via
+        # forward_with_cls_token, below); every other pooling must run with nglo=0 or the
+        # long-short attention reshape fails. "transformer" pooling also uses a class token,
+        # but concatenates it after the backbone, so it is not "class_token" here.
+        nglo = 1 if pooling == "class_token" else 0
 
         self.backbone = HelioSpectFormer(
             img_size=img_size,
@@ -87,40 +131,43 @@ class HelioSpectformer1D(nn.Module):
 
         self.pooling = pooling
         self.embed_dim = embed_dim
-        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
+        self.head_dropout = nn.Dropout(dropout) if dropout > 0 else None
         self.penultimate_linear_layer_enabled = penultimate_linear_layer
 
         if pooling == "attention":
-            self.attn_pool = nn.MultiheadAttention(embed_dim, num_penultimate_heads, dropout=dropout)
+            self.head_attn_pool = nn.MultiheadAttention(
+                embed_dim, num_penultimate_heads, dropout=dropout
+            )
 
         elif pooling == "transformer":
-            self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+            self.head_cls_token = ClassToken(embed_dim, init="randn")
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_penultimate_heads,
                 dim_feedforward=embed_dim,
                 dropout=dropout,
             )
-            self.downstream_transformer = nn.TransformerEncoder(
+            self.head_transformer = nn.TransformerEncoder(
                 encoder_layer, num_layers=num_penultimate_transformer_layers
             )
 
         elif pooling == "class_token":
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.head_cls_token = ClassToken(embed_dim, init="zeros")
 
         if penultimate_linear_layer:
-            self.linear = nn.Linear(embed_dim, embed_dim)
+            self.head_linear = nn.Linear(embed_dim, embed_dim)
 
-        self.unembed = nn.Linear(embed_dim, num_outputs)
+        self.head_unembed = nn.Linear(embed_dim, num_outputs)
 
     def forward(self, batch):
         if self.pooling == "class_token":
-            tokens = self.backbone.forward_with_cls_token(batch, self.cls_token)
+            # (1, 1, D) -- forward_with_cls_token expands it over the batch itself.
+            tokens = self.backbone.forward_with_cls_token(batch, self.head_cls_token(1))
         else:
             tokens = self.backbone.forward(batch)
 
         if self.penultimate_linear_layer_enabled:
-            tokens = self.linear(tokens)
+            tokens = self.head_linear(tokens)
 
         if self.pooling == "global_average":
             agg_tokens = torch.mean(tokens, dim=1)
@@ -128,20 +175,22 @@ class HelioSpectformer1D(nn.Module):
             agg_tokens, _ = torch.max(tokens, dim=1)
         elif self.pooling == "attention":
             tokens = tokens.permute(1, 0, 2)
-            tokens, _ = self.attn_pool(query=tokens, key=tokens, value=tokens)
+            # Positional, not keyword: under PEFT this module is replaced by a
+            # wrapper whose forward requires at least one positional argument.
+            tokens, _ = self.head_attn_pool(tokens, tokens, tokens)
             agg_tokens = tokens.sum(dim=0)
         elif self.pooling == "transformer":
             B = tokens.size(0)
-            tokens = torch.cat((self.cls_token.expand(B, -1, -1), tokens), dim=1)
-            tokens = self.downstream_transformer(tokens.permute(1, 0, 2))
+            tokens = torch.cat((self.head_cls_token(B), tokens), dim=1)
+            tokens = self.head_transformer(tokens.permute(1, 0, 2))
             agg_tokens = tokens[0, :, :]
         elif self.pooling == "class_token":
             agg_tokens = tokens.squeeze(dim=1)
 
-        if self.dropout_layer is not None:
-            agg_tokens = self.dropout_layer(agg_tokens)
+        if self.head_dropout is not None:
+            agg_tokens = self.head_dropout(agg_tokens)
 
-        return self.unembed(agg_tokens).squeeze(dim=1)
+        return self.head_unembed(agg_tokens).squeeze(dim=1)
 
     @classmethod
     def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer1D":
@@ -168,7 +217,6 @@ class HelioSpectformer1D(nn.Module):
             checkpoint_layers=cfg.checkpoint_layers,
             rpe=cfg.rpe,
             ensemble=cfg.ensemble,
-            nglo=cfg.nglo,
             dropout=cfg.dropout,
             pooling=cfg.pooling,
             penultimate_linear_layer=cfg.penultimate_linear_layer,
@@ -182,6 +230,9 @@ class HelioSpectformer2D(nn.Module):
     Fine-tuning wrapper for 2D outputs (e.g. image reconstruction or forecasting).
 
     Holds a HelioSpectFormer backbone and adds a spatial decoder head on top.
+
+    As with HelioSpectformer1D, every trainable head component is a direct
+    child whose name starts with ``head_`` -- see ``apply_peft_lora()``.
     """
 
     def __init__(
@@ -234,13 +285,13 @@ class HelioSpectformer2D(nn.Module):
         )
 
         if ft_unembedding_type == "linear":
-            self.unembed = LinearDecoder(
+            self.head_unembed = LinearDecoder(
                 patch_size=patch_size,
                 out_chans=ft_out_chans,
                 embed_dim=embed_dim,
             )
         elif ft_unembedding_type == "perceiver":
-            self.unembed = PerceiverDecoder(
+            self.head_unembed = PerceiverDecoder(
                 embed_dim=embed_dim,
                 patch_size=patch_size,
                 out_chans=ft_out_chans,
@@ -252,7 +303,7 @@ class HelioSpectformer2D(nn.Module):
 
     def forward(self, batch):
         tokens = self.backbone.forward(batch)
-        return self.unembed(tokens)  # (B, L, D) -> (B, C, H, W)
+        return self.head_unembed(tokens)  # (B, L, D) -> (B, C, H, W)
 
     @classmethod
     def from_config(cls, cfg: "ModelConfig", **overrides) -> "HelioSpectformer2D":
