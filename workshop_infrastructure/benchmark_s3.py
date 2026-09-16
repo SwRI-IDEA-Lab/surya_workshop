@@ -22,12 +22,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-from workshop_infrastructure.utils import detect_ec2_region
+from workshop_infrastructure.utils import detect_ec2_region, make_s3_client, parse_s3_uri
 
 try:
-    import boto3
-    from botocore import UNSIGNED
-    from botocore.config import Config as BotoConfig
+    import boto3  # noqa: F401  # presence check only; clients come from make_s3_client
 except ImportError:
     print("ERROR: boto3 is required. Install with: pip install boto3")
     sys.exit(1)
@@ -98,30 +96,12 @@ class BenchmarkConfig:
 # ---------------------------------------------------------------------------
 
 def _make_client(anon: bool, region: str | None, pool_size: int = 32):
-    """Return a boto3 S3 client with the given signature and connection pool."""
-    retry_cfg = {"max_attempts": 3, "mode": "adaptive"}
-    if anon:
-        return boto3.client(
-            "s3",
-            region_name=region,
-            config=BotoConfig(
-                signature_version=UNSIGNED,
-                max_pool_connections=pool_size,
-                retries=retry_cfg,
-            ),
-        )
-    return boto3.client(
-        "s3",
-        region_name=region,
-        config=BotoConfig(max_pool_connections=pool_size, retries=retry_cfg),
-    )
+    """Return a boto3 S3 client configured the same way the dataset loader configures its own.
 
-
-def _parse_s3_uri(uri: str) -> tuple[str, str]:
-    if not uri.startswith("s3://"):
-        raise ValueError(f"Expected an s3:// URI, got: {uri!r}")
-    bucket, key = uri[5:].split("/", 1)
-    return bucket, key
+    Retries are capped low here (unlike the dataset, which retries hard): a retry storm
+    would silently skew the throughput numbers this script exists to measure.
+    """
+    return make_s3_client(anon=anon, region=region, pool_size=pool_size, max_attempts=3)
 
 
 def _probe_file_size(client, bucket: str, key: str) -> int:
@@ -523,7 +503,7 @@ def main() -> None:
         warmup=not args.no_warmup,
     )
 
-    bucket, key = _parse_s3_uri(cfg.s3_uri)
+    bucket, key = parse_s3_uri(cfg.s3_uri)
 
     n_cells = len(concurrencies) * len(part_sizes_mb)
     print(f"S3 download benchmark")

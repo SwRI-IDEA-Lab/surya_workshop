@@ -7,8 +7,9 @@ This module provides:
   masking, and transparent local/S3 file access.
 - ``RandomChannelMaskerTransform`` — callable that randomly zeros input channels to
   improve robustness to missing observations.
-- Signum-log transform functions (``transform``, ``fast_transform``, and their inverses)
-  used to normalize solar imagery before passing it to the model.
+- Signum-log transform functions (``transform``, ``fast_inverse_transform``,
+  ``inverse_transform_single_channel``) used to normalize solar imagery before passing
+  it to the model, and to undo that normalization for plotting or physical-space losses.
 
 When writing a downstream task, subclass ``HelioNetCDFDataset`` and override
 ``__getitem__`` to attach your task-specific labels to the sample dict returned by
@@ -19,7 +20,9 @@ import os
 import re
 import random
 import hashlib
+import warnings
 from datetime import datetime
+from uuid import uuid4
 import torch
 import numpy as np
 import skimage.measure
@@ -27,7 +30,14 @@ import xarray as xr
 import pandas as pd
 from logging import Logger
 from torch.utils.data import Dataset
-from workshop_infrastructure.utils import get_rank, create_logger, detect_ec2_region
+from workshop_infrastructure.configs import VALID_S3_MODES
+from workshop_infrastructure.utils import (
+    get_rank,
+    create_logger,
+    detect_ec2_region,
+    make_s3_client,
+    parse_s3_uri,
+)
 
 # Optional S3 support via fsspec/s3fs (read-through streaming)
 try:
@@ -37,22 +47,73 @@ except Exception:  # pragma: no cover
     fsspec = None
     s3fs = None
 
-# Optional S3 support via boto3 (recommended: faster whole-object downloads)
+# Optional S3 support via boto3 (recommended: faster whole-object downloads).
+# Client construction itself lives in workshop_infrastructure.utils.make_s3_client so
+# the dataset and the S3 benchmark stay in sync.
 try:
     import boto3
-    from botocore import UNSIGNED
-    from botocore.config import Config as BotoConfig
     from boto3.s3.transfer import TransferConfig
 except Exception:  # pragma: no cover
     boto3 = None
-    UNSIGNED = None
-    BotoConfig = None
     TransferConfig = None
 
 from numba import njit, prange
 
-
 import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compression filters
+
+
+# ---------------------------------------------------------------------------
+# S3 access modes — the mode list itself lives in workshop_infrastructure.configs
+# (VALID_S3_MODES) so the config layer can reject a bad value before any dataset
+# is constructed.
+# ---------------------------------------------------------------------------
+
+def _resolve_s3_mode(s3_mode, s3_download_to_temp, s3_use_simplecache) -> str:
+    """Resolve the S3 access mode, honouring the deprecated boolean flags.
+
+    ``s3_download_to_temp`` and ``s3_use_simplecache`` are the legacy API. They were
+    error-prone: ``s3_download_to_temp`` defaulted to True and short-circuited the
+    dispatch, so setting ``s3_use_simplecache=True`` silently did nothing. They are
+    still accepted (with a DeprecationWarning) so existing callers keep working.
+    """
+    legacy_used = s3_download_to_temp is not None or s3_use_simplecache is not None
+
+    if legacy_used and s3_mode is not None:
+        raise ValueError(
+            "Pass either s3_mode or the deprecated s3_download_to_temp/s3_use_simplecache "
+            f"flags, not both (got s3_mode={s3_mode!r}, s3_download_to_temp="
+            f"{s3_download_to_temp!r}, s3_use_simplecache={s3_use_simplecache!r})."
+        )
+
+    if legacy_used:
+        # Reproduce the old precedence exactly: download_to_temp defaulted to True
+        # and won over simplecache.
+        download = True if s3_download_to_temp is None else bool(s3_download_to_temp)
+        if download:
+            resolved = "download"
+        elif s3_use_simplecache:
+            resolved = "simplecache"
+        else:
+            resolved = "stream"
+        warnings.warn(
+            "s3_download_to_temp/s3_use_simplecache are deprecated; use "
+            f"s3_mode={resolved!r} instead. Valid modes: {', '.join(VALID_S3_MODES)}.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return resolved
+
+    if s3_mode is None:
+        return "download"
+
+    if s3_mode not in VALID_S3_MODES:
+        raise ValueError(
+            f"Unknown s3_mode {s3_mode!r}. Valid modes are: {', '.join(VALID_S3_MODES)}.\n"
+            "  download    — whole-object download to s3_cache_dir, then open locally (recommended)\n"
+            "  simplecache — fsspec read-through cache into s3_cache_dir\n"
+            "  stream      — direct s3fs handle, no local cache (unreliable for NetCDF/HDF5)"
+        )
+    return s3_mode
 
 
 # ---------------------------------------------------------------------------
@@ -72,44 +133,51 @@ import hdf5plugin  # noqa: F401  # side-effect import: registers HDF5 compressio
 # μ, σ, ε, and s are stored in the per-channel scaler objects built by
 # ``workshop_infrastructure/utils.py:build_scalers()``.
 #
-# Two implementations are provided:
-#   fast_transform / fast_inverse_transform — Numba JIT, parallel across channels.
-#     Faster for large arrays but may hang on some GPU clusters with dataloader workers.
-#   transform / inverse_transform_single_channel — pure NumPy, always safe.
 # ---------------------------------------------------------------------------
-
-@njit(parallel=True)
-def fast_transform(data, means, stds, sl_scale_factors, epsilons):
-    """Signum-log normalization, Numba parallel implementation.
-
-    See the module-level comment for the mathematical definition.
-    Must live outside class definitions (Numba requirement).
-    May hang on some GPU clusters with dataloader workers — use ``transform`` in that case.
-
-    Args:
-        data: NumPy array of shape (C, H, W).
-        means: Per-channel means, shape (C,).
-        stds: Per-channel standard deviations, shape (C,).
-        sl_scale_factors: Per-channel amplitude scaling factors, shape (C,).
-        epsilons: Per-channel small constants that prevent division by zero, shape (C,).
-
-    Returns:
-        Normalized array of shape (C, H, W), dtype float32.
-    """
-    C, H, W = data.shape
-    out = np.empty((C, H, W), dtype=np.float32)
-    for c in prange(C):
-        mean = means[c]
-        std = stds[c]
-        eps = epsilons[c]
-        sl_scale_factor = sl_scale_factors[c]
-        for i in range(H):
-            for j in range(W):
-                val = data[c, i, j] * sl_scale_factor
-                val = np.log1p(val) if val >= 0 else -np.log1p(-val)
-                out[c, i, j] = (val - mean) / (std + eps)
-    return out
-
+# THE THREE SPACES  (read this before writing any "inverse transform" code)
+# ---------------------------------------------------------------------------
+#
+# The forward pipeline has two stages, so there are three meaningful spaces — and
+# therefore two different things "undoing the transform" can mean. Conflating them is
+# the easiest way to feed a model silently wrong numbers.
+#
+#   normalized     What the dataset returns and the model sees. Roughly zero-mean,
+#                  unit-variance per channel.
+#      |
+#      |  StandardScaler.inverse_transform()      <- undoes the z-score ONLY
+#      v
+#   signum-log     sign(x·s)·log1p(|x·s|). Still log-compressed, but channels are back
+#                  on their own scales. This is the linear baseline's feature space
+#                  (see downstream_apps/template/models/simple_baseline.py:
+#                  destandardize_channels).
+#      |
+#      |  StandardScaler.inverse_signum_log_transform()
+#      v
+#   physical       Raw instrument units — DN for AIA, Gauss for HMI, m/s for Doppler.
+#                  What you want for plotting with real colour limits, or for a loss
+#                  expressed in physical units.
+#
+# ``HelioNetCDFDataset.inverse_transform_data()`` goes from normalized all the way to
+# physical in one step (both stages), which is why notebook 0 can plot its output with
+# real DN percentiles and ±1000 G magnetogram limits.
+#
+# So: ``scaler.inverse_transform()`` is NOT the inverse of the dataset's ``transform()``.
+# It is the inverse of only the second stage. Name variables for the space they hold.
+#
+# ---------------------------------------------------------------------------
+#
+# The forward and inverse directions deliberately use different implementations:
+#
+#   forward  (``transform``, used by ``transform_data``) — pure NumPy. It runs inside
+#     DataLoader workers on every sample, and the Numba JIT has been observed to hang
+#     there on some GPU clusters. Correctness and reliability win over speed.
+#   inverse  (``fast_inverse_transform``, used by ``inverse_transform_data``) — Numba
+#     JIT, parallel across channels. It runs in the main process (plotting, physical-space
+#     metrics), never in a worker, so the hang risk does not apply and the speedup is free.
+#
+# ``inverse_transform_single_channel`` is the pure-NumPy inverse for one channel, used
+# where only a single channel needs undoing.
+# ---------------------------------------------------------------------------
 
 @njit(parallel=True)
 def fast_inverse_transform(data, means, stds, sl_scale_factors, epsilons):
@@ -292,15 +360,30 @@ class HelioNetCDFDataset(Dataset):
         random_vert_flip: If True, randomly flip images vertically during training.
         sdo_data_root_path: Optional root directory prepended to relative local paths.
         s3_storage_options: Options forwarded to fsspec/s3fs (e.g., ``{'anon': True}`` for public buckets).
-        s3_use_simplecache: If True, use fsspec simplecache for read-through S3 caching.
-        s3_cache_dir: **Required when reading from S3.** Local directory where S3 files are cached.
-            There is no default — you must set this explicitly. Each full-resolution SDO NetCDF file
-            is approximately 1 GB, so make sure the target filesystem has sufficient space
-            (budget ~1 GB × number of unique timesteps in your dataset).
+        s3_mode: How S3 objects are read. One of:
+
+            - ``"download"`` (default) — fetch the whole object into ``s3_cache_dir`` with boto3
+              (parallel multipart), then open it locally. Recommended for NetCDF/HDF5, which
+              need random seeks that streaming cannot always serve.
+            - ``"simplecache"`` — fsspec read-through cache into ``s3_cache_dir``.
+            - ``"stream"`` — direct s3fs handle; nothing is written to disk and ``s3_cache_dir``
+              is not required. Much slower for NetCDF/HDF5 (measured ~9x slower than
+              ``"download"`` on a full SDO frame) because random access turns into many
+              small ranged GETs. Use only when disk space is the binding constraint.
+
+        s3_cache_dir: **Required unless ``s3_mode="stream"``.** Local directory where S3 files are
+            cached. There is no default — you must set this explicitly. Each full-resolution SDO
+            NetCDF file is approximately 1 GB, so make sure the target filesystem has sufficient
+            space (budget ~1 GB × number of unique timesteps in your dataset). Validated at
+            construction time: if the index contains ``s3://`` paths and this is unset, the
+            constructor raises rather than failing later inside a DataLoader worker.
         s3fs_kwargs: Additional kwargs passed to ``s3fs.S3FileSystem``.
-        s3_download_to_temp: If True (recommended for NetCDF/HDF5), download each S3 object to a
-            local file before opening. Avoids seekability issues with streaming reads.
-        s3_temp_dir: Directory for downloaded S3 files. Defaults to ``s3_cache_dir``.
+        s3_download_to_temp: **Deprecated** — use ``s3_mode`` instead. Kept for backward
+            compatibility; passing it emits a ``DeprecationWarning``.
+        s3_use_simplecache: **Deprecated** — use ``s3_mode`` instead. Kept for backward
+            compatibility; passing it emits a ``DeprecationWarning``.
+        s3_temp_dir: Internal override for the download directory. Defaults to ``s3_cache_dir``,
+            which is the single public knob.
         s3_boto3_max_concurrency: Number of parallel threads for boto3 multipart downloads.
         s3_boto3_part_size_mb: Part size in MB for boto3 multipart downloads.
         load_forecast_frames: If True (default), load both input and forecast frames and include
@@ -328,11 +411,13 @@ class HelioNetCDFDataset(Dataset):
         sdo_data_root_path: str | None = None,
         # S3 options (only used when index contains s3:// URIs)
         s3_storage_options: dict | None = None,
-        s3_use_simplecache: bool = False,
+        s3_mode: str | None = None,
         s3_cache_dir: str | None = None,
         s3fs_kwargs: dict | None = None,
-        s3_download_to_temp: bool = True,
         s3_temp_dir: str | None = None,
+        # Deprecated aliases for s3_mode — see _resolve_s3_mode().
+        s3_use_simplecache: bool | None = None,
+        s3_download_to_temp: bool | None = None,
         s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
         load_forecast_frames: bool = True,
@@ -349,21 +434,38 @@ class HelioNetCDFDataset(Dataset):
         self.sdo_data_root_path = sdo_data_root_path
 
         self.s3_storage_options = s3_storage_options or {}
-        self.s3_use_simplecache = s3_use_simplecache
+        self.s3_mode = _resolve_s3_mode(s3_mode, s3_download_to_temp, s3_use_simplecache)
         self.s3_cache_dir = s3_cache_dir
         self.s3fs_kwargs = s3fs_kwargs or {}
-        self.s3_download_to_temp = s3_download_to_temp
         self.s3_temp_dir = s3_temp_dir if s3_temp_dir is not None else s3_cache_dir
-        # Note: s3_cache_dir is intentionally left as None here. Its presence is validated
-        # lazily in _load_s3_nc_data, so users with only local paths pay no cost.
+        # s3_cache_dir may legitimately be None for local-only indices (and for
+        # s3_mode="stream"). _validate_s3_cache_dir() checks it against the actual
+        # index right after the index is loaded, so misconfiguration surfaces at
+        # construction time rather than inside a DataLoader worker mid-training.
         self.s3_boto3_max_concurrency = s3_boto3_max_concurrency
         self.s3_boto3_part_size_mb = s3_boto3_part_size_mb
         self._s3fs = None  # lazily initialized per process
         self.load_forecast_frames = load_forecast_frames
 
-        self.channels = channels if channels is not None else [
-            "0094", "0131", "0171", "0193", "0211", "0304", "0335", "hmi"
-        ]
+        if scalers is None:
+            raise ValueError(
+                "scalers is required. Build it once with:\n"
+                "    from workshop_infrastructure.utils import build_scalers\n"
+                "    scalers = build_scalers(info=<path to assets/scalers.yaml>)\n"
+                "and pass it as scalers=... . (It has no usable default: the per-channel "
+                "mean/std/epsilon/sl_scale_factor are read during __init__.)"
+            )
+
+        if channels is None:
+            raise ValueError(
+                "channels is required. Pass the NetCDF variable names to load, e.g. the 13 "
+                "Surya channels:\n"
+                "    ['aia94', 'aia131', 'aia171', 'aia193', 'aia211', 'aia304', 'aia335',\n"
+                "     'aia1600', 'hmi_m', 'hmi_bx', 'hmi_by', 'hmi_bz', 'hmi_v']\n"
+                "The names must match the keys in your scalers.yaml."
+            )
+
+        self.channels = channels
         self.in_channels = len(self.channels)
 
         self.masker = RandomChannelMaskerTransform(
@@ -389,11 +491,27 @@ class HelioNetCDFDataset(Dataset):
         self.index.set_index("timestep", inplace=True)
         self.index.sort_index(inplace=True)
 
+        self._validate_s3_cache_dir(index_path)
+
         self.valid_indices = self._filter_valid_indices()
         self.adjusted_length = len(self.valid_indices)
 
         self.rank = get_rank()
         self.logger: Logger | None = None
+
+        # Every requested channel must have a scaler. Checking here turns what would
+        # otherwise be a bare `KeyError: 'aia1700'` from the comprehension below into a
+        # message naming the config key, the missing channels, and the valid ones.
+        missing = [ch for ch in self.channels if ch not in self.scalers]
+        if missing:
+            raise ValueError(
+                f"No scaler found for channel(s): {', '.join(missing)}.\n"
+                "Every entry in data.channels must have matching statistics in your "
+                "scalers file (data.scalers_path).\n"
+                f"Channels available in the scalers: {', '.join(sorted(self.scalers))}.\n"
+                "Either correct the channel name in the config or use a scalers file that "
+                "covers it."
+            )
 
         # Pre-compute normalization arrays once (avoids repeated dict lookups per sample).
         self._means = np.array([self.scalers[ch].mean for ch in self.channels])
@@ -552,8 +670,8 @@ class HelioNetCDFDataset(Dataset):
         Load a NetCDF file and return channel-stacked data as a NumPy array.
 
         Supports both local filesystem paths and S3 URIs (``s3://bucket/key``).
-        When loading from S3, files are downloaded to a local cache directory
-        before opening (controlled by ``s3_download_to_temp``).
+        How S3 objects are read is controlled by ``s3_mode`` (default: download the
+        whole object into ``s3_cache_dir``, then open it locally).
 
         Args:
             filepath: Local path or S3 URI.
@@ -578,17 +696,8 @@ class HelioNetCDFDataset(Dataset):
     def _load_s3_nc_data(self, s3_uri: str, channels: list[str]) -> np.ndarray:
         """Load a NetCDF file from S3 and return the requested channels as a NumPy array.
 
-        Two code paths depending on ``s3_download_to_temp`` (recommended default: True):
-
-        1. **Download-to-cache** (``s3_download_to_temp=True``): the full S3 object is
-           downloaded to ``s3_cache_dir`` before opening with xarray. Uses an atomic
-           write (partial → rename) so a crashed download never leaves a corrupt cache
-           file. Subsequent calls for the same URI are served from the local cache.
-           Requires boto3 (preferred, parallel multipart) or s3fs (fallback streaming).
-
-        2. **Streaming** (``s3_download_to_temp=False``): the file is opened in-place
-           via fsspec simplecache or direct s3fs. Avoid for NetCDF/HDF5 — these formats
-           require random seeks that streaming reads cannot always satisfy.
+        Dispatches on ``self.s3_mode`` — see ``VALID_S3_MODES`` in
+        ``workshop_infrastructure.configs`` for what each mode does and when to use it.
         """
         if boto3 is None and fsspec is None:
             raise ImportError(
@@ -596,38 +705,21 @@ class HelioNetCDFDataset(Dataset):
                 "Install via: pip install boto3  or  pip install s3fs fsspec"
             )
 
-        if self.s3_cache_dir is None:
-            raise ValueError(
-                "s3_cache_dir must be set when reading data from S3. "
-                "Each full-resolution SDO NetCDF file is approximately 1 GB, so choose a "
-                "filesystem with enough free space (budget ~1 GB × number of unique timesteps). "
-                "Example: s3_cache_dir='/scratch/my_project/helio_cache'"
-            )
+        if self.s3_mode == "download":
+            return self._read_s3_via_download(s3_uri, channels)
 
-        if self.s3_download_to_temp:
-            # Download whole object to a stable cache path, then open locally.
-            # Atomic write (partial → rename) avoids corrupted cache files on crash.
-            cache_path = self._s3_cache_path(s3_uri)
-            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-
-            if not os.path.exists(cache_path):
-                tmp_path = cache_path + ".partial"
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                self._download_s3_object(s3_uri, tmp_path)
-                os.replace(tmp_path, cache_path)
-
-            with xr.open_dataset(cache_path, engine="h5netcdf", chunks=None, cache=False) as ds:
-                return ds[channels].to_array().load().to_numpy()
-
-        # Streaming fallback (read-through via fsspec simplecache or direct s3fs)
+        # Both remaining modes go through fsspec/s3fs.
         if fsspec is None:
             raise ImportError(
-                "Streaming S3 reads require 'fsspec' and 's3fs'. "
-                "Install via: pip install s3fs fsspec"
+                "s3_mode='%s' requires 'fsspec' and 's3fs'. "
+                "Install via: pip install s3fs fsspec" % self.s3_mode
             )
 
-        if self.s3_use_simplecache:
+        if self.s3_mode == "simplecache":
+            # Same requirement as "download": fsspec needs somewhere to put the cache.
+            # Normally already caught by _validate_s3_cache_dir() at construction; this
+            # backstops an index whose s3:// rows were not visible then.
+            self._require_s3_cache_dir()
             s3_options = {**self.s3_storage_options, **self.s3fs_kwargs}
             opener = fsspec.open(
                 f"simplecache::{s3_uri}",
@@ -635,12 +727,42 @@ class HelioNetCDFDataset(Dataset):
                 cache_storage=self.s3_cache_dir,
                 s3=s3_options,
             )
-        else:
+        else:  # "stream"
             opener = self._get_s3fs().open(s3_uri, mode="rb")
 
         with opener as f:
             with xr.open_dataset(f, engine="h5netcdf", chunks=None, cache=False) as ds:
                 return ds[channels].to_array().load().to_numpy()
+
+    def _read_s3_via_download(self, s3_uri: str, channels: list[str]) -> np.ndarray:
+        """Download the whole object to the local cache, then open it with xarray.
+
+        The download is written to a process-unique ``.partial`` file and then renamed
+        into place. The uniqueness matters: with ``num_workers>0`` and/or several DDP
+        ranks sharing one ``s3_cache_dir``, two processes can pick the same timestep at
+        the same time. A shared temp name would let one process clobber or delete the
+        file another is still writing, and the rename would then publish a truncated
+        object into the cache permanently.
+        """
+        self._require_s3_cache_dir()
+
+        cache_path = self._s3_cache_path(s3_uri)
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+        if not os.path.exists(cache_path):
+            tmp_path = f"{cache_path}.{os.getpid()}.{uuid4().hex}.partial"
+            try:
+                self._download_s3_object(s3_uri, tmp_path)
+                # os.replace is atomic on POSIX: a concurrent writer either wins or
+                # loses the race, but the published file is always complete.
+                os.replace(tmp_path, cache_path)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+        with xr.open_dataset(cache_path, engine="h5netcdf", chunks=None, cache=False) as ds:
+            return ds[channels].to_array().load().to_numpy()
 
     # ------------------------------------------------------------------
     # S3 helpers
@@ -650,6 +772,63 @@ class HelioNetCDFDataset(Dataset):
         """Return True if ``path`` is an S3 URI (starts with ``s3://``)."""
         return isinstance(path, str) and path.startswith("s3://")
 
+    @staticmethod
+    def _suggested_cache_dir() -> str:
+        """Return a plausible cache directory for this machine, for use in error messages."""
+        for env_var in ("SCRATCH", "TMPDIR"):
+            root = os.environ.get(env_var)
+            if root:
+                return os.path.join(root, "helio_s3_cache")
+        return os.path.join(os.path.expanduser("~"), ".cache", "surya_workshop", "helio_s3_cache")
+
+    def _require_s3_cache_dir(self) -> None:
+        """Raise if a cache directory is needed but not configured."""
+        if self.s3_cache_dir is None:
+            raise ValueError(
+                f"s3_cache_dir must be set when s3_mode={self.s3_mode!r}.\n"
+                f"Suggested value for this machine: {self._suggested_cache_dir()}\n"
+                "Each full-resolution SDO NetCDF file is ~1 GB, so budget roughly "
+                "1 GB x (number of unique timesteps) of free space."
+            )
+
+    def _validate_s3_cache_dir(self, index_path: str) -> None:
+        """Fail at construction time if the index needs a cache dir that is not configured.
+
+        The index is already in memory in the main process, so this check is cheap and
+        exact. Without it the same error only fires on the first ``__getitem__`` inside a
+        spawned DataLoader worker — after asset downloads, model construction and Lightning
+        setup — surfacing as a worker-exit traceback minutes into a run.
+
+        ``s3_mode="stream"`` writes nothing to disk and is therefore exempt.
+        """
+        if self.s3_cache_dir is not None or self.s3_mode == "stream":
+            return
+
+        paths = self.index["path"].astype(str)
+        if not paths.str.startswith("s3://").any():
+            return  # local-only index: no cache dir needed
+
+        example = paths[paths.str.startswith("s3://")].iloc[0]
+        raise ValueError(
+            f"The index {index_path} contains s3:// paths (e.g. {example}) but "
+            f"s3_cache_dir is not set (s3_mode={self.s3_mode!r}).\n"
+            "\n"
+            "Set it in the data: section of your config YAML:\n"
+            "\n"
+            "    data:\n"
+            f"      s3_cache_dir: {self._suggested_cache_dir()}\n"
+            "\n"
+            "...or, to keep the config machine-independent, set it outside the config:\n"
+            "\n"
+            f"    export SURYA_WS_CACHE_DIR={self._suggested_cache_dir()}\n"
+            "    # or pass --s3-cache-dir <path> to the training script\n"
+            "\n"
+            "Each full-resolution SDO NetCDF file is ~1 GB, so pick a filesystem with "
+            "roughly 1 GB x (number of unique timesteps) free.\n"
+            "Alternatively set s3_mode: stream to read without a local cache "
+            "(not recommended for NetCDF/HDF5 — it requires random seeks)."
+        )
+
     def _get_s3fs(self):
         """Lazily create and cache an ``s3fs.S3FileSystem`` instance (per process)."""
         if s3fs is None:
@@ -658,16 +837,9 @@ class HelioNetCDFDataset(Dataset):
             self._s3fs = s3fs.S3FileSystem(**self.s3fs_kwargs, **self.s3_storage_options)
         return self._s3fs
 
-    def _parse_s3_uri(self, s3_uri: str) -> tuple[str, str]:
-        """Split ``s3://bucket/key`` into ``(bucket, key)``."""
-        if not s3_uri.startswith("s3://"):
-            raise ValueError(f"Not an S3 URI: {s3_uri}")
-        bucket, key = s3_uri[5:].split("/", 1)
-        return bucket, key
-
     def _s3_cache_path(self, s3_uri: str) -> str:
         """Build a stable, human-readable local cache path for an S3 object."""
-        bucket, key = self._parse_s3_uri(s3_uri)
+        bucket, key = parse_s3_uri(s3_uri)
         base = os.path.basename(key) or "object"
         base_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-") or "object"
         _, ext = os.path.splitext(base_safe)
@@ -691,25 +863,14 @@ class HelioNetCDFDataset(Dataset):
             region = (os.environ.get("AWS_REGION")
                       or os.environ.get("AWS_DEFAULT_REGION")
                       or detect_ec2_region())
-            pool_size = max(32, self.s3_boto3_max_concurrency * 2)
-            retry_config = {"max_attempts": 10, "mode": "adaptive"}
-
-            if anon:
-                client = boto3.client(
-                    "s3",
-                    region_name=region,
-                    config=BotoConfig(
-                        signature_version=UNSIGNED,
-                        max_pool_connections=pool_size,
-                        retries=retry_config,
-                    ),
-                )
-            else:
-                client = boto3.client(
-                    "s3",
-                    region_name=region,
-                    config=BotoConfig(max_pool_connections=pool_size, retries=retry_config),
-                )
+            client = make_s3_client(
+                anon=anon,
+                region=region,
+                # Pool must exceed the thread count or multipart threads contend.
+                pool_size=max(32, self.s3_boto3_max_concurrency * 2),
+                # Retry hard: a failed read kills the training run.
+                max_attempts=10,
+            )
 
             transfer_cfg = TransferConfig(
                 multipart_threshold=self.s3_boto3_part_size_mb * 1024 * 1024,
@@ -718,7 +879,7 @@ class HelioNetCDFDataset(Dataset):
                 use_threads=True,
                 io_chunksize=1024 * 1024,
             )
-            bucket, key = self._parse_s3_uri(s3_uri)
+            bucket, key = parse_s3_uri(s3_uri)
             client.download_file(bucket, key, local_path, Config=transfer_cfg)
             return
 

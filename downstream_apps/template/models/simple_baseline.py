@@ -7,12 +7,18 @@ import torch.nn as nn
 from einops import rearrange
 
 
-def inverse_transform_channels(batch: dict, channel_order: list, scalers: dict) -> dict:
-    """Return a new batch dict with 'ts' inverse-transformed to physical log space.
+def destandardize_channels(batch: dict, channel_order: list, scalers: dict) -> dict:
+    """Return a new batch dict with 'ts' moved from normalized space to signum-log space.
 
-    This converts each SDO channel from its normalized representation back to
-    the physical (signum-log) domain before feature extraction. Call this before
-    passing a batch to RegressionFlareModel.
+    This undoes the per-channel z-score ONLY. The signum-log compression applied by the
+    dataset is deliberately left in place, so the result is
+    ``sign(x*s) * log1p(|x*s|)`` — not raw DN/Gauss. Values spanning many orders of
+    magnitude make poor features for a single linear layer, so log space is what the
+    baseline wants.
+
+    If you need true physical units (plotting, a physical-space loss), use
+    ``HelioNetCDFDataset.inverse_transform_data()`` instead, which undoes both stages.
+    See the "THE THREE SPACES" block in ``workshop_infrastructure/datasets/helio.py``.
 
     Args:
         batch: Batch dict containing at minimum a 'ts' key with shape (B, C, T, H, W).
@@ -20,7 +26,7 @@ def inverse_transform_channels(batch: dict, channel_order: list, scalers: dict) 
         scalers: Dict mapping channel name -> scaler with an inverse_transform method.
 
     Returns:
-        A new batch dict with 'ts' replaced by the inverse-transformed tensor.
+        A new batch dict with 'ts' replaced by the de-standardized (signum-log) tensor.
     """
     x = batch["ts"].clone()
     with torch.no_grad():
@@ -38,9 +44,10 @@ class RegressionFlareModel(nn.Module):
             input_dim (int): The size of the input vector after channel and time dimensions are flattened.
 
         Note:
-            This model expects 'ts' in the batch dict to already be in physical (log) space.
-            Use inverse_transform_channels() to pre-process normalized SDO inputs before
-            passing them here (e.g., via the preprocess_fn argument of FlareLightningModule).
+            This model expects 'ts' in the batch dict to already be in **signum-log** space
+            (channel z-scores undone, log compression retained). Use
+            destandardize_channels() to pre-process normalized SDO inputs before passing
+            them here (e.g., via the preprocess_fn argument of FlareLightningModule).
         """
         super().__init__()
         self.linear = nn.Linear(input_dim, 1)
@@ -50,7 +57,7 @@ class RegressionFlareModel(nn.Module):
         Performs a forward pass through the model.
 
         Args:
-            x (dict): Batch dict with 'ts' of shape (B, C, T, H, W) in physical space.
+            x (dict): Batch dict with 'ts' of shape (B, C, T, H, W) in signum-log space.
 
         B - Batch size
         C - Channels

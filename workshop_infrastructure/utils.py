@@ -13,6 +13,16 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from workshop_infrastructure.configs import LoraAdapterConfig
 
+# Optional: S3 helpers below degrade to a clear ImportError when boto3 is absent.
+try:
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config as BotoConfig
+except Exception:  # pragma: no cover
+    boto3 = None
+    UNSIGNED = None
+    BotoConfig = None
+
 
 # ---------------------------------------------------------------------------
 # AWS / infrastructure utilities
@@ -43,6 +53,56 @@ def detect_ec2_region() -> str | None:
             return resp.read().decode()
     except Exception:
         return None
+
+
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Split ``s3://bucket/key`` into ``(bucket, key)``.
+
+    Raises:
+        ValueError: If ``uri`` is not an S3 URI, or has no key component.
+    """
+    if not isinstance(uri, str) or not uri.startswith("s3://"):
+        raise ValueError(f"Expected an s3:// URI, got: {uri!r}")
+    remainder = uri[len("s3://"):]
+    if "/" not in remainder:
+        raise ValueError(f"S3 URI is missing a key: {uri!r} (expected s3://bucket/key)")
+    bucket, key = remainder.split("/", 1)
+    return bucket, key
+
+
+def make_s3_client(
+    anon: bool = False,
+    region: str | None = None,
+    pool_size: int = 32,
+    max_attempts: int = 10,
+):
+    """Return a configured boto3 S3 client.
+
+    Shared by the dataset loader and the S3 benchmark so both use identical connection
+    pooling and retry behaviour.
+
+    Args:
+        anon: If True, sign requests anonymously (public buckets).
+        region: AWS region. Pass ``None`` to let boto3 resolve it.
+        pool_size: Max connections in the client's connection pool. Should be at least
+            twice the download concurrency, or threads will contend for connections.
+        max_attempts: Retry attempts in adaptive mode. The dataset uses a high value
+            because a failed read kills a training run; the benchmark uses a low one so
+            throughput measurements are not skewed by retries.
+    """
+    if boto3 is None:
+        raise ImportError("boto3 is required for S3 access. Install via: pip install boto3")
+
+    retry_cfg = {"max_attempts": max_attempts, "mode": "adaptive"}
+    if anon:
+        config = BotoConfig(
+            signature_version=UNSIGNED,
+            max_pool_connections=pool_size,
+            retries=retry_cfg,
+        )
+    else:
+        config = BotoConfig(max_pool_connections=pool_size, retries=retry_cfg)
+    return boto3.client("s3", region_name=region, config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -99,24 +159,69 @@ def build_scalers(info) -> Dict:
     """Reconstruct per-channel scaler objects from a scalers YAML file or dict.
 
     Args:
-        info: Path to a scalers YAML file, or an already-loaded dict.
+        info: Path to a scalers YAML file, or an already-loaded dict mapping
+            channel name -> scaler parameters.
 
-    The YAML entries contain a 'base' module path and 'class' name that were
-    recorded when the scalers were originally fitted (e.g. 'surya.datasets.transformations').
-    We resolve the class from our local transformations module instead of the
-    stored (now stale) module path.
+    Returns:
+        Dict mapping channel name -> scaler instance (e.g. ``StandardScaler``), each
+        exposing ``.mean``, ``.std``, ``.epsilon`` and ``.sl_scale_factor``.
+
+    On the ``base:`` field
+    ---------------------
+    Every entry records the module the scaler was originally fitted in — in the
+    shipped ``scalers.yaml`` that is ``surya.datasets.transformations``, which does not
+    exist in this repo (the Surya code is vendored under ``workshop_infrastructure/``).
+
+    That field is deliberately **ignored**. Classes are always resolved from
+    ``workshop_infrastructure.datasets.transformations``, never imported from the
+    recorded path, so normalization does not depend on what happens to be installed in
+    the environment: were a real ``surya`` package ever added, honoring ``base`` would
+    silently switch which ``StandardScaler`` implementation runs, and results could move
+    because of an unrelated install. Determinism matters more here than deference to a
+    stale field. This is not warned about at runtime — the field is stale in every entry
+    of a file fetched from HuggingFace that nobody can edit, so a warning would fire
+    always and invite no action.
     """
     import yaml
     import workshop_infrastructure.datasets.transformations as _transformations
 
+    source = "<dict>"
     if not isinstance(info, dict):
-        with open(info, "r", encoding="utf-8") as f:
+        source = str(info)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(
+                f"Scalers file not found: {source}\n"
+                "This is the data.scalers_path entry in your config. It is downloaded "
+                "automatically on the first run; to fetch it explicitly:\n"
+                "    python -m workshop_infrastructure.assets --scalers --dest <assets dir>"
+            )
+        with open(source, "r", encoding="utf-8") as f:
             info = yaml.safe_load(f)
 
-    ret_dict = {k: None for k in info.keys()}
+    if not isinstance(info, dict):
+        raise ValueError(f"Scalers source {source} must contain a mapping of channel name -> parameters.")
+
+    available = sorted(
+        name for name in dir(_transformations)
+        if isinstance(getattr(_transformations, name), type)
+    )
+
+    ret_dict = {}
     for p_key, p_val in info.items():
-        cls = getattr(_transformations, p_val["class"])
-        ret_dict[p_key] = cls.from_dict(p_val)
+        if not isinstance(p_val, dict) or "class" not in p_val:
+            raise ValueError(
+                f"Scalers entry {p_key!r} in {source} is malformed: expected a mapping "
+                f"with a 'class' key, got {type(p_val).__name__}."
+            )
+        class_name = p_val["class"]
+        # Note: p_val["base"] is intentionally not consulted — see the docstring.
+        if not hasattr(_transformations, class_name):
+            raise ValueError(
+                f"Scalers entry {p_key!r} in {source} names class {class_name!r}, which does "
+                "not exist in workshop_infrastructure.datasets.transformations.\n"
+                f"Available classes: {', '.join(available)}."
+            )
+        ret_dict[p_key] = getattr(_transformations, class_name).from_dict(p_val)
     return ret_dict
 
 

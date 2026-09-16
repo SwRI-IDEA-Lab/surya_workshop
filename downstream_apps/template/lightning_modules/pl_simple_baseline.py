@@ -25,8 +25,13 @@ Optional preprocessing:
 
 Key metrics contract (the `metrics` dict passed to __init__):
   - metrics["train_loss"]    : callable(output, target) -> (loss_dict, weight_list)
+        Backpropagated. Logged as "train_loss".
+  - metrics["val_loss"]      : callable(output, target) -> (loss_dict, weight_list)
+        Optional. Logged as "val_loss" and therefore what ModelCheckpoint monitors.
+        Falls back to metrics["train_loss"] when absent.
   - metrics["train_metrics"] : callable(output, target) -> (metric_dict, weight_list)
   - metrics["val_metrics"]   : callable(output, target) -> (metric_dict, weight_list)
+        Reported only. These do NOT affect checkpoint selection — "val_loss" does.
 
 Where:
   - loss_dict / metric_dict map string names -> torch scalar tensors
@@ -72,11 +77,18 @@ class FlareLightningModule(L.LightningModule):
           - "train_metrics": callable(output, target) -> (metrics, weights)
           - "val_metrics": callable(output, target) -> (metrics, weights)
 
+        Optional key:
+          - "val_loss": callable(output, target) -> (losses, weights)
+              The validation objective. Defaults to "train_loss" when not supplied, so
+              older metrics dicts keep working unchanged.
+
         The module uses:
-          - train_loss for both training_step and validation_step loss computation
-            (mirroring the original baseline behavior).
+          - train_loss in training_step, backpropagated and logged as "train_loss"
+          - val_loss in validation_step, logged as "val_loss" — the quantity
+            ModelCheckpoint monitors
           - train_metrics logged during training_step (if weights is non-empty)
-          - val_metrics logged during validation_step (if weights is non-empty)
+          - val_metrics logged during validation_step (if weights is non-empty).
+            Reported only; they do not influence checkpoint selection.
 
     lr:
         Learning rate for the Adam optimizer.
@@ -89,7 +101,7 @@ class FlareLightningModule(L.LightningModule):
     preprocess_fn:
         Optional callable applied to the batch dict before every model call.
         Signature: ``(batch: dict) -> dict``. Use this to apply input
-        transformations (e.g., ``inverse_transform_channels``) without
+        transformations (e.g., ``destandardize_channels``) without
         embedding them in the model itself.
     """
 
@@ -106,8 +118,11 @@ class FlareLightningModule(L.LightningModule):
         self.model = model
         self.preprocess_fn = preprocess_fn
 
-        # Loss callable: returns (loss_dict, weight_list)
+        # Loss callables: return (loss_dict, weight_list)
         self.training_loss = metrics["train_loss"]
+        # "val_loss" is optional: falling back to train_loss keeps a metrics dict written
+        # before this key existed working, with identical behavior.
+        self.validation_loss = metrics.get("val_loss", metrics["train_loss"])
 
         # Metric callables: return (metric_dict, weight_list)
         self.training_evaluation = metrics["train_metrics"]
@@ -213,9 +228,12 @@ class FlareLightningModule(L.LightningModule):
 
         Notes
         -----
-        - This baseline uses `self.training_loss` to compute validation loss as well,
-          matching the original code. If you need distinct train/val losses, introduce
-          a separate callable (e.g., metrics["val_loss"]).
+        - The loss is computed with `self.validation_loss`, which comes from
+          metrics["val_loss"] and falls back to metrics["train_loss"] when that key is
+          absent. Supply a distinct "val_loss" callable to monitor something other than
+          the training objective.
+        - "val_loss" is what ModelCheckpoint monitors. The `val_metrics` logged at the end
+          of this method are reported only and do not affect checkpoint selection.
         - No value is returned (Lightning uses logs for validation tracking).
         """
         target = batch["forecast"].unsqueeze(1).float()
@@ -223,7 +241,7 @@ class FlareLightningModule(L.LightningModule):
         if self.preprocess_fn is not None:
             batch = self.preprocess_fn(batch)
         output = self(batch)
-        val_losses, val_loss_weights = self.training_loss(output, target)
+        val_losses, val_loss_weights = self.validation_loss(output, target)
         loss = self._combine_losses(val_losses, val_loss_weights)
 
         # Log aggregate loss and component losses.

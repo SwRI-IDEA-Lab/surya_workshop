@@ -4,24 +4,35 @@ Runnable finetuning script derived from `2_finetune_template_1D.ipynb`.
 
 Design goals
 - Config-driven: all hyperparameters live in config_script.yaml
-- Minimal CLI: only --config is required; three optional overrides for dev convenience
+- Minimal CLI: --config plus a handful of per-run overrides
 - Multi-GPU capable (DDP) when run as a script
 
 Assumptions
-- You have already downloaded `scalers.yaml` + model weights (the notebook ran `download_scalers_and_weights.sh`).
+- Assets (`scalers.yaml` + model weights) are downloaded automatically on first run.
 - You run this script from the repo root and specify devices via CUDA_VISIBLE_DEVICES:
     CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
         --config downstream_apps/template/configs/config_script.yaml
 
-All other parameters (batch_size, max_epochs, S3 upload settings, etc.) are set in
-the YAML. Pass --max-epochs N to override max_epochs for quick sweeps without editing
-the file.
+All parameters live in the YAML. The CLI overrides only what genuinely varies between
+runs of the same config: --max-epochs and --batch-size (sweeps), --s3-cache-dir
+(per-machine scratch) and --deterministic (reproducibility, off by default for speed).
+Everything else is a config edit.
+
+Forking this script: build_datasets() and build_model() are the only two functions with
+task-specific content. build_trainer() and main() should need no changes.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+
+# Must be set BEFORE torch is imported: cuBLAS reads this once, when it initializes, so
+# setting it later has no effect. Deterministic cuBLAS on CUDA >= 10.2 requires it, and
+# without it every run under training.deterministic warns (or raises, when set to true).
+# setdefault so a deliberate ":16:8" (smaller workspace, slightly slower) is respected.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 from pathlib import Path
 from typing import Tuple
 
@@ -31,16 +42,25 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-from downstream_apps.template.configs import TrainingConfig, load_config
+from downstream_apps.template.configs import TrainingConfig, load_flare_config
 from downstream_apps.template.datasets.template_dataset import FlareDSDataset
 from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 from downstream_apps.template.metrics.template_metrics import FlareMetrics
+from workshop_infrastructure.assets import ensure_assets
+from workshop_infrastructure.datasets.builders import build_helio_dataloaders
 from workshop_infrastructure.utils import (
     apply_peft_lora,
     build_scalers,
     load_pretrained_weights,
     UploadBestCheckpointToS3,
 )
+
+DEFAULT_CONFIG = Path(__file__).parent / "configs" / "config_script.yaml"
+
+# --deterministic accepts the same three tokens as the YAML key. argparse hands back a
+# string, so the two boolean ones are mapped to real bools -- TrainingConfig validates
+# against True/False/"warn", not against their spellings.
+_DETERMINISTIC_CLI = {"false": False, "warn": "warn", "true": True}
 
 
 # ---------------------------------------------------------------------------
@@ -49,55 +69,27 @@ from workshop_infrastructure.utils import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="./configs/config.yaml",
-                        help="Path to config_script.yaml.")
+    parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG),
+                        help="Path to the run config YAML (default: this app's config_script.yaml).")
     # Dev toggles: flip without editing the YAML
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable WandB logging (useful for local runs).")
     parser.add_argument("--train_baseline", action="store_true",
                         help="Train the simple linear baseline instead of HelioSpectformer.")
-    # Sweep override: vary across jobs without touching the YAML
+    # Per-job / per-machine overrides: vary across runs without touching the YAML
     parser.add_argument("--max-epochs", type=int, default=None,
-                        help="Override max_epochs from the config YAML.")
+                        help="Override training.max_epochs from the config YAML.")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override training.batch_size from the config YAML.")
+    parser.add_argument("--s3-cache-dir", type=str, default=None,
+                        help="Override data.s3_cache_dir (the local cache for S3 reads). "
+                             "Handy when the same config runs on machines with different scratch.")
+    parser.add_argument("--deterministic", choices=tuple(_DETERMINISTIC_CLI), default=None,
+                        help="Override training.deterministic. The config default is 'false', "
+                             "which trades reproducibility for roughly 20%% throughput. Pass "
+                             "'warn' when you need to tell whether a change in your results came "
+                             "from your edit or from run-to-run drift.")
     return parser.parse_args()
-
-
-def _ensure_assets(cfg: TrainingConfig) -> None:
-    """Download scalers and model weights from HuggingFace if not already present.
-
-    Checks the paths declared in the config and fetches only the missing files,
-    so users who ran the notebooks first (and already have the files) pay no cost.
-    """
-    from pathlib import Path
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as e:
-        raise RuntimeError(
-            "huggingface_hub is required to download assets. "
-            "Install it with: pip install huggingface_hub"
-        ) from e
-
-    assets_to_fetch = [
-        (cfg.data.scalers_path, "nasa-ibm-ai4science/core-sdo", "dataset", "scalers.yaml"),
-    ]
-    if cfg.model.pretrained_path:
-        assets_to_fetch.append(
-            (cfg.model.pretrained_path, "nasa-ibm-ai4science/Surya-1.0", "model", "surya.366m.v1.pt")
-        )
-
-    for local_path, repo_id, repo_type, filename in assets_to_fetch:
-        if Path(local_path).exists():
-            continue
-        print(f"[assets] {Path(local_path).name} not found — downloading from {repo_id} ...")
-        dest_dir = Path(local_path).parent
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            filename=filename,
-            local_dir=str(dest_dir),
-        )
-        print(f"[assets] Saved to {local_path}")
 
 
 def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
@@ -114,26 +106,21 @@ def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
     return shifted / (2 * shifted.std())
 
 
-def build_datasets(cfg: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
-    """Create train and validation DataLoaders from config."""
-    scalers = build_scalers(info=cfg.data.scalers_path)
+def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader]:
+    """Create train and validation DataLoaders from config.
 
-    common_ds_kwargs = dict(
-        time_delta_input_minutes=cfg.data.time_delta_input_minutes,
-        time_delta_target_minutes=cfg.data.time_delta_target_minutes,
-        n_input_timestamps=cfg.model.time_embedding.time_dim,
-        rollout_steps=cfg.rollout_steps,
-        channels=cfg.data.channels,
-        drop_hmi_probability=cfg.drop_hmi_probability,
-        use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
+    Everything generic (channels, temporal sampling, S3 access, worker settings) is
+    handled by build_helio_dataloaders(). Only the flare-specific arguments below are
+    this app's business — when you fork the template, this is the list you replace.
+
+    ``scalers`` is built once in main() and shared with build_model(), so the two paths
+    cannot end up with different normalization statistics.
+    """
+    return build_helio_dataloaders(
+        cfg,
+        FlareDSDataset,
         scalers=scalers,
-        s3_use_simplecache=False,
-        s3_download_to_temp=True,
-        s3_storage_options={"anon": cfg.data.s3_anon},
-        s3_cache_dir=cfg.data.s3_cache_dir,
-        s3_boto3_max_concurrency=cfg.data.s3_boto3_max_concurrency,
-        s3_boto3_part_size_mb=cfg.data.s3_boto3_part_size_mb,
-        # Downstream-specific
+        seed=cfg.seed,
         return_surya_stack=True,
         max_number_of_samples=cfg.data.max_samples,
         label_transform=_flare_label_transform,
@@ -143,27 +130,17 @@ def build_datasets(cfg: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
         ds_match_direction=cfg.data.ds_match_direction,
     )
 
-    train_dataset = FlareDSDataset(index_path=cfg.data.train_data_path, phase="train", **common_ds_kwargs)
-    val_dataset = FlareDSDataset(index_path=cfg.data.valid_data_path, phase="val", **common_ds_kwargs)
 
-    loader_kwargs = dict(
-        batch_size=cfg.batch_size,
-        num_workers=8,
-        multiprocessing_context="spawn",
-        persistent_workers=True,
-        pin_memory=True,
-        drop_last=True,
-    )
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L.LightningModule:
+    """Instantiate the model and wrap it in a LightningModule.
 
-    return train_loader, val_loader
-
-
-def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.LightningModule:
-    """Instantiate the model and wrap it in a LightningModule."""
+    ``scalers`` is only needed by the linear baseline, which consumes its inputs in
+    signum-log space; the HelioSpectformer path works directly on normalized inputs.
+    """
     metrics = {
         "train_loss": FlareMetrics("train_loss"),
+        # val_loss is what ModelCheckpoint monitors; val_metrics are reported only.
+        "val_loss": FlareMetrics("val_loss"),
         "train_metrics": FlareMetrics("train_metrics"),
         "val_metrics": FlareMetrics("val_metrics"),
     }
@@ -172,13 +149,12 @@ def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.Lightnin
         from functools import partial
         from downstream_apps.template.models.simple_baseline import (
             RegressionFlareModel,
-            inverse_transform_channels,
+            destandardize_channels,
         )
-        scalers = build_scalers(info=cfg.data.scalers_path)
         n_input_timestamps = cfg.model.time_embedding.time_dim
         n_channels = len(cfg.data.channels)
         model = RegressionFlareModel(n_input_timestamps * n_channels)
-        preprocess_fn = partial(inverse_transform_channels, channel_order=cfg.data.channels, scalers=scalers)
+        preprocess_fn = partial(destandardize_channels, channel_order=cfg.data.channels, scalers=scalers)
         return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
@@ -189,10 +165,29 @@ def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.Lightnin
             use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         )
         load_pretrained_weights(model, cfg.model.pretrained_path)
+
+        # Three fine-tuning regimes, selected from the model: section of the YAML:
+        #   use_lora: true                        -> LoRA adapters (default)
+        #   use_lora: false, freeze_backbone: true  -> linear probe (head only)
+        #   use_lora: false, freeze_backbone: false -> full fine-tuning
+        if cfg.model.freeze_backbone:
+            for name, param in model.named_parameters():
+                if name.startswith("backbone."):
+                    param.requires_grad = False
         if cfg.model.use_lora:
             model = apply_peft_lora(model, cfg.model.lora_config)
 
+        _log_trainable_parameters(model)
+
     return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
+
+
+def _log_trainable_parameters(model) -> None:
+    """Print the trainable/total parameter counts, so the chosen regime is visible in the log."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    pct = 100.0 * trainable / total if total else 0.0
+    print(f"[MODEL] Trainable parameters: {trainable:,} / {total:,} ({pct:.2f}%)")
 
 
 def build_trainer(
@@ -236,6 +231,12 @@ def build_trainer(
         devices="auto",
         strategy="auto",
         precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
+        # Reproducibility. "warn" (the default) gives bit-identical runs wherever a
+        # deterministic kernel exists and names the op where one does not, instead of
+        # killing the run. benchmark is pinned rather than inherited: cuDNN autotuning
+        # picks algorithms by timing, so leaving it on would reintroduce run-to-run drift.
+        deterministic=cfg.deterministic,
+        benchmark=False,
         logger=loggers,
         callbacks=[checkpoint_cb, upload_cb],
         log_every_n_steps=2,
@@ -250,12 +251,27 @@ def build_trainer(
 def main() -> None:
     args = parse_args()
     torch.set_float32_matmul_precision("medium")
-    L.seed_everything(42, workers=True)
 
-    cfg = load_config(args.config)
-    _ensure_assets(cfg)
-    train_loader, val_loader = build_datasets(cfg)
-    lit_model = build_model(cfg, train_baseline=args.train_baseline)
+    cfg = load_flare_config(args.config)
+    # Seeding comes after the config load, so the seed is a configured value rather than
+    # a constant buried in the code. Seeds Python, NumPy and torch in this process;
+    # workers=True extends it to DataLoader workers.
+    L.seed_everything(cfg.seed, workers=True)
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.s3_cache_dir is not None:
+        cfg.data.s3_cache_dir = args.s3_cache_dir
+    if args.deterministic is not None:
+        cfg.deterministic = _DETERMINISTIC_CLI[args.deterministic]
+    # Fetch scalers, and the backbone weights unless we are training the baseline.
+    ensure_assets(cfg, which=["scalers"] if args.train_baseline else ["scalers", "weights"])
+
+    # Built once and shared: the dataset normalizes with these, and the linear baseline
+    # de-standardizes with them. Two separate builds could silently disagree.
+    scalers = build_scalers(info=cfg.data.scalers_path)
+
+    train_loader, val_loader = build_datasets(cfg, scalers)
+    lit_model = build_model(cfg, scalers, train_baseline=args.train_baseline)
     trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
 
     trainer.fit(lit_model, train_loader, val_loader)
