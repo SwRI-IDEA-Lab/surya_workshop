@@ -34,8 +34,12 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from downstream_apps.sep_pred_psp.configs import load_sep_psp_ds_config
+from downstream_apps.sep_pred_psp.datasets.label_transform import build_log_standardizer
 from downstream_apps.sep_pred_psp.datasets.template_dataset import SepPspDSDataset
 from downstream_apps.sep_pred_psp.lightning_modules.pl_simple_baseline import SepPspLightningModule
+from downstream_apps.sep_pred_psp.lightning_modules.val_prediction_logger import (
+    ValidationPredictionLogger,
+)
 from downstream_apps.sep_pred_psp.metrics.template_metrics import SepPspMetrics
 from downstream_apps.sep_pred_psp.models.simple_baseline import (
     RegressionSepPspModel,
@@ -77,16 +81,32 @@ def main() -> None:
     ensure_assets(cfg, which=["scalers"])
     scalers = build_scalers(info=cfg.data.scalers_path)
 
+    # log10 + z-score, fitted on the training split only and shared by both splits.
+    label_transform = build_log_standardizer(
+        cfg.data.sep_psp_index_path, cfg.data.train_data_path, column=cfg.data.label_column
+    )
+    print(f"[label] {label_transform}")
+
     train_loader, val_loader = build_helio_dataloaders(
         cfg,
         SepPspDSDataset,
         scalers=scalers,
         return_surya_stack=True,
-        max_number_of_samples=cfg.data.max_samples,
+        # Sized per split: max_samples drives training, max_val_samples holds validation
+        # fixed, so sweeping max_samples changes what the model learns from and not what
+        # it is scored on.
+        train_kwargs={"max_number_of_samples": cfg.data.max_samples},
+        val_kwargs={"max_number_of_samples": cfg.data.val_samples},
+        max_frames_per_event=cfg.data.max_frames_per_event,
+        label_column=cfg.data.label_column,
+        label_transform=label_transform,
         ds_sep_psp_index_path=cfg.data.sep_psp_index_path,
+        ds_event_list_path=cfg.data.event_list_path,
         ds_time_column=cfg.data.ds_time_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
         ds_match_direction=cfg.data.ds_match_direction,
+        ds_non_event_buffer=cfg.data.non_event_buffer,
+        sample_seed=cfg.seed,
     )
 
     n_input_timestamps = cfg.model.time_embedding.time_dim
@@ -125,13 +145,24 @@ def main() -> None:
         save_top_k=1,
     )
 
+    # Per-epoch validation predictions to CSV + the best epoch's histograms to WandB.
+    val_predictions_cb = ValidationPredictionLogger(
+        output_dir=Path(cfg.output.ckpt_dir) / "val_predictions" / run_name,
+        monitor="val_loss",
+        mode="min",
+        # The target is log10-z-scored: already log space and legitimately negative, so
+        # the y axis stays linear and is named for what is actually plotted.
+        label_name="log10 Jlinlin (z-scored)",
+        log_y=False,
+    )
+
     max_epochs = args.max_epochs if args.max_epochs is not None else cfg.max_epochs
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
         devices="auto",
         logger=loggers,
-        callbacks=[checkpoint_cb],
+        callbacks=[checkpoint_cb, val_predictions_cb],
         log_every_n_steps=2,
     )
 

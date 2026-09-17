@@ -201,6 +201,17 @@ class SepPspLightningModule(L.LightningModule):
 
         # Log aggregate loss and component losses.
         self.log("train_loss", loss, prog_bar=True, batch_size=self.batch_size, sync_dist=True)
+        # ...and the same loss averaged over the epoch. "train_loss" above is per-step
+        # (Lightning's default inside training_step), so on a small dataset it is a
+        # handful of points per epoch whose spread is dominated by which samples landed
+        # in which batch -- one large-event sample can put a single step an order of
+        # magnitude above its neighbours. The epoch mean is the curve to read against
+        # val_loss, which is epoch-level by the same default. Logged under its own key so
+        # the per-step series keeps the name it has always had.
+        self.log(
+            "train_loss_epoch_avg", loss, on_step=False, on_epoch=True,
+            prog_bar=False, batch_size=self.batch_size, sync_dist=True,
+        )
         for key in training_losses.keys():
             self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
@@ -225,6 +236,7 @@ class SepPspLightningModule(L.LightningModule):
               - total weighted loss as "val_loss" (progress bar)
               - each component loss as "val_loss_<name>"
               - validation metrics as "val_metric_<name>" (if any)
+        5) Return the raw predictions for any callback that wants them
 
         Notes
         -----
@@ -234,7 +246,15 @@ class SepPspLightningModule(L.LightningModule):
           the training objective.
         - "val_loss" is what ModelCheckpoint monitors. The `val_metrics` logged at the end
           of this method are reported only and do not affect checkpoint selection.
-        - No value is returned (Lightning uses logs for validation tracking).
+
+        Returns
+        -------
+        dict
+            ``{"preds": <detached model output>}``. Lightning forwards this to
+            ``on_validation_batch_end`` and does not accumulate it, so callbacks can
+            collect per-sample predictions without the module knowing what they are for.
+            ``ValidationPredictionLogger`` uses it to save every epoch's predictions and
+            plot the best epoch's.
         """
         target = batch["forecast"].unsqueeze(1).float()
 
@@ -254,6 +274,8 @@ class SepPspLightningModule(L.LightningModule):
         if len(val_evaluation_weights) > 0:
             for key in val_evaluation_metrics.keys():
                 self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
+
+        return {"preds": output.detach()}
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """

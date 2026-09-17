@@ -79,6 +79,8 @@ Each downstream task follows this pattern:
 
 Dataset and DataLoader construction is **not** re-implemented per app: `build_helio_dataloaders()` in `workshop_infrastructure/datasets/builders.py` maps the config onto the ~20 `HelioNetCDFDataset` arguments, and the app passes only its task-specific kwargs.
 
+**Per-split sizing.** Task kwargs passed positionally go to *both* splits. `train_kwargs` / `val_kwargs` override them for one split only — the mechanism behind `data.max_samples` (train) vs `data.max_val_samples` (val), so a learning curve varies the training set while every run is scored on one fixed validation set. Read `cfg.data.val_samples`, not `max_val_samples`: the property falls back to `max_samples` so a config that never sets it keeps the old one-knob behavior. The two dicts are merged before expansion, because `f(**common, **train_kwargs)` on a shared key is a `TypeError`, not an override.
+
 ### LoRA Fine-tuning
 
 PEFT LoRA is applied (rank=8, alpha=8, dropout=0.1) by `apply_peft_lora()` in `workshop_infrastructure/utils.py`.
@@ -123,6 +125,85 @@ Scalers (normalization stats per channel) are stored in `assets/scalers.yaml` an
 Never assume one is the other; the reference block is at the top of `workshop_infrastructure/datasets/helio.py`.
 
 Assets download on first run via `workshop_infrastructure/assets.py:ensure_assets()`. The two `download_*.sh` scripts are thin wrappers over its CLI.
+
+### Event sampling (`sep_pred_psp`)
+
+`downstream_apps/sep_pred_psp/datasets/event_sampling.py` draws a half-event / half-non-event
+sample per split. Two properties the rest of the app depends on:
+
+- **The ceiling is events, not frames.** Only 124 of the 349 catalogued SEP events have any
+  row in `SHARP_to_PSP_times.csv` inside their PSP-time window; they split 95 train / 11 val
+  / 13 test. At one frame per event a balanced draw therefore caps at **190 train / 22 val**.
+  `data.max_frames_per_event` lifts that: a draw that exhausts the events returns for a
+  second frame from each window, picked as far in PSP time from the frames already taken as
+  the window allows. Rounds are consumed in order, so every event contributes one frame
+  before any contributes two. Those extra samples are further views of an event already in
+  the set, **not new events** — `sample_balanced()` warns whenever a draw reaches round 2,
+  and `frame_round` on each sample records which round it came from. Judge a run by the
+  distinct-event count, not the sample count.
+- **Draws are nested.** Each pool is shuffled once per round from the seeded RNG, in an order
+  that does not depend on `n_samples`, and the draw is a prefix. So at one seed the
+  50-sample training set is a strict subset of the 100-sample one, and a 50/100/200/500
+  ladder is one growing dataset rather than four unrelated draws. Anything that makes a pool
+  size or an RNG draw depend on `n_samples` breaks this.
+
+### Label normalization (`sep_pred_psp`)
+
+The label is one column of `SHARP_to_PSP_times.csv`, chosen by `data.label_column`:
+`Jlinlin` (smoothed in PSP time, ~0.02 dex hour to hour) or `Jlinlin_raw` (unsmoothed,
+~0.12 dex — noisier, but free of processing whose provenance, and whether it peeks forward
+in time, is undocumented). Both are strictly positive and span ~6 decades, and both are
+**per PSP hour**: every SHARP row at the same hour carries the same value.
+
+Trained on directly, that range makes MSE a function of a handful of samples — in a
+50-sample training draw the three largest carry 94% of the total squared deviation. So
+`datasets/label_transform.py` applies **log10 then a z-score**, which drops that share to
+46% (12% at 500 samples). Two invariants:
+
+- The statistics come from the **training split only**, matched by date against the train
+  index, so the val/test periods never set the target scale.
+- **One `LogStandardizer` is built per run and shared by both splits.** Re-deriving it per
+  split, or per rung of a 50/100/200/500 ladder, would score each run on a different scale.
+
+`val_loss` is therefore an MSE in z-scored log units: **RMSE × `std` = error in dex**.
+`LogStandardizer.inverse()` maps predictions back to Jlinlin.
+
+### Validation predictions and reporting (`sep_pred_psp`)
+
+`downstream_apps/sep_pred_psp/lightning_modules/val_prediction_logger.py` holds
+`ValidationPredictionLogger`, a Lightning `Callback` that writes every epoch's per-sample
+validation predictions to `val_predictions.csv` and, for the best epoch only, renders a
+two-panel per-sample true-vs-predicted bar figure (non-event | event, RMSE per panel and
+overall) to PNG and to WandB.
+
+- It lives in a **callback**, not in `SepPspLightningModule`: the module is generic (losses
+  and metrics), while the event / non-event split is this task's business. The module's
+  only contribution is that `validation_step` returns `{"preds": ...}`, which Lightning
+  forwards to `on_validation_batch_end` without accumulating it.
+- `monitor` must match what `ModelCheckpoint` monitors, or the figure describes a different
+  epoch from the one whose weights were kept.
+- The figure is rendered once at `on_fit_end`, so a run logs exactly one image.
+- Predictions are `all_gather`ed before anything is written, so under DDP the CSV covers the
+  whole validation set rather than one rank's shard; rows are de-duplicated on
+  `valid_index` (the Surya timestep, added to each sample for exactly this purpose) to drop
+  the samples `DistributedSampler` repeats to even out ranks. The gather must run on every
+  rank, so it happens before the `is_global_zero` guard.
+- `plot_event_predictions()` draws **one pair of bars per validation sample** (true,
+  predicted), not binned counts: at 25 samples a panel, a histogram hides which sample is
+  wrong. Samples are sorted by true value within a panel, so the true series is a monotone
+  staircase and a model that ignores its input reads as a flat predicted series under a
+  rising true one. The x axis is therefore a rank, not a sample id — `val_predictions.csv`
+  keeps the timestamps.
+- Both panels share the y axis (`sharey=True`), which is what makes them comparable.
+- `log_y` follows the label space: **False** for the log10-z-scored target this app trains
+  on, whose values are legitimately negative, and True for a positive linear label (raw
+  Jlinlin), where the axis is log-scaled and predictions `<= 0` are clipped to the axis
+  floor with the count printed in the panel rather than silently dropped by the log.
+
+`build_helio_dataloaders()` uses `drop_last=True` for training and **`drop_last=False` for
+validation**: dropping the last partial training batch keeps optimizer steps uniform, but
+dropping it during validation would discard held-out samples and make the score depend on
+the batch size.
 
 ### Configuration
 

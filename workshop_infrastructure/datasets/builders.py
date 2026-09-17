@@ -80,6 +80,8 @@ def build_helio_datasets(
     cfg,
     dataset_cls: Type[Dataset],
     scalers: Any = None,
+    train_kwargs: dict | None = None,
+    val_kwargs: dict | None = None,
     **task_kwargs,
 ) -> Tuple[Dataset, Dataset]:
     """Build the train and validation datasets described by ``cfg``.
@@ -89,21 +91,34 @@ def build_helio_datasets(
         dataset_cls: ``HelioNetCDFDataset`` or a subclass of it.
         scalers: Normalization statistics. Built from ``cfg.data.scalers_path`` if omitted;
             pass an existing dict to avoid re-reading the YAML.
+        train_kwargs: Task kwargs applied to the training split only, overriding
+            ``task_kwargs``. This is how the two splits get different sample caps: pass
+            ``train_kwargs={"max_number_of_samples": cfg.data.max_samples}``.
+        val_kwargs: The same for the validation split. Sizing the two splits separately is
+            what lets a learning curve vary the training data while every run is scored on
+            one fixed validation set.
         **task_kwargs: Extra keyword arguments forwarded to ``dataset_cls`` — the
-            task-specific parameters your subclass adds.
+            task-specific parameters your subclass adds. Applied to both splits.
 
     Returns:
-        ``(train_dataset, val_dataset)``. They differ only in the index they read and in
-        ``phase``: the validation set uses ``phase="val"``, which disables the random
-        channel masking and vertical flips that are applied during training.
+        ``(train_dataset, val_dataset)``. Unless ``train_kwargs``/``val_kwargs`` say
+        otherwise they differ only in the index they read and in ``phase``: the validation
+        set uses ``phase="val"``, which disables the random channel masking and vertical
+        flips that are applied during training.
     """
     if scalers is None:
         scalers = build_scalers(info=cfg.data.scalers_path)
 
     common = {**_base_dataset_kwargs(cfg, scalers), **task_kwargs}
 
-    train_dataset = dataset_cls(index_path=cfg.data.train_data_path, phase="train", **common)
-    val_dataset = dataset_cls(index_path=cfg.data.valid_data_path, phase="val", **common)
+    # Merged into one dict rather than passed as two ** expansions: a key present in both
+    # would be a "multiple values for keyword argument" TypeError, not an override.
+    train_dataset = dataset_cls(
+        index_path=cfg.data.train_data_path, phase="train", **{**common, **(train_kwargs or {})}
+    )
+    val_dataset = dataset_cls(
+        index_path=cfg.data.valid_data_path, phase="val", **{**common, **(val_kwargs or {})}
+    )
     return train_dataset, val_dataset
 
 
@@ -113,6 +128,8 @@ def build_helio_dataloaders(
     scalers: Any = None,
     num_workers: int | None = None,
     seed: int | None = None,
+    train_kwargs: dict | None = None,
+    val_kwargs: dict | None = None,
     **task_kwargs,
 ) -> Tuple[DataLoader, DataLoader]:
     """Build the train and validation DataLoaders described by ``cfg``.
@@ -128,13 +145,21 @@ def build_helio_dataloaders(
             a bare ``shuffle=True`` seeds its sampler from whatever the global torch RNG
             state happens to be when the iterator is created, so anything that consumes
             RNG earlier in the program silently reshuffles the data.
-        **task_kwargs: Extra keyword arguments forwarded to ``dataset_cls``.
+        train_kwargs: Task kwargs for the training split only — see
+            ``build_helio_datasets()``.
+        val_kwargs: Task kwargs for the validation split only.
+        **task_kwargs: Extra keyword arguments forwarded to ``dataset_cls``, for both splits.
 
     Returns:
         ``(train_loader, val_loader)``. Only the training loader shuffles.
     """
     train_dataset, val_dataset = build_helio_datasets(
-        cfg, dataset_cls, scalers=scalers, **task_kwargs
+        cfg,
+        dataset_cls,
+        scalers=scalers,
+        train_kwargs=train_kwargs,
+        val_kwargs=val_kwargs,
+        **task_kwargs,
     )
 
     workers = cfg.num_workers if num_workers is None else num_workers
@@ -144,7 +169,6 @@ def build_helio_dataloaders(
         batch_size=cfg.batch_size,
         num_workers=workers,
         pin_memory=True,
-        drop_last=True,
     )
     if workers > 0:
         # "spawn": the dataset holds an s3fs/boto3 handle that does not survive fork.
@@ -159,8 +183,12 @@ def build_helio_dataloaders(
     shuffle_generator.manual_seed(base_seed)
 
     train_loader = DataLoader(
-        train_dataset, shuffle=True, generator=shuffle_generator, **loader_kwargs
+        train_dataset, shuffle=True, generator=shuffle_generator, drop_last=True,
+        **loader_kwargs
     )
-    # No generator for validation: it is not shuffled, so there is nothing to seed.
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    # drop_last=False for validation, unlike training. Dropping the last partial training
+    # batch keeps every optimizer step the same size; dropping it during validation would
+    # instead throw away held-out samples and score the model on a subset that changes
+    # with the batch size. No generator either: validation is not shuffled.
+    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
     return train_loader, val_loader

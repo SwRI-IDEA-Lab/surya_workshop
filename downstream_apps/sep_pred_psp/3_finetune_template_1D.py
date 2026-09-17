@@ -10,8 +10,8 @@ Design goals
 Assumptions
 - Assets (`scalers.yaml` + model weights) are downloaded automatically on first run.
 - You run this script from the repo root and specify devices via CUDA_VISIBLE_DEVICES:
-    CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
-        --config downstream_apps/template/configs/config_script.yaml
+    CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.sep_pred_psp.3_finetune_template_1D \
+        --config downstream_apps/sep_pred_psp/configs/config_script.yaml
 
 All parameters live in the YAML. The CLI overrides only what genuinely varies between
 runs of the same config: --max-epochs and --batch-size (sweeps), --s3-cache-dir
@@ -42,10 +42,14 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-from downstream_apps.template.configs import TrainingConfig, load_flare_config
-from downstream_apps.template.datasets.template_dataset import FlareDSDataset
-from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
-from downstream_apps.template.metrics.template_metrics import FlareMetrics
+from downstream_apps.sep_pred_psp.configs import TrainingConfig, load_sep_psp_ds_config
+from downstream_apps.sep_pred_psp.datasets.label_transform import build_log_standardizer
+from downstream_apps.sep_pred_psp.datasets.template_dataset import SepPspDSDataset
+from downstream_apps.sep_pred_psp.lightning_modules.pl_simple_baseline import SepPspLightningModule
+from downstream_apps.sep_pred_psp.lightning_modules.val_prediction_logger import (
+    ValidationPredictionLogger,
+)
+from downstream_apps.sep_pred_psp.metrics.template_metrics import SepPspMetrics
 from workshop_infrastructure.assets import ensure_assets
 from workshop_infrastructure.datasets.builders import build_helio_dataloaders
 from workshop_infrastructure.utils import (
@@ -92,42 +96,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
-    """Normalize flare peak intensity for the template task.
-
-    Converts raw GOES intensity to a z-score-like label:
-      1. Take log10 (intensity values span many orders of magnitude).
-      2. Shift so the minimum is 0.
-      3. Scale by 2 * std so most values fall in [-1, 1].
-    """
-    import numpy as np
-    log_intensity = np.log10(intensity)
-    shifted = log_intensity - log_intensity.min()
-    return shifted / (2 * shifted.std())
-
-
-def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader]:
+def build_datasets(cfg: TrainingConfig, scalers, label_transform=None) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config.
 
     Everything generic (channels, temporal sampling, S3 access, worker settings) is
-    handled by build_helio_dataloaders(). Only the flare-specific arguments below are
+    handled by build_helio_dataloaders(). Only the SEP/PSP-specific arguments below are
     this app's business — when you fork the template, this is the list you replace.
 
     ``scalers`` is built once in main() and shared with build_model(), so the two paths
-    cannot end up with different normalization statistics.
+    cannot end up with different normalization statistics. ``label_transform`` is shared
+    the same way, and for the same reason: fitted once in main() on the training split, it
+    puts both splits -- and every rung of a learning curve -- on one label scale.
     """
     return build_helio_dataloaders(
         cfg,
-        FlareDSDataset,
+        SepPspDSDataset,
         scalers=scalers,
         seed=cfg.seed,
         return_surya_stack=True,
-        max_number_of_samples=cfg.data.max_samples,
-        label_transform=_flare_label_transform,
-        ds_flare_index_path=cfg.data.flare_index_path,
+        # Sized per split: max_samples drives training, max_val_samples holds validation
+        # fixed, so sweeping max_samples changes what the model learns from and not what
+        # it is scored on.
+        train_kwargs={"max_number_of_samples": cfg.data.max_samples},
+        val_kwargs={"max_number_of_samples": cfg.data.val_samples},
+        max_frames_per_event=cfg.data.max_frames_per_event,
+        # One standardizer, fitted on the training split only and shared by both splits:
+        # labels span ~6 decades raw, so MSE on them is decided by a handful of events.
+        label_column=cfg.data.label_column,
+        label_transform=label_transform,
+        ds_sep_psp_index_path=cfg.data.sep_psp_index_path,
+        ds_event_list_path=cfg.data.event_list_path,
         ds_time_column=cfg.data.ds_time_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
         ds_match_direction=cfg.data.ds_match_direction,
+        ds_non_event_buffer=cfg.data.non_event_buffer,
+        sample_seed=cfg.seed,
     )
 
 
@@ -138,24 +141,24 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
     signum-log space; the HelioSpectformer path works directly on normalized inputs.
     """
     metrics = {
-        "train_loss": FlareMetrics("train_loss"),
+        "train_loss": SepPspMetrics("train_loss"),
         # val_loss is what ModelCheckpoint monitors; val_metrics are reported only.
-        "val_loss": FlareMetrics("val_loss"),
-        "train_metrics": FlareMetrics("train_metrics"),
-        "val_metrics": FlareMetrics("val_metrics"),
+        "val_loss": SepPspMetrics("val_loss"),
+        "train_metrics": SepPspMetrics("train_metrics"),
+        "val_metrics": SepPspMetrics("val_metrics"),
     }
 
     if train_baseline:
         from functools import partial
-        from downstream_apps.template.models.simple_baseline import (
-            RegressionFlareModel,
+        from downstream_apps.sep_pred_psp.models.simple_baseline import (
+            RegressionSepPspModel,
             destandardize_channels,
         )
         n_input_timestamps = cfg.model.time_embedding.time_dim
         n_channels = len(cfg.data.channels)
-        model = RegressionFlareModel(n_input_timestamps * n_channels)
+        model = RegressionSepPspModel(n_input_timestamps * n_channels)
         preprocess_fn = partial(destandardize_channels, channel_order=cfg.data.channels, scalers=scalers)
-        return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
+        return SepPspLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
         model = HelioSpectformer1D.from_config(
@@ -167,9 +170,14 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
         load_pretrained_weights(model, cfg.model.pretrained_path)
 
         # Three fine-tuning regimes, selected from the model: section of the YAML:
-        #   use_lora: true                        -> LoRA adapters (default)
+        #   use_lora: true                          -> LoRA adapters + the whole head
         #   use_lora: false, freeze_backbone: true  -> linear probe (head only)
         #   use_lora: false, freeze_backbone: false -> full fine-tuning
+        #
+        # freeze_backbone is ignored when use_lora is true: PEFT freezes every
+        # parameter, then re-enables the adapters and every head_* module.
+        # apply_peft_lora() finds the head by the head_ naming convention, so a
+        # custom head layer must carry that prefix or it is silently frozen.
         if cfg.model.freeze_backbone:
             for name, param in model.named_parameters():
                 if name.startswith("backbone."):
@@ -179,7 +187,7 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
 
         _log_trainable_parameters(model)
 
-    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
+    return SepPspLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
 
 
 def _log_trainable_parameters(model) -> None:
@@ -218,6 +226,19 @@ def build_trainer(
         save_top_k=1,
         save_last=False,
     )
+    # Saves every epoch's per-sample validation predictions to CSV, and logs the
+    # best epoch's true-vs-predicted histograms (non-event | event, with RMSE) to WandB.
+    # It monitors the same key as checkpoint_cb, so the figure describes the epoch whose
+    # weights were actually kept.
+    val_predictions_cb = ValidationPredictionLogger(
+        output_dir=Path(cfg.output.ckpt_dir) / "val_predictions",
+        monitor="val_loss",
+        mode="min",
+        # The target is log10-z-scored: already log space and legitimately negative, so
+        # the y axis stays linear and is named for what is actually plotted.
+        label_name="log10 Jlinlin (z-scored)",
+        log_y=False,
+    )
     upload_cb = UploadBestCheckpointToS3(
         checkpoint_cb=checkpoint_cb,
         bucket=cfg.output.s3_bucket,
@@ -238,7 +259,7 @@ def build_trainer(
         deterministic=cfg.deterministic,
         benchmark=False,
         logger=loggers,
-        callbacks=[checkpoint_cb, upload_cb],
+        callbacks=[checkpoint_cb, val_predictions_cb, upload_cb],
         log_every_n_steps=2,
     )
     return trainer, checkpoint_cb
@@ -252,7 +273,7 @@ def main() -> None:
     args = parse_args()
     torch.set_float32_matmul_precision("medium")
 
-    cfg = load_flare_config(args.config)
+    cfg = load_sep_psp_ds_config(args.config)
     # Seeding comes after the config load, so the seed is a configured value rather than
     # a constant buried in the code. Seeds Python, NumPy and torch in this process;
     # workers=True extends it to DataLoader workers.
@@ -270,7 +291,13 @@ def main() -> None:
     # de-standardizes with them. Two separate builds could silently disagree.
     scalers = build_scalers(info=cfg.data.scalers_path)
 
-    train_loader, val_loader = build_datasets(cfg, scalers)
+    # log10 + z-score, fitted on the training split's catalog rows only.
+    label_transform = build_log_standardizer(
+        cfg.data.sep_psp_index_path, cfg.data.train_data_path, column=cfg.data.label_column
+    )
+    print(f"[label] {label_transform}")
+
+    train_loader, val_loader = build_datasets(cfg, scalers, label_transform)
     lit_model = build_model(cfg, scalers, train_baseline=args.train_baseline)
     trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
 

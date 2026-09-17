@@ -32,8 +32,11 @@ job_id: sep_pred_psp
 # -----------------------------------------------------------------------------
 data:
   # -- Paths (relative to this file's directory) --
-  train_data_path: ../../../data/indices/surya_aws_s3_train.csv
-  valid_data_path: ../../../data/indices/surya_aws_s3_val.csv
+  # Split indices built by data/make_split_indices.py from Surya's full index:
+  #   train: 2020, 2021, 2023, 2024 (all dates, incl. January) | val: 2022 Jan-Jul | test: 2022 Aug-Dec
+  train_data_path: ../data/indices/sep_psp_train.csv
+  valid_data_path: ../data/indices/sep_psp_val.csv
+  test_data_path: ../data/indices/sep_psp_test.csv
   scalers_path: ../assets/scalers.yaml
 
   # -- Input channels and temporal sampling --
@@ -48,6 +51,32 @@ data:
                                    # (solar-surface time — used to pick the SDO/Surya frame)
   ds_time_tolerance: 4d           # Max allowed gap between catalog and Surya timestamps
   ds_match_direction: forward     # "forward": use solar state *before* the event (causal)
+
+  # -- Event / non-event sampling (PSP/ISOIS event list, compared on PSP `time`) --
+  event_list_path: ../data/psp_isois_eventlist_vSurya.csv
+  # Label column, log10-z-scored before training (see datasets/label_transform.py).
+  # Jlinlin     : smoothed in PSP time (~0.02 dex hour to hour)
+  # Jlinlin_raw : unsmoothed (~0.12 dex) -- noisier, but free of processing whose
+  #               provenance (and whether it peeks forward in time) is undocumented.
+  label_column: Jlinlin_raw
+  non_event_buffer: 1d            # Non-events must be at least this far from every event window
+
+  # Ceiling on how many Surya frames a single SEP event may contribute.
+  #
+  # The binding constraint on this task is the number of distinct events, not the number of
+  # SDO frames: only 124 of the 349 catalogued SEP events have any row in
+  # SHARP_to_PSP_times.csv inside their PSP-time window, and those split 95 train / 11 val /
+  # 13 test. At 1 frame per event a balanced draw therefore caps at 190 train / 22 val.
+  #
+  # Above 1, a draw that runs out of events goes back for a second frame from each event
+  # window, chosen as far in PSP time from the frames already taken as the window allows.
+  # Every event contributes one frame before any contributes two, so the extra samples are
+  # only ever the "cheapest" ones. They are further views of an event already in the set —
+  # more input variety and a different Jlinlin label, but NOT new events. sample_balanced()
+  # warns when a draw reaches into a second round so this never happens silently.
+  #
+  # 4 is what the 50/100/200/500 train ladder and the fixed 50-sample val set need.
+  max_frames_per_event: 4
 
   # -- Local data (only needed when the index contains relative local paths) --
   # sdo_data_root_path: /path/to/sdo   # Prepended to relative local paths; ignored for s3://
@@ -98,8 +127,20 @@ data:
   s3_boto3_max_concurrency: 4     # parallel download threads (benchmark default: 4)
   s3_boto3_part_size_mb: 64       # part size in MB (benchmark default: 64)
 
-  # -- Development --
-  max_samples: 10                 # Cap dataset size for quick experiments (null = all samples)
+  # -- Split sizes --
+  # max_samples sizes the TRAINING split only; max_val_samples sizes validation. Keeping
+  # them apart is the point: sweep max_samples for a learning curve (50, 100, 200, 500...)
+  # and every run is still scored on the same fixed validation set, so the curve measures
+  # the effect of training data and nothing else.
+  #
+  # Each is N//2 events + N - N//2 non-events (null = all events + as many non-events).
+  # The draw is a seeded prefix of a fixed shuffle, so at one seed the 50-sample training
+  # set is a strict subset of the 100-sample one — the ladder is nested, not three
+  # unrelated draws.
+  max_samples: 100                # TRAIN. This is the knob to sweep.
+  max_val_samples: 50             # VAL. 25 events + 25 non-events, drawn from the 11
+                                  # distinct events in the 2022 Jan-Jul split (so ~2-3
+                                  # frames per event). Leave this pinned across runs.
 
 
 # -----------------------------------------------------------------------------
@@ -126,26 +167,32 @@ model:
   init_weights: false
   checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   ensemble: null
-  nglo: 1
   time_embedding:
     type: linear        # Options: linear | fourier | perceiver
     n_queries: null     # Required for perceiver; unused otherwise
-    time_dim: 1         # Number of input timesteps (must match time_delta_input_minutes length)
+    time_dim: 1         # Number of input timesteps (must be <= time_delta_input_minutes length)
 
   # -- Fine-tuning head --
+  # Head layers live on the model as head_* attributes; see ADAPTING.md before adding one.
   pooling: class_token  # Options: class_token | global_average | global_max | attention | transformer
   penultimate_linear_layer: true
   dropout: 0.2
   freeze_backbone: false
 
   # -- LoRA adapters --
+  # Trainable under use_lora: true = these adapters + every head_* module.
+  # The head is discovered automatically from the head_ naming convention.
   use_lora: true
   lora_config:
     r: 8
     lora_alpha: 8
     lora_dropout: 0.1
     bias: none
-    target_modules: [q_proj, v_proj, k_proj, out_proj, fc1, fc2]
+    # fc1/fc2 in all 10 blocks; attn.qkv/attn.proj in the 8 attention blocks.
+    # Dotted names are required: a bare "proj" would also match the Conv2d
+    # patch-embedding tokeniser. Never adapted: the spectral complex_weight,
+    # attn.to_dynamic_projection, and the patch embedding.
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
 
 
 # -----------------------------------------------------------------------------
