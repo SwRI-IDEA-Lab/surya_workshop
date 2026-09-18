@@ -210,7 +210,23 @@ class DataConfig:
     s3_boto3_part_size_mb: int = 64     # part size in MB for multipart downloads
 
     # --- Development ---
+    # Cap on the TRAINING split. Raise it to train on more data; the validation split is
+    # sized separately by max_val_samples, so a learning curve changes only what the model
+    # learns from and never what it is scored on.
     max_samples: Optional[int] = None
+    # Cap on the VALIDATION split. None means "same as max_samples" (one knob for both,
+    # which is what every app did before this field existed). Pin it to a number to hold
+    # the validation set fixed while max_samples sweeps.
+    max_val_samples: Optional[int] = None
+
+    @property
+    def val_samples(self) -> Optional[int]:
+        """Sample cap for the validation split, falling back to ``max_samples``.
+
+        Apps should read this rather than ``max_val_samples`` so that a config which never
+        sets it keeps the old behavior of one cap for both splits.
+        """
+        return self.max_samples if self.max_val_samples is None else self.max_val_samples
 
     def __post_init__(self) -> None:
         if self.s3_mode not in VALID_S3_MODES:
