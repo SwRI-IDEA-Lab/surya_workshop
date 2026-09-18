@@ -64,12 +64,12 @@ def test_split_specific_kwargs_reach_only_their_own_split():
 
 def test_shared_task_kwargs_still_reach_both_splits():
     train, val = build(
-        max_frames_per_event=4,
+        active_above=1.0,
         train_kwargs={"max_number_of_samples": 500},
         val_kwargs={"max_number_of_samples": 50},
     )
-    assert train.kwargs["max_frames_per_event"] == 4
-    assert val.kwargs["max_frames_per_event"] == 4
+    assert train.kwargs["active_above"] == 1.0
+    assert val.kwargs["active_above"] == 1.0
 
 
 def test_split_kwargs_override_a_shared_one_rather_than_raising():

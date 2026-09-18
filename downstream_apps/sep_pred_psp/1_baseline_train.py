@@ -97,11 +97,11 @@ def main() -> None:
         # it is scored on.
         train_kwargs={"max_number_of_samples": cfg.data.max_samples},
         val_kwargs={"max_number_of_samples": cfg.data.val_samples},
-        max_frames_per_event=cfg.data.max_frames_per_event,
+        active_above=cfg.data.active_above,
+        quiet_below=cfg.data.quiet_below,
         label_column=cfg.data.label_column,
         label_transform=label_transform,
         ds_sep_psp_index_path=cfg.data.sep_psp_index_path,
-        ds_event_list_path=cfg.data.event_list_path,
         ds_time_column=cfg.data.ds_time_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
         ds_match_direction=cfg.data.ds_match_direction,

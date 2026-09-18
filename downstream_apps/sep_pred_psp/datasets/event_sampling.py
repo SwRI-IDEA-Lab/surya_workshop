@@ -1,23 +1,26 @@
-"""
-Balanced event / non-event sample selection for the SEP-from-PSP task.
+"""Balanced active / quiet sampling for the SEP-from-PSP task.
 
-The SHARP-to-PSP catalog has one row per (PSP hour, active region). Each row carries two
-clocks: ``time`` (when the particles arrive at PSP) and ``SHARP time`` (the solar-surface
-time about 3 days earlier, used to pick the Surya frame). The ISOIS event list is on the
-PSP clock, so event membership is always decided on ``time``.
+A sample is labelled by the SEP intensity at its PSP hour, with two thresholds and a gap
+between them:
 
-Selection, per data split:
+    intensity >  active_above   ->  ACTIVE   (is_event = 1)
+    intensity <  quiet_below    ->  QUIET    (is_event = 0)
+    anything in between         ->  DROPPED, never sampled
 
-1. Match every catalog row to the Surya frame at ``SHARP time`` (within a tolerance).
-2. **Event** candidates: up to ``max_frames_per_event`` rows per event, drawn in *rounds*.
-   Round 1 is the row whose PSP ``time`` is closest to the event's ``Max Time Lo``, inside
-   its Start-Finish window; round 2 adds the row furthest in PSP time from that one, and so
-   on. Events with no Max Time Lo, or with Max Time Lo outside the window, are skipped.
-3. **Non-event** candidates: rows whose PSP ``time`` is at least ``non_event_buffer`` away
-   from every event window.
-4. Draw N//2 events and the rest non-events at random (seeded). Event rounds are
-   consumed in order, so every event contributes one frame before any event contributes a
-   second — a bigger N reaches for a new event before it reuses one.
+The middle band is excluded on purpose: those hours are neither clearly an SEP enhancement
+nor clearly background, and including them on either side would blur exactly the contrast
+the task is about. Dropping them costs nothing -- the quiet class has candidates to spare.
+
+Two properties the rest of the app depends on:
+
+- **Draws are nested.** Each pool is shuffled once from the seeded RNG, in an order that
+  does not depend on ``n_samples``, and the draw is a prefix. So at one seed the 50-sample
+  training set is a strict subset of the 100-sample one, and a 50/100/200/500 ladder is one
+  growing dataset rather than four unrelated draws. Anything that makes a pool size or an
+  RNG draw depend on ``n_samples`` breaks this.
+- **One sample per Surya frame.** Several active regions share a PSP hour, and their rows
+  can match the same SDO frame; only the closest match is kept, so a frame is never in the
+  set twice.
 
 Everything here is a pure function of DataFrames, so it can be tested without Surya data.
 """
@@ -30,45 +33,11 @@ import numpy as np
 import pandas as pd
 
 PSP_TIME = "time"
-START, FINISH, MAX_LO = "Start (UTC)", "Finish (UTC)", "Max Time Lo (UTC)"
-EVENT_ID = "Event Number"
 
 # Catalog-side direction for pd.merge_asof. ds_match_direction is phrased from the Surya
 # side ("forward": the catalog time is at or after the Surya frame, i.e. causal), while
 # here the catalog is the left table, so each direction flips.
 _CATALOG_DIRECTION = {"forward": "backward", "backward": "forward", "nearest": "nearest"}
-
-
-def _parse_times(series: pd.Series) -> pd.Series:
-    """Parse the event list's hand-entered timestamps.
-
-    The file mixes formats ("10/2/2018 13:00:00", "12/17/24 20:52", "2023-01-02 7:24") and
-    has at least one "2023-01-04:11:09" typo, so a single fixed format does not work.
-    """
-    cleaned = series.astype("string").str.strip().str.replace(
-        r"^(\d{4}-\d{2}-\d{2}):", r"\1 ", regex=True
-    )
-    return pd.to_datetime(cleaned, format="mixed", errors="coerce")
-
-
-def load_event_list(path: str) -> pd.DataFrame:
-    """Load the ISOIS event list with parsed Start/Finish/Max Time Lo.
-
-    Rows whose Start or Finish is missing, or whose Finish is before Start, are dropped with
-    a warning: their window is unknown, so they can be used neither as events nor to decide
-    what counts as "outside all events". Fix them in the CSV to bring them back.
-    """
-    events = pd.read_csv(path)
-    for col in (START, FINISH, MAX_LO):
-        events[col] = _parse_times(events[col])
-
-    bad = events[START].isna() | events[FINISH].isna() | (events[FINISH] < events[START])
-    if bad.any():
-        warnings.warn(
-            f"Skipping {int(bad.sum())} event(s) with a missing or inverted Start/Finish "
-            f"window: {events.loc[bad, EVENT_ID].tolist()}"
-        )
-    return events.loc[~bad].reset_index(drop=True)
 
 
 def match_catalog_to_surya(
@@ -107,150 +76,87 @@ def match_catalog_to_surya(
     return matched.reset_index(drop=True)
 
 
-def _pick_frames(in_window: pd.DataFrame, max_lo, k: int, rng) -> list:
-    """Up to ``k`` rows from one event window, each far in PSP time from the ones before it.
-
-    The first pick is the row closest to ``Max Time Lo`` (ties broken at random), so ``k=1``
-    is the single most representative frame for the event. Each later pick maximizes the
-    gap to everything already picked, which spreads repeat frames across the window instead
-    of taking the next hour along — adjacent frames would be near-identical solar images.
-    """
-    # One row per Surya frame: several active regions can map to the same frame, and the
-    # closest SHARP match is the one to keep.
-    pool = in_window.sort_values("index_delta", kind="stable").drop_duplicates("valid_indices")
-    gap = (pool[PSP_TIME] - max_lo).abs()
-    closest = pool[gap == gap.min()]
-    first = closest.iloc[rng.integers(len(closest))]
-
-    picks = [first]
-    pool = pool.drop(index=first.name)
-    while len(picks) < k and len(pool) > 0:
-        taken = np.array([p[PSP_TIME].to_datetime64() for p in picks])
-        distance = np.abs(pool[PSP_TIME].to_numpy()[:, None] - taken[None, :]).min(axis=1)
-        nxt = pool.iloc[int(distance.argmax())]
-        picks.append(nxt)
-        pool = pool.drop(index=nxt.name)
-    return picks
+def _one_row_per_frame(rows: pd.DataFrame) -> pd.DataFrame:
+    """Collapse to one row per Surya frame, keeping the closest catalog match."""
+    return rows.sort_values("index_delta", kind="stable").drop_duplicates("valid_indices")
 
 
-def event_candidates(
+def active_candidates(
+    matched: pd.DataFrame, label_column: str, active_above: float
+) -> pd.DataFrame:
+    """Rows whose intensity is above ``active_above``, one per Surya frame."""
+    return _one_row_per_frame(matched[matched[label_column] > active_above]).reset_index(drop=True)
+
+
+def quiet_candidates(
     matched: pd.DataFrame,
-    events: pd.DataFrame,
-    rng,
-    max_frames_per_event: int = 1,
+    label_column: str,
+    quiet_below: float,
+    active_above: float,
+    buffer: str = "1d",
 ) -> pd.DataFrame:
-    """Up to ``max_frames_per_event`` catalog rows per event, ordered in rounds.
+    """Rows below ``quiet_below`` and at least ``buffer`` in PSP time from any active hour.
 
-    The ``frame_round`` column records which round a row came from: round 1 holds one row
-    per event (the frame closest to Max Time Lo), round 2 a second frame per event, and so
-    on. Rows come back sorted by round, so a caller that takes a prefix exhausts every
-    event before reusing one. A Surya frame belongs to a single sample — where two events
-    would claim the same frame, the earlier round keeps it.
+    The buffer is what keeps the two classes apart in time as well as in value: the hours
+    on the flank of an SEP enhancement are below the quiet threshold while the Sun is still
+    in the state that produced it, so an SDO frame taken there looks active while its label
+    says quiet. ``buffer`` is measured against every active hour in ``matched``, not only
+    the ones that end up sampled.
     """
-    usable = events.dropna(subset=[MAX_LO])
-    usable = usable[(usable[MAX_LO] >= usable[START]) & (usable[MAX_LO] <= usable[FINISH])]
-
-    rows = []
-    for _, event in usable.iterrows():
-        in_window = matched[
-            (matched[PSP_TIME] >= event[START]) & (matched[PSP_TIME] <= event[FINISH])
-        ]
-        if in_window.empty:
-            continue  # no Surya frame for this event in this split
-        for round_number, row in enumerate(
-            _pick_frames(in_window, event[MAX_LO], max_frames_per_event, rng), start=1
-        ):
-            row = row.copy()
-            row["event_number"] = event[EVENT_ID]
-            row["frame_round"] = round_number
-            rows.append(row)
-
-    columns = list(matched.columns) + ["event_number", "frame_round"]
-    out = pd.DataFrame(rows, columns=columns)
-    out = out.sort_values("frame_round", kind="stable").drop_duplicates("valid_indices")
-    return out.reset_index(drop=True)
-
-
-def non_event_candidates(
-    matched: pd.DataFrame, events: pd.DataFrame, buffer: str = "1d"
-) -> pd.DataFrame:
-    """Rows whose PSP ``time`` is at least ``buffer`` away from every event window."""
-    pad = pd.Timedelta(buffer)
-    psp = matched[PSP_TIME].to_numpy()
-    near_event = np.zeros(len(matched), dtype=bool)
-    for start, finish in zip(events[START] - pad, events[FINISH] + pad):
-        near_event |= (psp >= start.to_datetime64()) & (psp <= finish.to_datetime64())
-    out = matched.loc[~near_event].copy()
-    out["event_number"] = ""
-    out["frame_round"] = 0  # 0 = not drawn from an event window
-    return out.reset_index(drop=True)
+    quiet = matched[matched[label_column] < quiet_below]
+    active_times = matched.loc[matched[label_column] > active_above, PSP_TIME].to_numpy()
+    if len(active_times) and len(quiet):
+        pad = pd.Timedelta(buffer).to_timedelta64()
+        gap = np.abs(quiet[PSP_TIME].to_numpy()[:, None] - active_times[None, :]).min(axis=1)
+        quiet = quiet.loc[gap >= pad]
+    return _one_row_per_frame(quiet).reset_index(drop=True)
 
 
 def sample_balanced(
     matched: pd.DataFrame,
-    events: pd.DataFrame,
     n_samples: int | None,
     seed: int,
+    label_column: str,
+    active_above: float,
+    quiet_below: float,
     non_event_buffer: str = "1d",
-    max_frames_per_event: int = 1,
 ) -> pd.DataFrame:
-    """Draw a half-event / half-non-event sample, one row per Surya frame.
+    """Draw a half-active / half-quiet sample, one row per Surya frame.
 
-    ``n_samples`` gives N//2 events and N - N//2 non-events (an odd extra is a non-event).
-    ``n_samples=None`` uses every event candidate plus the same number of non-events.
+    ``n_samples`` gives N//2 active and N - N//2 quiet rows (an odd extra is quiet).
+    ``n_samples=None`` uses every active candidate plus the same number of quiet ones.
 
-    ``max_frames_per_event`` is the ceiling on how many Surya frames one event may
-    contribute. With the default of 1 the event samples are one per event and fully
-    independent; raising it lets the draw grow past the number of distinct events in the
-    split by taking a second (then third, ...) frame from each event window, spread as far
-    apart in PSP time as the window allows. Those extra frames are repeat views of an event
-    already in the set, not new events, so the draw warns when it reaches into round 2.
+    Each pool is shuffled once, independently of ``n_samples``, and the draw is a prefix of
+    that shuffle -- so at a fixed seed a smaller draw is a strict subset of a larger one,
+    which is what makes a 50/100/200 learning curve a nested sequence of training sets.
 
-    Rounds are consumed in order and every pool is shuffled once per round, independently
-    of ``n_samples`` — so at a fixed seed the draw for a smaller ``n_samples`` is a strict
-    prefix of the draw for a larger one. That is what makes a 50/100/200 learning curve a
-    nested sequence of training sets rather than three unrelated draws.
-
-    If the split runs out of candidates the balance is still held and a warning reports the
-    shortfall. Returns the selected rows with ``is_event`` (0/1), ``event_number`` and
-    ``frame_round`` columns.
+    If a split runs out of candidates the balance is still held and a warning reports the
+    shortfall -- worth reading, because the active pool is the scarce one and a split can
+    be far smaller than requested. Returns the selected rows with an ``is_event`` column
+    (1 = active, 0 = quiet).
     """
     rng = np.random.default_rng(seed)
-    ev = event_candidates(matched, events, rng, max_frames_per_event)
-    # A non-event may not reuse a Surya frame already chosen as an event.
-    non = non_event_candidates(matched, events, non_event_buffer)
-    non = non[~non["valid_indices"].isin(ev["valid_indices"])].drop_duplicates("valid_indices")
+    act = active_candidates(matched, label_column, active_above)
+    quiet = quiet_candidates(matched, label_column, quiet_below, active_above, non_event_buffer)
+    # A quiet sample may not reuse a Surya frame already available as an active one.
+    quiet = quiet[~quiet["valid_indices"].isin(act["valid_indices"])]
 
-    # Shuffle inside each round, then keep the rounds in order: a larger draw reaches for
-    # an unused event before it takes a second frame from one it already has.
-    if len(ev):
-        ev = pd.concat(
-            [g.iloc[rng.permutation(len(g))] for _, g in ev.groupby("frame_round", sort=True)],
-            ignore_index=True,
-        )
-    non = non.iloc[rng.permutation(len(non))].reset_index(drop=True)
+    act = act.iloc[rng.permutation(len(act))].reset_index(drop=True)
+    quiet = quiet.iloc[rng.permutation(len(quiet))].reset_index(drop=True)
 
-    n_event_wanted = len(ev) if n_samples is None else n_samples // 2
-    n_event = min(n_event_wanted, len(ev))
-    n_extra = 0 if n_samples is None or n_event < n_event_wanted else n_samples % 2
-    n_non = min(n_event + n_extra, len(non))
+    n_active_wanted = len(act) if n_samples is None else n_samples // 2
+    n_active = min(n_active_wanted, len(act))
+    n_extra = 0 if n_samples is None or n_active < n_active_wanted else n_samples % 2
+    n_quiet = min(n_active + n_extra, len(quiet))
 
-    if n_event < n_event_wanted or n_non < n_event + n_extra:
+    if n_active < n_active_wanted or n_quiet < n_active + n_extra:
         warnings.warn(
-            f"Requested {n_samples} samples but only {len(ev)} event and {len(non)} "
-            f"non-event candidates exist; using {n_event} events + {n_non} non-events."
+            f"Requested {n_samples} samples ({label_column} > {active_above} vs "
+            f"< {quiet_below}) but only {len(act)} active and {len(quiet)} quiet frames "
+            f"exist in this split; using {n_active} active + {n_quiet} quiet."
         )
 
-    picked_ev = ev.iloc[:n_event].assign(is_event=1)
-    picked_non = non.iloc[:n_non].assign(is_event=0)
-
-    if n_event and int(picked_ev["frame_round"].max()) > 1:
-        distinct = picked_ev["event_number"].nunique()
-        warnings.warn(
-            f"{n_event} event samples drawn from {distinct} distinct events "
-            f"(up to {int(picked_ev['frame_round'].max())} frames per event). The "
-            f"{n_event - distinct} samples beyond the first {distinct} are further frames "
-            f"from an event already in the set, not new events."
-        )
-
-    return pd.concat([picked_ev, picked_non], ignore_index=True)
+    return pd.concat(
+        [act.iloc[:n_active].assign(is_event=1), quiet.iloc[:n_quiet].assign(is_event=0)],
+        ignore_index=True,
+    )

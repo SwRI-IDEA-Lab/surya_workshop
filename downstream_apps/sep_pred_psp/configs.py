@@ -37,19 +37,15 @@ class SepPspDSDataConfig(DataConfig):
     """
     # Path to the label catalog (relative paths resolve against the config file's dir).
     sep_psp_index_path: str = ""
-    # PSP/ISOIS SEP event list; decides which samples are events vs. non-events.
-    event_list_path: str = ""
     # Held-out Surya index for final evaluation (not used during training).
     test_data_path: str = ""
-    # Minimum PSP-time gap between a non-event sample and any event window.
+    # Minimum PSP-time gap between a quiet sample and any active hour.
     non_event_buffer: str = "1d"
-    # Ceiling on how many Surya frames a single SEP event may contribute to a split.
-    # 1 keeps every event sample independent, but then a split can never hold more event
-    # samples than it has events (95 train / 11 val here, so 190 / 22 balanced samples).
-    # Raising it lets a draw grow past that by taking a second, third, ... frame from each
-    # event window, spread as far apart in PSP time as the window allows. Those frames are
-    # further views of an event already in the set, not new events.
-    max_frames_per_event: int = 1
+    # Thresholds on label_column (in its own units) that define the two classes. Frames
+    # between them are dropped, so the classes stay separated by a gap rather than by a
+    # single cut through the middle of the distribution.
+    active_above: float = 1.0
+    quiet_below: float = 0.1
     # Catalog column used as the training label. "Jlinlin" is smoothed in time
     # (~0.02 dex hour to hour); "Jlinlin_raw" is unsmoothed (~0.12 dex). Both span ~6
     # decades, so they are log10-z-scored by datasets/label_transform.py before training.
@@ -65,7 +61,6 @@ class SepPspDSDataConfig(DataConfig):
     # relative-to-the-config-file resolution. Extend this whenever you add a path field.
     PATH_FIELDS: ClassVar[tuple[str, ...]] = DataConfig.PATH_FIELDS + (
         "sep_psp_index_path",
-        "event_list_path",
         "test_data_path",
     )
 

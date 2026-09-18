@@ -52,31 +52,23 @@ data:
   ds_time_tolerance: 4d           # Max allowed gap between catalog and Surya timestamps
   ds_match_direction: forward     # "forward": use solar state *before* the event (causal)
 
-  # -- Event / non-event sampling (PSP/ISOIS event list, compared on PSP `time`) --
-  event_list_path: ../data/psp_isois_eventlist_vSurya.csv
+  # -- Active / quiet sampling (thresholds on the label itself, at the sample's PSP hour) --
   # Label column, log10-z-scored before training (see datasets/label_transform.py).
   # Jlinlin     : smoothed in PSP time (~0.02 dex hour to hour)
   # Jlinlin_raw : unsmoothed (~0.12 dex) -- noisier, but free of processing whose
   #               provenance (and whether it peeks forward in time) is undocumented.
   label_column: Jlinlin_raw
-  non_event_buffer: 1d            # Non-events must be at least this far from every event window
+  # A frame is ACTIVE above active_above and QUIET below quiet_below, both in the label
+  # column's own units (before the log10 + z-score). The band between them is dropped, so
+  # the two classes are separated by a gap instead of by one cut through the middle of the
+  # distribution. Frames available at these thresholds (one row per Surya frame):
+  #   train 2020/21/23/24 : 762 active / 8,320 quiet  -> a balanced draw caps at ~1,524
+  #   val   2022 Jan-Jul  :  12 active /   981 quiet  -> caps at 24  (2022 was quiet)
+  #   test  2022 Aug-Dec  : 105 active / 1,641 quiet  -> caps at 210
+  active_above: 1.0
+  quiet_below: 0.1
+  non_event_buffer: 1d            # Quiet samples must be this far in PSP time from any active hour
 
-  # Ceiling on how many Surya frames a single SEP event may contribute.
-  #
-  # The binding constraint on this task is the number of distinct events, not the number of
-  # SDO frames: only 124 of the 349 catalogued SEP events have any row in
-  # SHARP_to_PSP_times.csv inside their PSP-time window, and those split 95 train / 11 val /
-  # 13 test. At 1 frame per event a balanced draw therefore caps at 190 train / 22 val.
-  #
-  # Above 1, a draw that runs out of events goes back for a second frame from each event
-  # window, chosen as far in PSP time from the frames already taken as the window allows.
-  # Every event contributes one frame before any contributes two, so the extra samples are
-  # only ever the "cheapest" ones. They are further views of an event already in the set —
-  # more input variety and a different Jlinlin label, but NOT new events. sample_balanced()
-  # warns when a draw reaches into a second round so this never happens silently.
-  #
-  # 4 is what the 50/100/200/500 train ladder and the fixed 50-sample val set need.
-  max_frames_per_event: 4
 
   # -- Local data (only needed when the index contains relative local paths) --
   # sdo_data_root_path: /path/to/sdo   # Prepended to relative local paths; ignored for s3://
@@ -133,14 +125,16 @@ data:
   # and every run is still scored on the same fixed validation set, so the curve measures
   # the effect of training data and nothing else.
   #
-  # Each is N//2 events + N - N//2 non-events (null = all events + as many non-events).
+  # Each is N//2 active + N - N//2 quiet (null = every active frame + as many quiet ones).
   # The draw is a seeded prefix of a fixed shuffle, so at one seed the 50-sample training
   # set is a strict subset of the 100-sample one — the ladder is nested, not three
   # unrelated draws.
   max_samples: 100                # TRAIN. This is the knob to sweep.
-  max_val_samples: 50             # VAL. 25 events + 25 non-events, drawn from the 11
-                                  # distinct events in the 2022 Jan-Jul split (so ~2-3
-                                  # frames per event). Leave this pinned across runs.
+  max_val_samples: 24             # VAL. 12 active + 12 quiet -- the whole of what the
+                                  # 2022 Jan-Jul split can supply, since it holds only 12
+                                  # frames above active_above. Asking for more does not
+                                  # fail, it just warns and returns these same 24, so this
+                                  # is the honest number. Leave it pinned across runs.
 
 
 # -----------------------------------------------------------------------------

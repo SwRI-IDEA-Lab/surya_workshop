@@ -126,26 +126,40 @@ Never assume one is the other; the reference block is at the top of `workshop_in
 
 Assets download on first run via `workshop_infrastructure/assets.py:ensure_assets()`. The two `download_*.sh` scripts are thin wrappers over its CLI.
 
-### Event sampling (`sep_pred_psp`)
+### Active / quiet sampling (`sep_pred_psp`)
 
-`downstream_apps/sep_pred_psp/datasets/event_sampling.py` draws a half-event / half-non-event
-sample per split. Two properties the rest of the app depends on:
+`downstream_apps/sep_pred_psp/datasets/event_sampling.py` draws a half-active / half-quiet
+sample per split, classified by **the label itself** at the sample's PSP hour — there is no
+event list any more:
 
-- **The ceiling is events, not frames.** Only 124 of the 349 catalogued SEP events have any
-  row in `SHARP_to_PSP_times.csv` inside their PSP-time window; they split 95 train / 11 val
-  / 13 test. At one frame per event a balanced draw therefore caps at **190 train / 22 val**.
-  `data.max_frames_per_event` lifts that: a draw that exhausts the events returns for a
-  second frame from each window, picked as far in PSP time from the frames already taken as
-  the window allows. Rounds are consumed in order, so every event contributes one frame
-  before any contributes two. Those extra samples are further views of an event already in
-  the set, **not new events** — `sample_balanced()` warns whenever a draw reaches round 2,
-  and `frame_round` on each sample records which round it came from. Judge a run by the
-  distinct-event count, not the sample count.
-- **Draws are nested.** Each pool is shuffled once per round from the seeded RNG, in an order
-  that does not depend on `n_samples`, and the draw is a prefix. So at one seed the
-  50-sample training set is a strict subset of the 100-sample one, and a 50/100/200/500
-  ladder is one growing dataset rather than four unrelated draws. Anything that makes a pool
-  size or an RNG draw depend on `n_samples` breaks this.
+```
+label >  data.active_above (1.0)  -> active (is_event = 1)
+label <  data.quiet_below  (0.1)  -> quiet  (is_event = 0)
+in between                        -> dropped, never sampled
+```
+
+Both thresholds are in `data.label_column`'s own units, i.e. **before** the log10 + z-score.
+Three properties the rest of the app depends on:
+
+- **The band between the thresholds is dropped on purpose.** Those hours are neither a clear
+  enhancement nor clear background, so putting them on either side would blur the contrast
+  the task is about. The quiet class has candidates to spare, so this costs nothing.
+- **The scarce class is the active one, and a split can be far smaller than requested.** One
+  row per Surya frame at the default thresholds: train (2020/21/23/24) **762 active / 8,320
+  quiet**, val (2022 Jan–Jul) **12 / 981**, test (2022 Aug–Dec) **105 / 1,641**. A balanced
+  draw therefore caps at ~1,524 train but only **24 val** — 2022 was a quiet year.
+  `sample_balanced()` warns whenever it cannot fill the request; read that warning rather
+  than assuming `max_samples` is what you got.
+- **Draws are nested.** Each pool is shuffled once from the seeded RNG, in an order that does
+  not depend on `n_samples`, and the draw is a prefix. So at one seed the 50-sample training
+  set is a strict subset of the 100-sample one, and a 50/100/200/500 ladder is one growing
+  dataset rather than four unrelated draws. Anything that makes a pool size or an RNG draw
+  depend on `n_samples` breaks this.
+
+`data.non_event_buffer` additionally keeps quiet samples at least that far in PSP time from
+**any** active hour: the flank of an enhancement is below the quiet threshold while the Sun
+is still in the state that produced it, so an SDO frame taken there looks active while its
+label says quiet.
 
 ### Label normalization (`sep_pred_psp`)
 
