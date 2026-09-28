@@ -17,7 +17,6 @@ class FlareDSDataset(HelioNetCDFDataset):
     Additional Args:
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
             Set to False to return only the flare intensity label (useful for label inspection).
-        max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
         label_transform: Optional callable applied to the ``intensity`` column of the flare index
             to produce the ``normalized_intensity`` label. Signature:
             ``(series: pd.Series) -> pd.Series``.  If ``None``, the raw intensity values are
@@ -35,11 +34,15 @@ class FlareDSDataset(HelioNetCDFDataset):
             between the Surya and DS indices within the specified tolerance.
     """
 
+    # This class rebuilds valid_indices from the flare join below, so the base class must
+    # not cap the index before that join happens -- otherwise which flares are matched
+    # would depend on the cap. _apply_subsample() is called at the end of __init__ instead.
+    SUBSAMPLE_IN_BASE_INIT = False
+
     def __init__(
         self,
         # Downstream-specific parameters
         return_surya_stack: bool = True,
-        max_number_of_samples: int | None = None,
         label_transform: Callable[[pd.Series], pd.Series] | None = None,
         ds_flare_index_path: str | None = None,
         ds_time_column: str | None = None,
@@ -112,10 +115,13 @@ class FlareDSDataset(HelioNetCDFDataset):
         self.adjusted_length = len(self.valid_indices)
         self.df_valid_indices.set_index("valid_indices", inplace=True)
 
-        if max_number_of_samples is not None and max_number_of_samples < self.adjusted_length:
-            self.valid_indices = self.valid_indices[:max_number_of_samples]
-            self.df_valid_indices = self.df_valid_indices.iloc[:max_number_of_samples]
-            self.adjusted_length = max_number_of_samples
+        # The index is final now, so apply the size cap the builders passed down. The
+        # base class picks a seeded random subset (see HelioNetCDFDataset._apply_subsample)
+        # and hands back the positions it kept, so the label frame stays row-aligned with
+        # valid_indices -- __getitem__ indexes both by the same integer.
+        keep = self._apply_subsample()
+        if keep is not None:
+            self.df_valid_indices = self.df_valid_indices.iloc[keep]
 
     def __len__(self):
         return self.adjusted_length

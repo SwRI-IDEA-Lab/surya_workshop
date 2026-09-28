@@ -220,8 +220,17 @@ class DataConfig:
     # pretrained spectral filters to the smaller token grid.
     pooling: int = 1
 
-    # --- Development ---
+    # --- Dataset size ---
+    # Train and validation are capped independently so a data-scaling study can vary the
+    # training set while every run is scored on the *same* validation set. max_samples is
+    # a shorthand that sets both when the specific keys are not given.
+    #
+    # The subset is a prefix of a seeded permutation, so it is a random sample of the
+    # whole index (not the earliest N timesteps) and smaller subsets nest inside larger
+    # ones: the 100-sample run trains on a subset of the 1000-sample run's data.
     max_samples: Optional[int] = None
+    max_train_samples: Optional[int] = None
+    max_val_samples: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.s3_mode not in VALID_S3_MODES:
@@ -239,6 +248,12 @@ class DataConfig:
                 f"data.pooling ({self.pooling}) must divide data.native_img_size "
                 f"({self.native_img_size}) exactly."
             )
+        # The shorthand fills in only what was left unset, so specifying one of the two
+        # explicitly alongside max_samples does what it reads like.
+        if self.max_train_samples is None:
+            self.max_train_samples = self.max_samples
+        if self.max_val_samples is None:
+            self.max_val_samples = self.max_samples
 
 
 @dataclass

@@ -421,7 +421,11 @@ class HelioNetCDFDataset(Dataset):
         s3_boto3_max_concurrency: int = 4,
         s3_boto3_part_size_mb: int = 64,
         load_forecast_frames: bool = True,
+        max_number_of_samples: int | None = None,
+        subsample_seed: int = 42,
     ):
+        self.max_number_of_samples = max_number_of_samples
+        self.subsample_seed = subsample_seed
         self.scalers = scalers
         self.phase = phase
         self.num_mask_aia_channels = num_mask_aia_channels
@@ -519,9 +523,46 @@ class HelioNetCDFDataset(Dataset):
         self._epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
         self._sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
 
+        if self.SUBSAMPLE_IN_BASE_INIT:
+            self._apply_subsample()
+
     # ------------------------------------------------------------------
     # Index filtering
     # ------------------------------------------------------------------
+
+    # A subclass that rebuilds ``valid_indices`` after ``super().__init__()`` -- e.g. by
+    # joining a label catalog against it -- must set this to False and call
+    # ``_apply_subsample()`` itself once its index is final. Subsampling before the join
+    # would cap the timesteps rather than the labelled samples, so which events survive
+    # would depend on the cap.
+    SUBSAMPLE_IN_BASE_INIT: bool = True
+
+    def _apply_subsample(self) -> np.ndarray | None:
+        """Cap the dataset at ``max_number_of_samples`` entries, chosen reproducibly.
+
+        The subset is the first ``n`` entries of a seeded permutation of the whole index,
+        re-sorted into chronological order. Two properties follow, and both matter for a
+        data-scaling experiment:
+
+        * It is a **random sample** of the index, not its earliest ``n`` timesteps. A
+          head-of-list cap would train every small run on the same few days of one month.
+        * Subsets **nest**: with the same seed, the 100-sample subset is contained in the
+          1000-sample one, so the curve measures the effect of adding data rather than
+          the effect of swapping it.
+
+        Returns:
+            The positions kept, as an index array into the pre-subsample ``valid_indices``
+            (sorted ascending), or ``None`` if no cap applied. Subclasses use it to subset
+            any parallel structure they keep alongside ``valid_indices``.
+        """
+        n = self.max_number_of_samples
+        if n is None or n >= self.adjusted_length:
+            return None
+        rng = np.random.default_rng(self.subsample_seed)
+        keep = np.sort(rng.permutation(self.adjusted_length)[:n])
+        self.valid_indices = [self.valid_indices[i] for i in keep]
+        self.adjusted_length = len(self.valid_indices)
+        return keep
 
     def _filter_valid_indices(self) -> list:
         """Return the list of reference timesteps for which all required offsets are present.
