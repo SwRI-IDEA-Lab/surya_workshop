@@ -28,11 +28,13 @@ downstream_apps/template/
 ├── datasets/
 │   └── template_dataset.py          ← FlareDSDataset (extends HelioNetCDFDataset)
 ├── lightning_modules/
-│   └── pl_simple_baseline.py        ← FlareLightningModule (Lightning wrapper)
+│   ├── pl_simple_baseline.py        ← FlareLightningModule (Lightning wrapper)
+│   └── pl_finetune.py               ← FlareFinetuneLightningModule (head/adapter LRs)
 ├── metrics/
 │   └── template_metrics.py          ← FlareMetrics (loss + evaluation metrics)
 └── models/
-    └── simple_baseline.py           ← RegressionFlareModel (linear baseline)
+    ├── simple_baseline.py           ← RegressionFlareModel (linear baseline)
+    └── finetune_model.py            ← FlareSuryaModel (Surya backbone + YOUR head)
 ```
 
 And what it *imports* rather than owning:
@@ -42,7 +44,8 @@ And what it *imports* rather than owning:
 | `configs.py` | `DataConfig`, `TrainingConfig`, `ModelConfig`, `load_config()` — the whole config layer |
 | `datasets/helio.py` | `HelioNetCDFDataset` — NetCDF loading, local + S3, normalization, frame sampling |
 | `datasets/builders.py` | `build_helio_dataloaders()` — maps your config onto ~20 dataset arguments |
-| `models/finetune_models.py` | `HelioSpectformer1D` / `HelioSpectformer2D` — backbone plus a configurable head |
+| `models/finetune_models.py` | `build_surya_backbone()` — the backbone; plus `HelioSpectformer1D`/`2D` reference heads |
+| `models/weight_adaptation.py` | Converts pretrained weights when you change resolution or frame count |
 | `utils.py` | `build_scalers()`, `apply_peft_lora()`, `discover_head_modules()`, `load_pretrained_weights()`, S3 checkpoint upload |
 
 ---
@@ -192,36 +195,62 @@ The dict keys become the metric names in WandB and CSV logs.
 
 ## Step 5 — Define your model head (`models/`)
 
-For 1D output tasks (regression, classification): use `HelioSpectformer1D` from
-`workshop_infrastructure/models/finetune_models.py`. It wraps the Surya backbone with a
-configurable pooling head and a linear output layer.
+**File to edit:** `models/finetune_model.py`.
 
-For 2D output tasks (pixel-level prediction): use `HelioSpectformer2D`.
+`FlareSuryaModel` is the app's own fine-tuning model, and it is the counterpart of
+`simple_baseline.py`: the backbone comes from `build_surya_backbone()` in the
+infrastructure (nobody should re-type Surya's 18 constructor arguments), and everything
+after it — the pooling, the head layers, the forward pass — is in your app for you to
+edit. **Changing the architecture never requires touching `workshop_infrastructure/`.**
 
-The head is fully configured from the YAML `model:` section — you usually don't need to
-touch the model code at all, just adjust the config:
+```python
+class FlareSuryaModel(nn.Module):
+    def __init__(self, model_cfg, num_outputs=1, **backbone_overrides):
+        super().__init__()
+        self.backbone = build_surya_backbone(model_cfg, nglo=0, **backbone_overrides)
+        # ---- yours ----
+        self.head_linear  = nn.Linear(model_cfg.embed_dim, model_cfg.embed_dim)
+        self.head_dropout = nn.Dropout(model_cfg.dropout)
+        self.head_unembed = nn.Linear(model_cfg.embed_dim, num_outputs)
 
-```yaml
-model:
-  pooling: class_token        # class_token | global_average | global_max | attention | transformer
-  penultimate_linear_layer: true
-  dropout: 0.2
-  freeze_backbone: false
-  use_lora: true
-  lora_config:
-    r: 8
-    lora_alpha: 8
-    target_modules: [fc1, fc2, attn.qkv, attn.proj]
-    ...
+    def pool(self, tokens):          # (B, L, D) -> (B, D)
+        return tokens.mean(dim=1)
 ```
 
-`use_lora` and `freeze_backbone` together select the fine-tuning regime:
+The default is mean pooling over the patch tokens (`model.pooling: global_average`),
+because it adds no parameters and every token gets gradient from the first step — whereas
+a class token has to learn what to attend to before it contributes anything, which a
+short fine-tune on a few hundred samples may never reach. Swapping the pooling is one
+method. `HelioSpectformer1D` in `workshop_infrastructure/models/finetune_models.py` has
+working implementations of all five variants (`global_average`, `global_max`,
+`class_token`, `attention`, `transformer`) to copy from; note that `class_token` also
+needs `nglo=1` and `backbone.forward_with_cls_token()`.
 
-| `use_lora` | `freeze_backbone` | Regime | Trainable |
+For 2D output tasks (pixel-level prediction), `HelioSpectformer2D` is the equivalent
+starting point.
+
+### The optimizer: `lightning_modules/pl_finetune.py`
+
+`FlareFinetuneLightningModule` subclasses the baseline module and overrides only
+`configure_optimizers`. Under LoRA the model holds two populations of parameters: the
+adapters, which start as a near-identity perturbation of a backbone that already works,
+and the head, which starts *random*. One learning rate cannot serve both — low enough for
+the adapters and the head crawls, high enough for the head and the adapters shove the
+pretrained features around in the first few steps. `training.head_lr_multiplier` (default
+10) gives the head a larger rate; `training.weight_decay` applies to the adapters only,
+where pulling toward zero means pulling toward the *pretrained* weights.
+
+Set `head_lr_multiplier: 1.0` and `weight_decay: 0.0` to get plain Adam over everything.
+
+### Fine-tuning regimes
+
+`use_lora` and `freeze_backbone` together select the regime:
+
+| `use_lora` | `freeze_backbone` | Regime | Trainable (1024² config) |
 |---|---|---|---|
-| `true` | ignored | LoRA adapters on FFN + attention, **plus the whole head** (default) | 3,157,761 |
-| `false` | `true` | Linear probe — only the head trains | 1,642,241 |
-| `false` | `false` | Full fine-tuning of all 366M parameters | ~366M |
+| `true` | ignored | LoRA adapters on FFN + attention, **plus the whole head** (default) | 3,156,481 |
+| `false` | `true` | Linear probe — only the head trains | 1,640,961 |
+| `false` | `false` | Full fine-tuning | ~201M |
 
 `freeze_backbone` has no effect when `use_lora: true`: PEFT freezes every parameter and
 then re-enables the adapters and the head regardless.
@@ -317,6 +346,46 @@ to the dataclasses:
 | `output:` | `OutputConfig` | `cfg.output.*` |
 | `logging:` | flat fields on `TrainingConfig` | `cfg.wandb_project`, `cfg.wandb_entity` |
 
+Adding a `training:` or `logging:` key is one edit — declare the field on `TrainingConfig`
+in `workshop_infrastructure/configs.py`. The accepted key list is derived from the
+dataclass, so it cannot fall out of sync. A `data:` key goes on your `DataConfig` subclass.
+
+### Resolution: `data.pooling` and `model.img_size`
+
+`data.pooling` average-pools each frame before normalization, so the model sees
+`native_img_size // pooling` pixels. It is the main memory and speed knob, because the
+token count falls with its square. Measured on one A100 (LoRA, bf16-mixed):
+
+| `pooling` | frames | tokens | batch | peak VRAM | s/sample |
+|---|---|---|---|---|---|
+| 1 | 4096² | 65536 | 2 | 28.6 GB | 1.72 |
+| 2 | 2048² | 16384 | 8 | 27.9 GB | 0.40 |
+| **4** | **1024²** | **4096** | **16** | **14.3 GB** | **0.099** |
+| 4 | 1024² | 4096 | 32 | 27.7 GB | 0.099 |
+
+`model.img_size` must equal `native_img_size // pooling`; the config load checks it, so a
+mismatch is a named error rather than a reshape failure inside the first forward pass.
+
+Lowering the resolution does **not** throw the pretrained model away.
+`load_pretrained_weights()` restricts the two spectral-gating filters to the smaller
+token grid instead of dropping them (~170M parameters). The token grid always spans the
+same field of view, so mode *m* is the same physical spatial frequency at any resolution
+and the conversion is a truncation to the frequencies the smaller grid can represent —
+see `workshop_infrastructure/models/weight_adaptation.py`.
+
+Pooling saves GPU memory and compute, **not** download time: the full 4096×4096 array is
+read from S3 first and pooled after.
+
+### Dataset size: separate train and validation caps
+
+`data.max_train_samples` and `data.max_val_samples` are independent, so you can vary the
+amount of training data and score every run on the same validation set. The subset is a
+seeded random sample (not the earliest *N* events) and subsets **nest**: with the same
+`training.seed`, the 50-sample run's data is a subset of the 200-sample run's, so the
+difference between two points on a scaling curve is *more* data, not *different* data.
+
+`data.max_samples` is a shorthand that sets both when the specific keys are absent.
+
 ---
 
 ## Reproducibility
@@ -392,10 +461,18 @@ CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.your_task.3_finetune_template_1
 # Reproducible run, for comparing a change against a baseline (~20% slower)
 CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.your_task.3_finetune_template_1D \
     --deterministic warn
+
+# Data-scaling sweep: the validation set is capped separately and stays fixed
+for n in 25 50 100 200; do
+  CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.your_task.3_finetune_template_1D \
+      --max-train-samples $n --deterministic warn
+done
 ```
 
-Set `max_samples: 10` in the YAML while developing — it limits the dataset so data loading
-is fast without changing anything else.
+Set `max_train_samples: 8` in the YAML while developing — it limits the dataset so data
+loading is fast without changing anything else. Every sample is a ~1 GB download the
+first time it is seen, so a small cap is the difference between a 30-second iteration
+and a 20-minute one.
 
 ---
 

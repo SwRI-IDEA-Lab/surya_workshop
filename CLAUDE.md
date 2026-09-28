@@ -36,11 +36,17 @@ Python 3.12+ required. Key dependencies: PyTorch, PyTorch Lightning, PEFT (LoRA)
 # Fine-tune a downstream model (from repo root).
 # --config defaults to the app's own configs/config_script.yaml.
 CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
-  --batch-size 2 --max-epochs 20
+  --batch-size 16 --max-epochs 20
 
-# Quick sanity run: cap the dataset with max_samples in the YAML, then
+# Quick sanity run (every sample is a ~1 GB download the first time it is seen)
 CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D \
-  --max-epochs 2 --no-wandb
+  --max-epochs 2 --max-train-samples 8 --no-wandb
+
+# Data-scaling sweep: the validation set is capped separately and stays fixed
+for n in 25 50 100 200; do
+  CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D \
+    --max-train-samples $n --deterministic warn
+done
 
 # Benchmark S3 throughput to pick s3_boto3_* settings for this machine
 python -m workshop_infrastructure.benchmark_s3 \
@@ -52,7 +58,7 @@ isort .
 mypy .
 ```
 
-Run the test suite with `pytest tests/ -v` (currently `tests/test_lora_setup.py`, which is CPU-only and fast). For changes not covered by tests, verify by running the training script with `max_samples` capped (see above).
+Run the test suite with `pytest tests/ -v` (CPU-only and fast — about 30 s for the whole suite). For changes not covered by tests, verify by running the training script with `--max-train-samples` capped (see above).
 
 ## Architecture
 
@@ -71,8 +77,8 @@ Architecture: 2 spectral gating blocks + 8 long-short attention blocks.
 Each downstream task follows this pattern:
 - `configs.py` — a `DataConfig` subclass holding **only** the task-specific config fields. Everything generic (and `load_config()` itself) lives in `workshop_infrastructure/configs.py` and is never copied.
 - `datasets/` — task dataset inheriting from `HelioNetCDFDataset` (see `workshop_infrastructure/datasets/helio.py`)
-- `models/` — task-specific head
-- `lightning_modules/` — PyTorch Lightning wrapper with loss and metrics
+- `models/` — **both** models live in the app, not in infrastructure: `simple_baseline.py` (the linear baseline) and `finetune_model.py` (`FlareSuryaModel` = `build_surya_backbone()` + a head written out in app code). Changing the fine-tuning architecture must never require editing `workshop_infrastructure/`; `HelioSpectformer1D`/`2D` remain as reference implementations of all five pooling variants.
+- `lightning_modules/` — `pl_simple_baseline.py` holds the shared training mechanics; `pl_finetune.py` subclasses it and overrides `configure_optimizers` only, splitting the learning rate between the randomly-initialized head and the LoRA adapters (`training.head_lr_multiplier`, `training.weight_decay`)
 - `metrics/` — custom metric implementations. Four modes: `train_loss` (backpropagated), `val_loss` (**what ModelCheckpoint monitors**; defaults to `train_loss`), `train_metrics` and `val_metrics` (reported only — they do *not* select checkpoints)
 - `configs/config_script.yaml` — single YAML drives everything
 - `N_*.py` / `N_*.ipynb` — numbered scripts/notebooks for step-by-step workflow
@@ -100,9 +106,13 @@ Three regimes, selected from the `model:` config section:
 - `use_lora: false, freeze_backbone: true` — linear probe, head only
 - `use_lora: false, freeze_backbone: false` — full fine-tuning
 
-Trainable counts for the template config: LoRA 3,157,761 (1,515,520 adapters + 1,642,241 head); probe 1,642,241; full 366M. `tests/test_lora_setup.py` pins all of this.
+Trainable counts for the template config (`pooling: global_average`, `img_size: 1024`): LoRA 3,156,481 (1,515,520 adapters + 1,640,961 head); probe 1,640,961; full ~201M. The head is 1,280 smaller than under `class_token`, which owns a CLS token; the 201M total is the 366M backbone minus the spectral filters that shrink with the token grid. `tests/test_lora_setup.py` pins the module sets.
 
-`HelioSpectformer1D` derives the backbone's `nglo` argument from `pooling` internally (`1` for `class_token`, `0` otherwise) — it is not a config field. `ModelConfig`/`TrainingConfig` also validate several other cross-field invariants at config-load time (`img_size` vs `patch_size`, `spectral_blocks`/`checkpoint_layers` vs `depth`, `time_embedding.time_dim` vs `data.time_delta_input_minutes`, `training.deterministic` vs `model.learned_flow`, and `model.learned_flow` vs `time_embedding.type`) — see `ModelConfig.__post_init__` and `TrainingConfig.__post_init__` in `workshop_infrastructure/configs.py` for the current list, and add new ones there rather than leaving them as documentation-only footguns.
+`nglo_for_pooling()` in `finetune_models.py` derives the backbone's `nglo` argument from `pooling` (`1` for `class_token`, `0` otherwise) — it is not a config field. `build_surya_backbone(cfg.model, **overrides)` is the shared constructor app models call; it fixes `finetune=True` and defaults `nglo` from the pooling.
+
+The default pooling is **`global_average`**, not `class_token`: it adds no parameters and every token carries gradient from the first step, whereas a CLS token must learn what to attend to before it contributes — which a few-hundred-sample fine-tune may never reach. For `global_average` only, `HelioSpectformer1D.forward` and `FlareSuryaModel.forward` pool *before* `head_linear`, which is exactly equivalent (mean and an affine map commute) and applies the layer to one token instead of L. The reorder is **not** valid for any other pooling.
+
+`ModelConfig`/`TrainingConfig` also validate several other cross-field invariants at config-load time (`img_size` vs `patch_size`, `spectral_blocks`/`checkpoint_layers` vs `depth`, `time_embedding.time_dim` vs `data.time_delta_input_minutes`, `training.deterministic` vs `model.learned_flow`, `model.learned_flow` vs `time_embedding.type`, and `model.img_size` vs `data.native_img_size // data.pooling`) — see `ModelConfig.__post_init__` and `TrainingConfig.__post_init__` in `workshop_infrastructure/configs.py` for the current list, and add new ones there rather than leaving them as documentation-only footguns.
 
 ### Data Pipeline
 
@@ -110,9 +120,46 @@ Trainable counts for the template config: LoRA 3,157,761 (1,515,520 adapters + 1
 NetCDF files (SDO, 4096×4096, 13 channels, 12-min cadence)
   ↓ CSV index (path, timestamp, label)  ←  data/indices/
   ↓ HelioNetCDFDataset (local, or S3 via data.s3_mode: download | simplecache | stream)
+  ↓ Average pooling by data.pooling  →  native_img_size // pooling  (default 4 → 1024²)
   ↓ Signum-log normalization: sign(x)*log(1+|x|) per channel
-  ↓ DataLoader → HelioSpectformer1D → task head
+  ↓ DataLoader → FlareSuryaModel (build_surya_backbone + app head)
 ```
+
+**Resolution is the main VRAM/speed knob.** `data.pooling` average-pools each frame before
+normalization; the token count falls with its square. Measured on one A100 (LoRA,
+bf16-mixed, all layers checkpointed): pooling 1 → 4096², 65536 tokens, batch 2, 28.6 GB,
+1.72 s/sample; pooling 4 → 1024², 4096 tokens, batch 16, 14.3 GB, 0.099 s/sample — 17×
+faster per sample. `model.img_size` must equal `native_img_size // pooling`, validated at
+config load. Pooling saves GPU memory and compute, **not** download time: the full
+4096×4096 array is read from S3 first and pooled after.
+
+**Pretrained weights are adapted, not dropped.** `load_pretrained_weights()` used to skip
+every shape-mismatched key silently and print only a count. Two of them matter, together
+~170M of the 366M parameters:
+- `embedding.patch_embed.proj.weight` is a Conv2d over `in_chans * time_dim` = 26 channels
+  (13 × 2 frames). The template ships `time_dim: 1`, so **the tokenizer was randomly
+  initialized on every run**. `adapt_patch_embed_weight()` selects the most-recent-frame
+  slice (index `c * T + t`, keeping the tail of the time axis).
+- `blocks_spectral_gating.*.filter.complex_weight` is grid-shaped. Because the token grid
+  always spans the same field of view, mode *m* is the same physical spatial frequency at
+  any resolution, so `truncate_spectral_filter()` takes the low-|k| block in rfft2 layout
+  (rows `[0:N/2+1]` + `[-(N/2-1):]`, cols `[0:N/2+1]`). This is a restriction, not an
+  interpolation.
+
+Anything else that does not fit now **raises** rather than leaving a backbone tensor at its
+random initialization; pass `strict_shapes=False` to opt out deliberately. Both conversions
+live in `workshop_infrastructure/models/weight_adaptation.py` and are pinned by
+`tests/test_weight_adaptation.py`, including a numerical check that a band-limited signal
+is filtered identically at both resolutions.
+
+**Dataset size: `max_train_samples` and `max_val_samples` are separate**, so a data-scaling
+study varies the training set while every run is scored on the same validation set.
+`HelioNetCDFDataset._apply_subsample()` takes a prefix of a seeded permutation, so subsets
+are random *and* nested (the 50-sample subset is contained in the 200-sample one). A
+subclass that rebuilds `valid_indices` after `super().__init__()` — as `FlareDSDataset`
+does, joining the flare catalog — sets `SUBSAMPLE_IN_BASE_INIT = False` and calls
+`_apply_subsample()` itself once its index is final, using the returned position array to
+keep parallel frames aligned. `max_samples` remains a shorthand setting both.
 
 Scalers (normalization stats per channel) are stored in `assets/scalers.yaml` and loaded at dataset init time by `build_scalers()`. That function always resolves scaler classes from the vendored `workshop_infrastructure.datasets.transformations`, deliberately ignoring the stale `base:` field each entry records — normalization must not depend on what happens to be installed.
 
@@ -128,13 +175,16 @@ Assets download on first run via `workshop_infrastructure/assets.py:ensure_asset
 
 All runtime parameters live in a single YAML file (`configs/config_script.yaml`), parsed by `load_config()` in `workshop_infrastructure/configs.py` into a typed `TrainingConfig`. Sections: `data`, `model` (incl. LoRA and time embedding), `training`, `output`, `logging`.
 
-Two properties matter when editing configs:
+Three properties matter when editing configs:
+- **Adding a key is one edit.** `_TRAINING_KEYS` is derived from `TrainingConfig`'s fields and both sections are splatted into the constructor, so declaring the dataclass field is all it takes. Retired keys get a targeted message: `training.dtype` (which was read and then ignored by the backbone) now errors pointing at `training.precision`.
 - **Unknown keys raise.** A key not present on the target dataclass is an error naming the valid alternatives, never a silent no-op. Task-specific keys require a field on the app's `DataConfig` subclass.
 - **Paths are relative to the config file** and resolved at load time, so a checked-in config works from any working directory. `s3_cache_dir` is the exception — it expands `~`/`$VARS` but is never anchored to the repo.
 
 **Reproducibility.** `training.seed` and `training.deterministic` (`false` | `warn` | `true`, **default `false`** for throughput — determinism costs ~20% wall time) control it. Results are therefore NOT reproducible out of the box; `warn` is the setting to use when comparing runs. `3_finetune_template_1D.py` sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` **before importing torch** — this is required for deterministic cuBLAS and is inert if moved after the import, so do not "tidy" it into the other imports. The notebooks' first cell does the same. `build_helio_dataloaders()` passes an explicit `generator` and `worker_init_fn`; without them the shuffle order depends on ambient global RNG state. `deterministic: true` is incompatible with `model.learned_flow: true` (`F.grid_sample` has no deterministic CUDA backward); `TrainingConfig.__post_init__` rejects that combination at config-load time.
 
-CLI overrides are deliberately limited to what varies between runs of one config: `--max-epochs`, `--batch-size`, `--s3-cache-dir`, `--deterministic {false,warn,true}`, plus the `--no-wandb` and `--train_baseline` toggles.
+CLI overrides are deliberately limited to what varies between runs of one config: `--max-epochs`, `--batch-size`, `--max-train-samples` (the data-scaling sweep knob; the validation cap stays in the YAML so it cannot drift between runs), `--s3-cache-dir`, `--deterministic {false,warn,true}`, plus the `--no-wandb` and `--train_baseline` toggles. All of them are applied to `cfg` before anything reads it, so `cfg` is the single record of what ran.
+
+`training.precision` (`bf16-mixed` | `16-mixed` | `32-true`) and `training.accumulate_grad_batches` are config fields rather than hardcoded Trainer arguments. The script still forces `32-true` on CPU.
 
 ### Distributed Training
 
@@ -145,13 +195,18 @@ DDP via PyTorch Lightning. Use `CUDA_VISIBLE_DEVICES` to select GPUs. Logging is
 | Purpose | Path |
 |---|---|
 | Core model architecture (vendored) | `workshop_infrastructure/models/helio_spectformer.py` |
+| Pretrained-weight adaptation (resolution, frames) | `workshop_infrastructure/models/weight_adaptation.py` |
 | Base dataset loader | `workshop_infrastructure/datasets/helio.py` |
 | Dataset/DataLoader builders | `workshop_infrastructure/datasets/builders.py` |
 | Config dataclasses + `load_config()` | `workshop_infrastructure/configs.py` |
 | Asset download (scalers, weights) | `workshop_infrastructure/assets.py` |
 | LoRA application + `head_` discovery | `workshop_infrastructure/utils.py` |
 | LoRA setup tests | `tests/test_lora_setup.py` |
-| Downstream adapter model | `workshop_infrastructure/models/finetune_models.py` |
+| Weight-adaptation tests | `tests/test_weight_adaptation.py` |
+| Defaults / subsampling / app-model tests | `tests/test_template_defaults.py` |
+| Backbone builder + reference heads | `workshop_infrastructure/models/finetune_models.py` |
+| App's editable fine-tuning model | `downstream_apps/template/models/finetune_model.py` |
+| App's fine-tuning LightningModule | `downstream_apps/template/lightning_modules/pl_finetune.py` |
 | Fine-tuning entry point | `downstream_apps/template/3_finetune_template_1D.py` |
 | Model weights (HuggingFace) | `nasa-impact/surya` |
 | Pretrained checkpoint | `downstream_apps/template/assets/surya.366m.v1.pt` |

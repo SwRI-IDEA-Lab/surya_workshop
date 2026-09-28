@@ -74,7 +74,8 @@ surya_workshop/
 │   │   ├── builders.py                 # build_helio_datasets/dataloaders() — dataset wiring, done once
 │   │   └── transformations.py          # Additional data transformations
 │   ├── models/
-│   │   ├── finetune_models.py          # HelioSpectformer1D / HelioSpectformer2D fine-tuning wrappers
+│   │   ├── finetune_models.py          # build_surya_backbone() + HelioSpectformer1D/2D reference heads
+│   │   ├── weight_adaptation.py        # Adapts pretrained weights when resolution / frame count changes
 │   │   ├── helio_spectformer.py        # Full backbone (HelioSpectFormer)
 │   │   ├── spectformer.py              # Spectral gating blocks
 │   │   ├── transformer_ls.py           # Long-short attention blocks
@@ -155,6 +156,10 @@ Each notebook is self-contained and builds directly on the previous one. They ar
 | `1_baseline_template.ipynb` | Training a simple linear model end-to-end; defines the metric and evaluation baseline |
 | `2_finetune_template_1D.ipynb` | Loading Surya weights, applying LoRA to the backbone while the head trains, and fine-tuning interactively |
 
+The model each notebook trains lives in the app, not in shared code: `models/simple_baseline.py`
+for the linear baseline and `models/finetune_model.py` for the Surya fine-tune. Changing the
+fine-tuning architecture never requires editing `workshop_infrastructure/`.
+
 ### 3. Run the production training script
 
 Once you're satisfied with the notebook workflow, `3_finetune_template_1D.py` runs the same logic as notebook 2 but with multi-GPU DDP support, checkpoint saving, and WandB logging:
@@ -167,19 +172,39 @@ CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D
 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m downstream_apps.template.3_finetune_template_1D \
     --config downstream_apps/template/configs/config_script.yaml
 
-# Quick sanity check (cap epochs without editing the YAML)
+# Quick sanity check (cap epochs and dataset size without editing the YAML)
 CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D \
-    --max-epochs 2 --no-wandb
+    --max-epochs 2 --max-train-samples 8 --no-wandb
+
+# Data-scaling sweep: the validation set is capped separately and stays fixed
+for n in 25 50 100 200; do
+  CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.template.3_finetune_template_1D \
+      --max-train-samples $n --deterministic warn
+done
 ```
 
 **All hyperparameters live in `config_script.yaml`** — batch size, learning rate, LoRA settings, S3 paths, and more. The script reads the YAML via `load_flare_config()` and returns a fully typed `TrainingConfig`, so IDE autocompletion works and mistakes are caught at startup rather than mid-training: an unrecognized key is an error that names the valid alternatives, and a config that needs an S3 cache directory but does not declare one fails before the first epoch instead of inside a DataLoader worker.
 
-The CLI overrides only what genuinely varies between runs of one config: `--max-epochs` and
-`--batch-size` for sweeps, `--s3-cache-dir` for per-machine scratch space, and
-`--deterministic {false,warn,true}` to make a run reproducible without editing the committed
-config. Everything else is a config edit.
+The CLI overrides only what genuinely varies between runs of one config: `--max-epochs`,
+`--batch-size` and `--max-train-samples` for sweeps, `--s3-cache-dir` for per-machine scratch
+space, and `--deterministic {false,warn,true}` to make a run reproducible without editing the
+committed config. Everything else is a config edit.
 
-Set `max_samples: 10` in the YAML during development to cap the dataset size for fast iteration.
+Set `max_train_samples: 8` in the YAML during development to cap the dataset size for fast
+iteration — every sample is a ~1 GB download the first time it is seen.
+
+**Two defaults worth knowing about.** `data.pooling: 4` average-pools each frame to
+1024×1024 before the model sees it, which cuts the token count from 65536 to 4096: measured
+on one A100, that is 14.3 GB of VRAM at batch size 16 and 0.099 s/sample, against 28.6 GB at
+batch size 2 and 1.72 s/sample at native resolution — a 17× speedup per sample. The
+pretrained spectral filters are restricted to the smaller token grid rather than discarded,
+so this is still a Surya fine-tune. Set `pooling: 1` and `model.img_size: 4096` for the
+native-resolution run.
+
+`data.max_train_samples` and `data.max_val_samples` are separate knobs, so a data-scaling
+study varies the training set while every run is scored on the same validation set. Subsets
+are seeded random samples and they nest, so the difference between two points on the curve
+is *more* data, not *different* data.
 
 ### 4. Reading data from S3
 
@@ -237,7 +262,7 @@ its config or dataset-wiring code. Your app subclasses `DataConfig` and calls
 
 **YAML as single source of truth.** All parameters are declared once in `config_script.yaml` and nowhere else. The CLI adds only what genuinely varies between runs of the same config — `--max-epochs` and `--batch-size` (sweeps), `--s3-cache-dir` (per-machine scratch), `--deterministic` (reproducibility for a one-off comparison) — plus the `--no-wandb` and `--train_baseline` dev toggles. `--config` defaults to the app's own file. This keeps experiment management simple and reproducible.
 
-**Reproducibility is one config key away.** `training.deterministic` defaults to `false` for throughput — determinism costs about 20% of wall time — so two identical runs may disagree. Set it to `warn` whenever you need to attribute a change in results to your edit rather than to drift; that is the setting to use for any ablation or before/after comparison. The machinery behind it pins three things that are easy to leave loose: `torch.use_deterministic_algorithms` via Lightning's `deterministic` flag, `cudnn.benchmark` (autotuning picks algorithms by timing, which drifts), and the train DataLoader's shuffle generator and worker seeds — a bare `shuffle=True` seeds itself from ambient global RNG state, so unrelated code that draws a random number silently reshuffles your epochs. The seed and the data order stay pinned either way. Note that reproducibility is not significance: with `max_samples: 10` the result is still noise, just the same noise each time.
+**Reproducibility is one config key away.** `training.deterministic` defaults to `false` for throughput — determinism costs about 20% of wall time — so two identical runs may disagree. Set it to `warn` whenever you need to attribute a change in results to your edit rather than to drift; that is the setting to use for any ablation or before/after comparison. The machinery behind it pins three things that are easy to leave loose: `torch.use_deterministic_algorithms` via Lightning's `deterministic` flag, `cudnn.benchmark` (autotuning picks algorithms by timing, which drifts), and the train DataLoader's shuffle generator and worker seeds — a bare `shuffle=True` seeds itself from ambient global RNG state, so unrelated code that draws a random number silently reshuffles your epochs. The seed and the data order stay pinned either way. Note that reproducibility is not significance: with `max_train_samples: 8` the result is still noise, just the same noise each time.
 
 **Typed configuration, and mistakes surface early.** `load_config()` parses the YAML into a `TrainingConfig` dataclass, so downstream code receives a typed object rather than a raw dict. An unrecognized key raises and lists the valid ones instead of being silently dropped; paths resolve relative to the config file; and a config that needs an S3 cache directory but does not declare one fails at dataset construction, not inside a DataLoader worker part-way through the first epoch.
 
