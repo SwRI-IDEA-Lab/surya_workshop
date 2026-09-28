@@ -1,106 +1,61 @@
+"""
+The non-Surya baseline for EUV2MAG.
+
+A per-pixel linear map from the EUV channels to the magnetogram: a 1x1 convolution, which
+is exactly a learned linear combination of the input channels at each pixel independently.
+
+It is worth running before the fine-tune, because it answers a question the fine-tune
+cannot: how much of the magnetogram is predictable from EUV intensity *at the same pixel*,
+with no spatial context at all. Whatever the Surya fine-tune beats this by is what the
+spatial and spectral structure in the backbone is buying. A fine-tune that does not beat it
+is not working, however plausible its loss curve looks.
+
+Note there is no ``head_`` prefix convention here: this model is never wrapped by PEFT
+(there is no pretrained backbone to freeze), so every parameter trains by default.
+"""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 from einops import rearrange
 
-"""
-A simple linear regression model to be used as a baseline for flare forecasting.
-"""
-class RegressionFlareModel(nn.Module):
-    def __init__(self, input_dim, channel_order, scalers):
-        """
-        Initializes the RegressionFlareModel.
-
-        Args:
-            input_dim (int): The size of the input vector after channel and time dimensions are flattened.
-            channel_order (list[str]): List of channel names, defining the order in which channels appear in the input data.
-                                       This is used to ensure the inverse transform uses the correct scaler for each channel.
-            scalers (dict): A dictionary of scalers, one for each channel, used for inverse transforming the data to physical space.
-        """
-        super().__init__()
-        self.linear = nn.Linear(input_dim, 1)
-        self.channel_order = channel_order
-        self.scalers = scalers
-
-    def forward(self, x):
-        """
-        Performs a forward pass through the model.
-        Args:
-            x (torch.Tensor): Input tensor of shape (b, c, t, w, h).
-
-        b - Batch size
-        c - Channels
-        t - Time steps
-        w - Width
-        h - Height
-        """
-
-        # Avoid mutating the caller's tensor
-        x = x.clone()
-
-        # Get dimensions
-        b, c, t, w, h = x.shape
-
-        # Invert normalization to work in physical logarithmic space
-        with torch.no_grad():
-            for channel_index, channel in enumerate(self.channel_order):
-                x[:, channel_index, ...] = self.scalers[channel].inverse_transform(
-                    x[:, channel_index, ...]
-                )
-
-        # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
-        x = x.abs().mean(dim=[3,4])
-
-        # Rearange in preparation for linear layer
-        x = rearrange(x, "b c t -> b (c t)")
-
-        out = self.linear(x)
-        return out
-
 
 class Conv2DImageTranslationModel(nn.Module):
-    """
-    Simple image translation baseline.
-    Flattens time into channels and applies a 1x1 conv (per-pixel linear map).
+    """A 1x1 convolution over the channel-and-time axes.
+
+    Args:
+        input_channels: Ordered list of input channel names. Only its length is used; it
+            is taken as a list so a misconfigured call fails here rather than in the loss.
+        target_channels: Ordered list of target channel names.
+        n_input_timestamps: Number of input frames, i.e. ``model.time_embedding.time_dim``.
+            Time is folded into the convolution's input channels, so the baseline can use
+            several frames even though it has no notion of their order.
     """
 
-    def __init__(self, input_channels, target_channels, n_input_timestamps):
-        """
-        Args:
-            input_channels (list[str]): Ordered list of input channels.
-            target_channels (list[str]): Ordered list of target channels.
-            n_input_timestamps (int): Number of input timesteps.
-        """
+    def __init__(
+        self,
+        input_channels: list[str],
+        target_channels: list[str],
+        n_input_timestamps: int,
+    ):
         super().__init__()
-        self.input_channels = input_channels
-        self.target_channels = target_channels
+        self.input_channels = list(input_channels)
+        self.target_channels = list(target_channels)
         self.n_input_timestamps = n_input_timestamps
 
-        in_channels = len(input_channels) * n_input_timestamps
-        out_channels = len(target_channels)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.conv = nn.Conv2d(
+            len(self.input_channels) * n_input_timestamps,
+            len(self.target_channels),
+            kernel_size=1,
+        )
 
-    def forward(self, x):
+    def forward(self, batch: dict) -> torch.Tensor:
+        """Map a batch dict to a predicted image of shape (B, C_out, H, W).
+
+        Takes the batch dict rather than a bare tensor so it is interchangeable with
+        ``Euv2MagSuryaModel`` and can share the same Lightning module -- an earlier version
+        took a tensor and needed a subclass that overrode every step to unwrap the dict.
         """
-        Performs a forward pass through the model.
-        Args:
-            x (torch.Tensor): Input tensor of shape (b, c, t, h, w).
-
-        b - Batch size
-        c - Channels
-        t - Time steps
-        h - Height
-        w - Width
-        """
-        x = x.clone()
-        b, c, t, h, w = x.shape
-        #x = x.reshape(b, c * t, h, w)
-
-        # Rearange in preparation for linear layer
-        x = rearrange(x, "b c t h w -> b (c t) h w")
-
-        x = self.conv(x)
-
-        x = rearrange(x, "b c h w -> b c 1 h w")
-
-        return x
-
+        x = rearrange(batch["ts"], "b c t h w -> b (c t) h w")
+        return self.conv(x)

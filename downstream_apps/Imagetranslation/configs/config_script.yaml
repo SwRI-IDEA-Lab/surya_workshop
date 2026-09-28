@@ -1,0 +1,230 @@
+# =============================================================================
+# EUV2MAG — predicting an HMI magnetogram from three AIA EUV channels
+#
+# Five sections own all parameters:
+#   data      — what to load, and how the channels split into inputs and targets
+#   model     — backbone architecture, the decoder head, LoRA
+#   training  — optimization hyperparameters
+#   output    — where checkpoints go
+#   logging   — experiment tracking (WandB)
+#
+# Two things to know before editing:
+#
+#   * Paths are relative to THIS FILE's directory (~ and $ENV_VARS are expanded), so this
+#     config works on any machine with no absolute paths to fix up. The one exception is
+#     s3_cache_dir — see its comment below.
+#   * Unrecognized keys are an ERROR, not a silent no-op. To add a task-specific key, add
+#     the field to Euv2MagDataConfig in configs.py first.
+#
+# Usage — --config defaults to this file, so the short form is enough:
+#   CUDA_VISIBLE_DEVICES=0 python -m downstream_apps.Imagetranslation.3_finetune_euv2mag
+#
+# Per-run overrides that do not require editing this file:
+#   --max-epochs 5   --batch-size 4   --max-train-samples 500
+#   --s3-cache-dir /scratch/$USER/cache   --deterministic warn
+# =============================================================================
+
+job_id: euv2mag_image_translation
+
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  # -- Paths (relative to this file's directory) --
+  train_data_path: ../../../data/indices/surya_aws_s3_train.csv
+  valid_data_path: ../../../data/indices/surya_aws_s3_val.csv
+  scalers_path: ../assets/scalers.yaml
+
+  # -- Channels --
+  # `channels` is what the dataset decodes from each NetCDF file: the union of the inputs
+  # and the targets, and nothing else. Every channel listed here costs decode time and
+  # memory on every sample, so listing all 13 to use 4 is pure waste (config load rejects
+  # a channel that is neither an input nor a target, for exactly that reason).
+  channels: [aia171, aia193, aia304, hmi_m]
+
+  # The three EUV channels the model sees, in the order its tokenizer expects them. The
+  # tokenizer's pretrained weights are selected for these channels by position in
+  # data.pretrained_channel_order, so changing this list changes which pretrained filters
+  # are loaded — it is not just a relabelling.
+  input_channels: [aia304, aia193, aia171]
+
+  # What the model predicts: the line-of-sight magnetogram. Use [hmi_bx, hmi_by, hmi_bz]
+  # for the vector field instead.
+  target_channels: [hmi_m]
+
+  # The channel order the Surya 366M checkpoint was pretrained with. Leave this alone
+  # unless you are loading a checkpoint pretrained on a different channel set; the default
+  # in configs.py is correct for surya.366m.v1.pt. It is NOT the key order in
+  # scalers.yaml, where hmi_bx/by/bz precede hmi_m.
+  # pretrained_channel_order: [aia94, aia131, ...]
+
+  # -- Temporal sampling --
+  time_delta_input_minutes: [0]   # Offsets (minutes) of input frames from the reference step
+  time_delta_target_minutes: 60   # Step size (minutes) to the target frame
+
+  # -- Resolution --
+  # The main VRAM and speed knob: each frame is average-pooled by this factor, so the
+  # token count falls with its square. model.img_size must equal
+  # native_img_size // pooling (validated at config load).
+  #
+  # 4 gives 1024x1024, which fits comfortably and is why this app no longer needs
+  # batch_size: 1. It costs output resolution: predicted magnetograms are 1024x1024, so
+  # features finer than ~4 native pixels are not represented. If your science needs the
+  # full 4096x4096, set pooling: 1 and model.img_size: 4096 and expect to drop the batch
+  # size. No pretrained weights are lost either way — load_pretrained_weights restricts
+  # the spectral filters to the smaller token grid rather than discarding them.
+  pooling: 4
+
+  # -- S3 (only needed when the index contains s3:// paths) --
+  s3_anon: true                   # true for public buckets; false to use IAM credentials
+  s3_mode: download               # download | simplecache | stream; see the template config
+
+  # Local cache for S3 reads. REQUIRED unless s3_mode is "stream" — budget ~1 GB per
+  # unique timestep. Left null on purpose: this file is checked in, and an absolute path
+  # into one person's scratch is wrong for everyone else. Set it, highest precedence first:
+  #   1. --s3-cache-dir /scratch/$USER/helio_cache      (per-run)
+  #   2. s3_cache_dir: /scratch/me/helio_cache          (here, in your own fork)
+  #   3. export SURYA_WS_CACHE_DIR=/scratch/me/cache    (per-machine, config stays clean)
+  s3_cache_dir: null
+
+  s3_boto3_max_concurrency: 4     # parallel download threads
+  s3_boto3_part_size_mb: 64       # part size in MB
+
+  # -- Dataset size --
+  # Capped independently so a data-scaling study varies the training set while every run is
+  # scored on the same validation set. These reproduce the original pilot's regime. The
+  # subset is a prefix of a seeded permutation, so subsets nest: the 100-sample run trains
+  # on a subset of the 1000-sample run's data. null = use everything.
+  max_train_samples: 100
+  max_val_samples: 20
+
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  # -- Pretrained checkpoint (relative to this file; downloaded on first run if missing) --
+  pretrained_path: ../assets/surya.366m.v1.pt
+
+  # -- Backbone --
+  # in_channels is 3, NOT the 13 the checkpoint was pretrained with: the tokenizer is built
+  # for the channels this app actually feeds it, and load_pretrained_weights selects those
+  # three channels' planes out of the pretrained convolution. Must equal
+  # len(data.input_channels) (validated at config load).
+  in_channels: 3
+  img_size: 1024        # = data.native_img_size // data.pooling
+  patch_size: 16
+  embed_dim: 1280
+  depth: 10
+  spectral_blocks: 2
+  num_heads: 16
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  window_size: 2
+  dp_rank: 4
+  rpe: false
+  learned_flow: false
+  init_weights: false
+  checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  ensemble: null
+  time_embedding:
+    type: linear        # linear | fourier | perceiver
+    n_queries: null     # perceiver only
+    time_dim: 1         # Input timesteps; <= len(data.time_delta_input_minutes)
+
+  # -- Fine-tuning head --
+  # The decoder that turns the (B, L, D) token sequence back into an image.
+  #   linear    — conv + pixel shuffle per patch. Cheap, and the default.
+  #   perceiver — cross-attention resampler; more parameters, no patch-grid artefacts.
+  # The head lives in models/finetune_model.py — edit it there.
+  ft_unembedding_type: linear
+
+  # -- Backbone layers kept trainable under LoRA --
+  # This app changed the tokenizer's channel count (13 -> 3), so the tokenizer is
+  # initialized from a *slice* of the pretrained convolution and then has to re-fit. It
+  # must therefore train, and LoRA cannot do it for us:
+  #
+  #   LinearEmbedding is patch_embed(x) + pos_embed with no normalization in between, and
+  #   the blocks are pre-norm, so LayerNorm only ever sees a branch input, never the
+  #   residual stream. Taking 3 channels instead of 13 shrinks the tokenizer's output while
+  #   pos_embed — a fixed-amplitude Fourier buffer — stays where it is.
+  #
+  #   Measured, not assumed: token std falls from ~2.1 to ~1.3 on real data, a ratio of
+  #   0.59, so position's share of every token grows 1.68x. Reproduce with
+  #     python -m downstream_apps.Imagetranslation.tools.measure_token_scale
+  #   No downstream LayerNorm can restore that ratio, because it acts on the sum, and a
+  #   LoRA adapter acts after tokenization and cannot change a per-channel linear map.
+  #   Only the tokenizer can rescale its own output.
+  #
+  # Cost: ~984k parameters (3 x 16 x 16 x 1280 + 1280), comparable to the LoRA adapters
+  # themselves and 0.27% of the backbone. It starts from pretrained weights, so it trains
+  # at the base learning rate rather than the head's multiplied one.
+  #
+  # Set this to [] to A/B the decision — see MIGRATION.md for the measured comparison.
+  trainable_backbone_modules: [embedding.patch_embed]
+
+  # -- LoRA adapters --
+  use_lora: true
+  lora_config:
+    r: 8
+    lora_alpha: 8
+    lora_dropout: 0.1
+    bias: none
+    # These match the backbone's actual layer names. Do not write q_proj/k_proj/v_proj/
+    # out_proj: the backbone uses a fused attn.qkv and attn.proj, PEFT only errors when
+    # *no* entry matches, and the original pilot config's list silently adapted nothing but
+    # fc1/fc2. "attn.proj" is dotted on purpose — a bare "proj" would also match the
+    # patch-embedding tokenizer at embedding.patch_embed.proj.
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
+
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  learning_rate: 0.0001
+  # The decoder head starts random while the adapters start as a small perturbation of a
+  # backbone that already works, so one rate cannot serve both. 1.0 disables the split.
+  head_lr_multiplier: 10.0
+  weight_decay: 0.0       # Applied to the adapters and the tokenizer, never to the head
+  batch_size: 2           # Per-device batch size under DDP
+  max_epochs: 15
+  num_workers: 8          # DataLoader workers per device (0 to debug in-process)
+  accumulate_grad_batches: 1
+  precision: bf16-mixed   # bf16-mixed | 16-mixed | 32-true
+
+  # -- Reproducibility --
+  # seed pins the shuffle order, the worker RNGs and which samples the caps select.
+  seed: 42
+  # false | warn | true. false is the default for throughput (~20% faster). Set "warn"
+  # whenever you need to tell whether a change in your results came from your edit or from
+  # run-to-run drift; with false that comparison is not meaningful.
+  deterministic: false
+
+  # -- Task-specific --
+  rollout_steps: 0
+  # MUST stay 0 here. drop_hmi_probability randomly zeroes the HMI channels as an
+  # augmentation, which for this app would zero the prediction target.
+  drop_hmi_probability: 0.0
+  use_latitude_in_learned_flow: false
+
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+output:
+  ckpt_dir: checkpoints   # Local directory for checkpoints and the evaluation figure
+
+  # S3 upload of the best checkpoint (set s3_bucket to enable)
+  s3_bucket: null
+  s3_prefix: ""
+  s3_best_key: best.ckpt
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  wandb_project: euv2mag_image_translation
+  wandb_entity: null      # WandB team/org; null logs to your personal account

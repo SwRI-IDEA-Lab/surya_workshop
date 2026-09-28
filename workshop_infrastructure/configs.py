@@ -59,6 +59,9 @@ VALID_DETERMINISTIC = (True, False, "warn")
 #                  suspected precision problem, and on CPU.
 VALID_PRECISIONS = ("bf16-mixed", "16-mixed", "32-true")
 
+# Accepted values for model.ft_unembedding_type, used by 2D (image-output) heads.
+VALID_UNEMBEDDINGS = ("linear", "perceiver")
+
 
 @dataclass
 class TimeEmbeddingConfig:
@@ -133,6 +136,12 @@ class ModelConfig:
     penultimate_linear_layer: bool = True
     dropout: float = 0.2
     freeze_backbone: bool = False
+    # 2D heads only (HelioSpectformer2D and app models that unembed tokens back to an
+    # image): which decoder turns the (B, L, D) token sequence into (B, C, H, W).
+    #   linear    — one conv + pixel shuffle per patch. Cheap, and the default.
+    #   perceiver — cross-attention resampler. More parameters, no patch-grid artefacts.
+    # Ignored by 1D heads, which pool the tokens instead.
+    ft_unembedding_type: str = "linear"
 
     # --- Backbone layers that must stay trainable under LoRA ---
     # Named backbone submodules (e.g. ["embedding.patch_embed"]) that apply_peft_lora
@@ -143,11 +152,14 @@ class ModelConfig:
     # The case it exists for: an app feeding Surya a subset of the 13 pretraining
     # channels rebuilds the tokenizer at that channel count, initialized from a slice
     # of the pretrained weights (see models/weight_adaptation.py). That slice is not
-    # the function the backbone was trained to consume -- the tokenizer's output is
-    # summed with a fixed-amplitude pos_embed before any normalization, so dropping
-    # channels shifts the content-to-position ratio in every token -- and the
-    # tokenizer is the only layer that can rescale its own output. A low-rank adapter
-    # cannot: it acts after tokenization and cannot change a per-channel linear map.
+    # the function the backbone was trained to consume: the tokenizer's output is
+    # summed with a fixed-amplitude pos_embed before any normalization, and the blocks
+    # are pre-norm, so dropping channels shifts the content-to-position ratio in every
+    # token and nothing downstream can restore it. Only the tokenizer can rescale its
+    # own output; a low-rank adapter acts after tokenization and cannot change a
+    # per-channel linear map. Measured for the 3-of-13 case by
+    # downstream_apps/Imagetranslation/tools/measure_token_scale.py: position's share
+    # of each token grows 1.68x.
     #
     # Names are resolved and checked for uniqueness at LoRA-application time, because
     # PEFT matches modules_to_save by suffix. See resolve_trainable_backbone_modules.
@@ -181,6 +193,11 @@ class ModelConfig:
                 f"each entry must satisfy 0 <= i < model.depth ({self.depth}). Out-of-range "
                 "entries are silently ignored at runtime rather than erroring, so they are "
                 "rejected here instead."
+            )
+        if self.ft_unembedding_type not in VALID_UNEMBEDDINGS:
+            raise ValueError(
+                f"Unknown model.ft_unembedding_type {self.ft_unembedding_type!r}. "
+                f"Valid values are: {', '.join(repr(u) for u in VALID_UNEMBEDDINGS)}."
             )
         if self.learned_flow and self.time_embedding.type != "linear":
             raise ValueError(
@@ -261,6 +278,19 @@ class DataConfig:
     max_samples: Optional[int] = None
     max_train_samples: Optional[int] = None
     max_val_samples: Optional[int] = None
+
+    def validate_with_model(self, model: "ModelConfig") -> None:
+        """Check invariants that span the ``data:`` and ``model:`` sections.
+
+        Called from ``TrainingConfig.__post_init__`` once both sections are built, which
+        is the only point at which a subclass can see both. A no-op here; override it in
+        an app's DataConfig subclass when a task-specific data field has to agree with a
+        model field -- e.g. an app feeding Surya a channel subset, where
+        ``len(input_channels)`` must equal ``model.in_channels`` or the tokenizer is built
+        for a different number of channels than the dataset delivers.
+
+        Raise ValueError with a message naming both keys and the values that disagree.
+        """
 
     def __post_init__(self) -> None:
         if self.s3_mode not in VALID_S3_MODES:
@@ -393,6 +423,8 @@ class TrainingConfig:
                 "training.accumulate_grad_batches must be an integer >= 1, got "
                 f"{self.accumulate_grad_batches!r}."
             )
+        # Last, so an app's cross-section checks can assume the generic ones passed.
+        self.data.validate_with_model(self.model)
 
 
 # ---------------------------------------------------------------------------
