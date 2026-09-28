@@ -22,6 +22,7 @@
 # Per-run overrides that do not require editing this file:
 #   --max-epochs 5     --batch-size 4     --s3-cache-dir /scratch/$USER/cache
 #   --deterministic warn   (reproducible run; see training.deterministic below)
+#   --max-train-samples 50   (data-scaling sweeps; validation set stays fixed)
 # =============================================================================
 
 job_id: solar_flare_forecasting
@@ -41,6 +42,31 @@ data:
              hmi_m, hmi_bx, hmi_by, hmi_bz, hmi_v]
   time_delta_input_minutes: [0]   # Offsets (minutes) of input frames relative to reference timestep
   time_delta_target_minutes: 60   # Step size (minutes) between forecast frames
+
+  # -- Resolution (the main memory and speed knob) --
+  # Each frame is average-pooled by this factor before normalization, so the model sees
+  # native_img_size // pooling pixels. Token count falls with the SQUARE of it.
+  #
+  # Measured on one A100, LoRA fine-tune, bf16-mixed, all 10 layers checkpointed:
+  #
+  #   pooling  frames seen   tokens  batch  peak VRAM  seconds/sample
+  #      1      4096x4096    65536      2    28.6 GB       1.72
+  #      2      2048x2048    16384      8    27.9 GB       0.40
+  #      4      1024x1024     4096     16    14.3 GB       0.099
+  #      4      1024x1024     4096     32    27.7 GB       0.099
+  #
+  # 4 is the default: 17x faster per sample than native resolution, and at batch_size 16
+  # it leaves room on a 40 GB card rather than filling it. Compute scales with the token
+  # count, so seconds/sample is flat in batch size -- raise the batch for a steadier
+  # gradient, not for throughput.
+  # The pretrained spectral filters are restricted to the smaller token grid on load
+  # (see models/weight_adaptation.py) rather than dropped, so this stays a Surya
+  # fine-tune. Set pooling: 1 and img_size: 4096 below for the native-resolution run.
+  #
+  # NOTE: pooling saves GPU memory and compute, NOT download time -- the full 4096x4096
+  # array is read from S3 first and pooled after.
+  native_img_size: 4096           # Pixel size of one frame in the NetCDF files
+  pooling: 4                      # model.img_size must equal native_img_size // pooling
 
   # -- Downstream label alignment (flare catalog → Surya index) --
   flare_index_path: ../data/hek_flare_catalog.csv
@@ -97,8 +123,20 @@ data:
   s3_boto3_max_concurrency: 4     # parallel download threads (benchmark default: 4)
   s3_boto3_part_size_mb: 64       # part size in MB (benchmark default: 64)
 
-  # -- Development --
-  max_samples: 10                 # Cap dataset size for quick experiments (null = all samples)
+  # -- Dataset size --
+  # Train and validation are capped SEPARATELY, so you can vary the amount of training
+  # data and still score every run on the same validation set -- which is what makes a
+  # data-scaling curve mean anything.
+  #
+  # The subset is a seeded random sample of the matched events, not the earliest N of
+  # them, and subsets nest: with the same training.seed, the 50-sample run's data is a
+  # subset of the 200-sample run's. So the difference between two points on the curve is
+  # "more data", not "different data".
+  #
+  # max_samples is a shorthand that sets both when the specific keys are absent.
+  # null = use every sample.
+  max_train_samples: 200
+  max_val_samples: 100
 
 
 # -----------------------------------------------------------------------------
@@ -109,7 +147,12 @@ model:
   pretrained_path: ../assets/surya.366m.v1.pt
 
   # -- Backbone (Surya 366M defaults — match the pretrained checkpoint) --
-  img_size: 4096
+  # img_size must equal data.native_img_size // data.pooling; the config load checks it.
+  # Every other value here matches the checkpoint and should not be changed: altering
+  # embed_dim, depth or patch_size leaves the corresponding pretrained tensors with
+  # nowhere to load, and load_pretrained_weights() now refuses rather than continuing
+  # with a partly random backbone.
+  img_size: 1024
   patch_size: 16
   in_channels: 13
   embed_dim: 1280
@@ -132,7 +175,12 @@ model:
 
   # -- Fine-tuning head --
   # Head layers live on the model as head_* attributes; see ADAPTING.md before adding one.
-  pooling: class_token  # Options: class_token | global_average | global_max | attention | transformer
+  # global_average: mean over patch tokens. The default because it adds no parameters
+  # and every token gets gradient from the first step, whereas a class_token has to
+  # learn what to attend to before it contributes -- which a short fine-tune on a few
+  # hundred samples may never reach. Try the others; the head lives in
+  # models/finetune_model.py and pooling is one method on it.
+  pooling: global_average  # Options: global_average | global_max | class_token | attention | transformer
   penultimate_linear_layer: true
   dropout: 0.2
   freeze_backbone: false
@@ -158,9 +206,26 @@ model:
 # -----------------------------------------------------------------------------
 training:
   learning_rate: 0.0001
-  batch_size: 2         # Per-device batch size under DDP
+
+  # The head starts random; the LoRA adapters start as a small perturbation of a backbone
+  # that already works. One learning rate cannot suit both, so the head gets
+  # learning_rate * head_lr_multiplier. Set to 1.0 for a single rate.
+  head_lr_multiplier: 10.0
+  # Applied to the adapters (toward zero = toward the pretrained weights), never to the
+  # head. Both are used by FlareFinetuneLightningModule.
+  weight_decay: 0.0
+
+  batch_size: 16        # Per-device batch size under DDP (16 fits 40 GB at pooling: 4)
+  # Optimizer steps see batch_size * accumulate_grad_batches * num_devices samples, so
+  # raise this instead of batch_size when you want a larger effective batch than fits.
+  accumulate_grad_batches: 1
   max_epochs: 20        # Can be overridden with --max-epochs at the CLI
   num_workers: 8        # DataLoader worker processes per device (use 0 to debug in-process)
+
+  # Passed to lightning.Trainer. bf16-mixed halves activation memory versus 32-true and
+  # needs no loss scaling. Options: bf16-mixed | 16-mixed | 32-true (16-mixed for
+  # pre-Ampere GPUs; 32-true on CPU, which the script selects automatically).
+  precision: bf16-mixed
 
   # -- Reproducibility --
   # Seeds Python, NumPy, torch, every DataLoader worker, and the shuffle order. Two runs
@@ -195,7 +260,6 @@ training:
   rollout_steps: 0
   drop_hmi_probability: 0.0
   use_latitude_in_learned_flow: false
-  dtype: float32        # Options: float32 | bfloat16
 
 
 # -----------------------------------------------------------------------------
