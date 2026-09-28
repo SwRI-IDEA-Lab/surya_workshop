@@ -5,7 +5,7 @@ import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -386,12 +386,14 @@ def apply_peft_lora(
 _REGENERATED_BUFFERS = ("embedding.pos_embed",)
 
 
-def _adapt_pretrained_tensor(key, target_key, value, want_shape, modules):
+def _adapt_pretrained_tensor(
+    key, target_key, value, want_shape, modules, channel_indices=None, ckpt_in_chans=None
+):
     """Convert one shape-mismatched checkpoint tensor, or return None if it cannot be.
 
     Only two tensors in the Surya checkpoint change shape for legitimate reasons — the
-    patch-embedding convolution (when the number of input frames changes) and the
-    spectral-gating filters (when the token grid changes). See
+    patch-embedding convolution (when the number of input frames or of input channels
+    changes) and the spectral-gating filters (when the token grid changes). See
     ``workshop_infrastructure/models/weight_adaptation.py`` for why each conversion is
     the right one. Everything else is a genuine configuration error.
     """
@@ -407,7 +409,16 @@ def _adapt_pretrained_tensor(key, target_key, value, want_shape, modules):
         time_dim = getattr(patch_embed, "time_dim", None)
         if not time_dim or want_shape[1] % time_dim:
             return None
-        return adapt_patch_embed_weight(value, want_shape, in_chans=want_shape[1] // time_dim)
+        # A channel subset cannot be inferred here either, so it is passed through rather
+        # than derived: adapt_patch_embed_weight raises if the channel count changed and
+        # no indices were given, which surfaces as the mismatch error below.
+        return adapt_patch_embed_weight(
+            value,
+            want_shape,
+            in_chans=want_shape[1] // time_dim,
+            ckpt_in_chans=ckpt_in_chans,
+            channel_indices=channel_indices,
+        )
 
     if key.endswith("filter.complex_weight"):
         return truncate_spectral_filter(value, want_shape)
@@ -419,6 +430,8 @@ def load_pretrained_weights(
     model: torch.nn.Module,
     pretrained_path: Optional[str],
     strict_shapes: bool = True,
+    channel_indices: Optional[Sequence[int]] = None,
+    ckpt_in_chans: Optional[int] = None,
 ) -> None:
     """Load pretrained weights into a fine-tuning model, adapting what can be adapted.
 
@@ -440,6 +453,14 @@ def load_pretrained_weights(
         strict_shapes: If True (default), raise when a checkpoint tensor cannot be
             matched or adapted. Set False to reproduce the old drop-and-continue
             behaviour — only ever deliberately, e.g. when changing ``embed_dim``.
+        channel_indices: For an app that feeds Surya a **subset** of the 13 pretraining
+            channels: which pretrained channel each of the model's channels corresponds
+            to, as positions in the pretraining channel order, in the model's own channel
+            order. The tokenizer is then initialized from exactly those pretrained
+            channels instead of from scratch. Leave as None when the channel count is
+            unchanged; see ``adapt_patch_embed_weight`` for why it cannot be inferred.
+        ckpt_in_chans: How many input channels the checkpoint was pretrained with (13 for
+            Surya). Required alongside ``channel_indices``.
     """
     if not pretrained_path:
         return
@@ -470,7 +491,11 @@ def load_pretrained_weights(
         if k.endswith(_REGENERATED_BUFFERS):
             continue
 
-        converted = _adapt_pretrained_tensor(k, target, v, want, modules)
+        converted = _adapt_pretrained_tensor(
+            k, target, v, want, modules,
+            channel_indices=channel_indices,
+            ckpt_in_chans=ckpt_in_chans,
+        )
         if converted is None:
             mismatched.append(f"  {k}: checkpoint {tuple(v.shape)} vs model {tuple(want)}")
         else:
