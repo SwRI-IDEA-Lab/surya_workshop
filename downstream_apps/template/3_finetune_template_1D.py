@@ -14,12 +14,18 @@ Assumptions
         --config downstream_apps/template/configs/config_script.yaml
 
 All parameters live in the YAML. The CLI overrides only what genuinely varies between
-runs of the same config: --max-epochs and --batch-size (sweeps), --s3-cache-dir
-(per-machine scratch) and --deterministic (reproducibility, off by default for speed).
-Everything else is a config edit.
+runs of the same config: --max-epochs, --batch-size and --max-train-samples (sweeps),
+--s3-cache-dir (per-machine scratch) and --deterministic (reproducibility, off by default
+for speed). Every override is applied to cfg before anything reads it, so cfg is the
+single record of what ran. Everything else is a config edit.
+
+Note that --max-train-samples has no --max-val-samples counterpart on purpose: a
+data-scaling sweep is only meaningful if every run is scored on the same validation set,
+so that cap stays in the YAML where it cannot drift between runs.
 
 Forking this script: build_datasets() and build_model() are the only two functions with
-task-specific content. build_trainer() and main() should need no changes.
+task-specific content. build_trainer() and main() should need no changes. The model
+itself lives in models/finetune_model.py -- edit the head there.
 """
 
 from __future__ import annotations
@@ -43,7 +49,11 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from downstream_apps.template.configs import TrainingConfig, load_flare_config
-from downstream_apps.template.datasets.template_dataset import FlareDSDataset
+from downstream_apps.template.datasets.template_dataset import (
+    FlareDSDataset,
+    flare_label_transform,
+)
+from downstream_apps.template.lightning_modules.pl_finetune import FlareFinetuneLightningModule
 from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
 from downstream_apps.template.metrics.template_metrics import FlareMetrics
 from workshop_infrastructure.assets import ensure_assets
@@ -81,6 +91,10 @@ def parse_args() -> argparse.Namespace:
                         help="Override training.max_epochs from the config YAML.")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override training.batch_size from the config YAML.")
+    parser.add_argument("--max-train-samples", type=int, default=None,
+                        help="Override data.max_train_samples. This is the knob for a "
+                             "data-scaling sweep: the validation set is capped separately "
+                             "by data.max_val_samples and stays fixed across runs.")
     parser.add_argument("--s3-cache-dir", type=str, default=None,
                         help="Override data.s3_cache_dir (the local cache for S3 reads). "
                              "Handy when the same config runs on machines with different scratch.")
@@ -92,20 +106,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
-    """Normalize flare peak intensity for the template task.
-
-    Converts raw GOES intensity to a z-score-like label:
-      1. Take log10 (intensity values span many orders of magnitude).
-      2. Shift so the minimum is 0.
-      3. Scale by 2 * std so most values fall in [-1, 1].
-    """
-    import numpy as np
-    log_intensity = np.log10(intensity)
-    shifted = log_intensity - log_intensity.min()
-    return shifted / (2 * shifted.std())
-
-
 def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config.
 
@@ -115,6 +115,10 @@ def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader
 
     ``scalers`` is built once in main() and shared with build_model(), so the two paths
     cannot end up with different normalization statistics.
+
+    The per-split size caps (``data.max_train_samples`` / ``data.max_val_samples``) and
+    the resolution (``data.pooling``) are applied by the builder from the config, so they
+    do not appear in this list.
     """
     return build_helio_dataloaders(
         cfg,
@@ -122,8 +126,7 @@ def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader
         scalers=scalers,
         seed=cfg.seed,
         return_surya_stack=True,
-        max_number_of_samples=cfg.data.max_samples,
-        label_transform=_flare_label_transform,
+        label_transform=flare_label_transform,
         ds_flare_index_path=cfg.data.flare_index_path,
         ds_time_column=cfg.data.ds_time_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
@@ -157,13 +160,18 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
         preprocess_fn = partial(destandardize_channels, channel_order=cfg.data.channels, scalers=scalers)
         return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
     else:
-        from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
-        model = HelioSpectformer1D.from_config(
+        # The app's own model -- downstream_apps/template/models/finetune_model.py.
+        # Edit the head there; you do not need to touch workshop_infrastructure/ to
+        # change the architecture.
+        from downstream_apps.template.models.finetune_model import FlareSuryaModel
+        model = FlareSuryaModel(
             cfg.model,
             num_outputs=1,
-            dtype=cfg.dtype,
             use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
         )
+        # Adapts the patch embedding and the spectral filters to this config's frame
+        # count and resolution, and raises on anything it cannot adapt rather than
+        # leaving a backbone tensor at its random initialization.
         load_pretrained_weights(model, cfg.model.pretrained_path)
 
         # Three fine-tuning regimes, selected from the model: section of the YAML:
@@ -183,8 +191,14 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
             model = apply_peft_lora(model, cfg.model.lora_config)
 
         _log_trainable_parameters(model)
-
-    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
+        return FlareFinetuneLightningModule(
+            model,
+            metrics,
+            lr=cfg.learning_rate,
+            batch_size=cfg.batch_size,
+            head_lr_multiplier=cfg.head_lr_multiplier,
+            weight_decay=cfg.weight_decay,
+        )
 
 
 def _log_trainable_parameters(model) -> None:
@@ -195,14 +209,8 @@ def _log_trainable_parameters(model) -> None:
     print(f"[MODEL] Trainable parameters: {trainable:,} / {total:,} ({pct:.2f}%)")
 
 
-def build_trainer(
-    cfg: TrainingConfig,
-    no_wandb: bool = False,
-    max_epochs_override: int | None = None,
-) -> Tuple[L.Trainer, ModelCheckpoint]:
+def build_trainer(cfg: TrainingConfig, no_wandb: bool = False) -> Tuple[L.Trainer, ModelCheckpoint]:
     """Configure loggers, callbacks, and the Lightning Trainer."""
-    max_epochs = max_epochs_override if max_epochs_override is not None else cfg.max_epochs
-
     loggers = []
     if not no_wandb:
         loggers.append(WandbLogger(
@@ -231,11 +239,14 @@ def build_trainer(
     )
 
     trainer = L.Trainer(
-        max_epochs=max_epochs,
+        max_epochs=cfg.max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices="auto",
         strategy="auto",
-        precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
+        # 32-true on CPU: neither bf16 nor fp16 autocast is useful there, and Lightning
+        # warns or errors depending on the version.
+        precision=cfg.precision if torch.cuda.is_available() else "32-true",
+        accumulate_grad_batches=cfg.accumulate_grad_batches,
         # Reproducibility. "warn" (the default) gives bit-identical runs wherever a
         # deterministic kernel exists and names the op where one does not, instead of
         # killing the run. benchmark is pinned rather than inherited: cuDNN autotuning
@@ -264,6 +275,12 @@ def main() -> None:
     L.seed_everything(cfg.seed, workers=True)
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.max_train_samples is not None:
+        cfg.data.max_train_samples = args.max_train_samples
+    if args.max_epochs is not None:
+        # Applied to cfg (not only to the Trainer) so everything that reads max_epochs --
+        # logging, schedulers a fork might add -- sees the value actually in force.
+        cfg.max_epochs = args.max_epochs
     if args.s3_cache_dir is not None:
         cfg.data.s3_cache_dir = args.s3_cache_dir
     if args.deterministic is not None:
@@ -277,7 +294,13 @@ def main() -> None:
 
     train_loader, val_loader = build_datasets(cfg, scalers)
     lit_model = build_model(cfg, scalers, train_baseline=args.train_baseline)
-    trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
+    print(
+        f"[DATA] train: {len(train_loader.dataset)} samples | "
+        f"val: {len(val_loader.dataset)} samples | "
+        f"batch_size: {cfg.batch_size} x {cfg.accumulate_grad_batches} accumulated | "
+        f"frames: {cfg.model.img_size}x{cfg.model.img_size} (data.pooling={cfg.data.pooling})"
+    )
+    trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb)
 
     trainer.fit(lit_model, train_loader, val_loader)
 

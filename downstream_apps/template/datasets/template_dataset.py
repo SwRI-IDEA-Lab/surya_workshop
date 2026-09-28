@@ -4,6 +4,23 @@ from typing import Callable, Literal
 from workshop_infrastructure.datasets.helio import HelioNetCDFDataset
 
 
+def flare_label_transform(intensity: pd.Series) -> pd.Series:
+    """Normalize flare peak intensity into the label the template regresses on.
+
+      1. log10, because GOES intensity spans many orders of magnitude.
+      2. Shift so the minimum is 0.
+      3. Divide by 2 * std, so most values land in [-1, 1].
+
+    This lives here, next to the dataset that consumes it, because the label definition
+    has to be identical in the notebook and in the training script. When it was defined
+    separately in each, the notebook silently trained on raw GOES intensity while the
+    script trained on this -- two runs of "the same" experiment, different targets.
+    """
+    log_intensity = np.log10(intensity)
+    shifted = log_intensity - log_intensity.min()
+    return shifted / (2 * shifted.std())
+
+
 class FlareDSDataset(HelioNetCDFDataset):
     """
     Template child class of HelioNetCDFDataset showing how to build a downstream dataset.
