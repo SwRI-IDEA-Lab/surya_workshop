@@ -125,8 +125,11 @@ class ModelConfig:
     time_embedding: TimeEmbeddingConfig = field(default_factory=TimeEmbeddingConfig)
 
     # --- Fine-tuning head ---
-    # One of: "global_average" | "global_max" | "attention" | "transformer" | "class_token"
-    pooling: str = "class_token"
+    # One of: "global_average" | "global_max" | "attention" | "transformer" | "class_token".
+    # global_average is the default: it adds no parameters and every token carries
+    # gradient from the first step, whereas a class_token must first learn what to attend
+    # to -- which a short fine-tune on a few hundred samples may never reach.
+    pooling: str = "global_average"
     penultimate_linear_layer: bool = True
     dropout: float = 0.2
     freeze_backbone: bool = False
