@@ -282,6 +282,12 @@ class TrainingConfig:
     model: ModelConfig
     output: OutputConfig = field(default_factory=OutputConfig)
     learning_rate: float = 1e-4
+    # The fine-tuning head trains at learning_rate * head_lr_multiplier. The head starts
+    # random while the LoRA adapters start as a small perturbation of a backbone that
+    # already works, so one rate for both is a compromise; 1.0 disables the split.
+    head_lr_multiplier: float = 10.0
+    # Applied to the adapters (or the backbone under full fine-tuning), never to the head.
+    weight_decay: float = 0.0
     max_epochs: int = 20
     batch_size: int = 2
     num_workers: int = 8
