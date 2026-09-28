@@ -209,6 +209,17 @@ class DataConfig:
     s3_boto3_max_concurrency: int = 4   # parallel threads per multipart download
     s3_boto3_part_size_mb: int = 64     # part size in MB for multipart downloads
 
+    # --- Resolution ---
+    # Native pixel size of one frame in the NetCDF files. Only change this if your index
+    # points at something other than full-disk 4096x4096 SDO data.
+    native_img_size: int = 4096
+    # Spatial average-pooling factor applied by the dataset, so each sample arrives at
+    # native_img_size // pooling. This is the main VRAM and speed knob: the token count
+    # falls with the square of it. model.img_size must agree (validated in
+    # TrainingConfig.__post_init__), and load_pretrained_weights() restricts the
+    # pretrained spectral filters to the smaller token grid.
+    pooling: int = 1
+
     # --- Development ---
     max_samples: Optional[int] = None
 
@@ -217,6 +228,16 @@ class DataConfig:
             raise ValueError(
                 f"Unknown data.s3_mode {self.s3_mode!r}. "
                 f"Valid modes are: {', '.join(VALID_S3_MODES)}."
+            )
+        if not isinstance(self.pooling, int) or isinstance(self.pooling, bool) or self.pooling < 1:
+            raise ValueError(
+                f"data.pooling must be an integer >= 1, got {self.pooling!r}. "
+                "It is the average-pooling factor applied to each frame (1 = no pooling)."
+            )
+        if self.native_img_size % self.pooling:
+            raise ValueError(
+                f"data.pooling ({self.pooling}) must divide data.native_img_size "
+                f"({self.native_img_size}) exactly."
             )
 
 
@@ -285,6 +306,20 @@ class TrainingConfig:
                 f"model.time_embedding.time_dim ({time_dim}) must be <= "
                 f"len(data.time_delta_input_minutes) ({n_available}): the dataset samples "
                 "time_dim frames from that list and cannot sample more than it contains."
+            )
+        # The dataset hands the model frames of native_img_size // pooling pixels. If
+        # model.img_size disagrees, the patch grid the model builds does not match the
+        # tensor it receives, and the failure surfaces as an opaque reshape error deep in
+        # the first forward pass -- or, worse, silently loads the wrong spectral filters.
+        expected_img_size = self.data.native_img_size // self.data.pooling
+        if self.model.img_size != expected_img_size:
+            raise ValueError(
+                f"model.img_size ({self.model.img_size}) does not match the frames the "
+                f"dataset produces: data.native_img_size ({self.data.native_img_size}) // "
+                f"data.pooling ({self.data.pooling}) = {expected_img_size}.\n"
+                f"Set model.img_size: {expected_img_size}, or set data.pooling so that "
+                f"data.native_img_size // data.pooling == model.img_size if you meant to "
+                f"train at {self.model.img_size}x{self.model.img_size}."
             )
 
 

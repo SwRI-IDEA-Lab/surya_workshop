@@ -63,6 +63,9 @@ def _base_dataset_kwargs(cfg, scalers) -> dict:
         # Channels and normalization
         channels=cfg.data.channels,
         scalers=scalers,
+        # Resolution: each frame arrives at native_img_size // pooling pixels.
+        # TrainingConfig validates that cfg.model.img_size agrees.
+        pooling=cfg.data.pooling,
         # Augmentation
         drop_hmi_probability=cfg.drop_hmi_probability,
         use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
