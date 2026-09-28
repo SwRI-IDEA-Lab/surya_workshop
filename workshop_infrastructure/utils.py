@@ -300,9 +300,76 @@ def discover_head_modules(model: torch.nn.Module) -> list[str]:
     return head_names
 
 
+def resolve_trainable_backbone_modules(
+    model: torch.nn.Module, requested: Sequence[str]
+) -> list[str]:
+    """Validate backbone submodule names that must stay trainable under LoRA.
+
+    The ``head_`` convention in :func:`discover_head_modules` covers the fine-tuning
+    head, which is a direct child of the top-level model. It deliberately does not
+    cover the backbone -- freezing the backbone is the point of LoRA. But an app that
+    changes the *shape* of an input or output layer of the backbone has to train that
+    layer: a tokenizer rebuilt for a different channel count is initialized from a
+    slice of the pretrained weights and then has to re-fit, and a low-rank adapter
+    downstream cannot stand in for it (LoRA acts after tokenization and cannot change
+    a per-channel linear map).
+
+    This is the explicit, config-driven exception for those layers
+    (``model.trainable_backbone_modules``). It is deliberately not a convention: the
+    default is empty, so nothing in the backbone trains unless a config says so by
+    name.
+
+    Each name is resolved against ``model.named_modules()`` and must match exactly
+    one module. PEFT matches ``modules_to_save`` entries with a bare
+    ``key.endswith(name)`` -- no dot boundary -- which is the same trap
+    ``discover_head_modules`` guards the head against: ``patch_embed`` would also
+    match anything ending in that string. Requiring a unique match makes an ambiguous
+    entry an error at startup rather than a module silently wrapped by accident.
+
+    Args:
+        model: The model LoRA is about to be applied to, before ``get_peft_model``.
+        requested: Backbone submodule names, as written in the config, e.g.
+            ``["embedding.patch_embed"]``.
+
+    Returns:
+        The names, unchanged, once every one is known to resolve uniquely.
+
+    Raises:
+        ValueError: If a name matches no module, or more than one.
+    """
+    if not requested:
+        return []
+
+    names = [n for n, _ in model.named_modules() if n]
+    resolved = []
+    for want in requested:
+        matches = [n for n in names if n == want or n.endswith(f".{want}")]
+        if not matches:
+            suggestion = [n for n in names if want.split(".")[-1] in n][:5]
+            raise ValueError(
+                f"model.trainable_backbone_modules names {want!r}, which matches no "
+                "module in this model, so it would silently do nothing.\n"
+                + (
+                    f"Did you mean one of: {', '.join(suggestion)}?"
+                    if suggestion
+                    else "Check the name against model.named_modules()."
+                )
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"model.trainable_backbone_modules names {want!r}, which matches "
+                f"{len(matches)} modules: {', '.join(matches)}.\n"
+                "PEFT matches these names by suffix, so an ambiguous entry would wrap "
+                "more than intended. Qualify the name until it matches exactly one."
+            )
+        resolved.append(want)
+    return resolved
+
+
 def apply_peft_lora(
     model: torch.nn.Module,
     lora_config: LoraAdapterConfig,
+    trainable_backbone_modules: Sequence[str] = (),
 ) -> torch.nn.Module:
     """
     Applies PEFT LoRA adapters to a model.
@@ -313,14 +380,29 @@ def apply_peft_lora(
     head is frozen at its random initialisation and LoRA fits adapters to a
     random readout.
 
+    ``trainable_backbone_modules`` adds named backbone submodules to that same
+    list, for an app that changed the shape of one of them; see
+    :func:`resolve_trainable_backbone_modules`.
+
+    ``embedding.pos_embed`` never needs to appear there: it is a buffer the model
+    regenerates from (img_size, patch_size, embed_dim), already handled by
+    ``_REGENERATED_BUFFERS`` in :func:`load_pretrained_weights`, and buffers are
+    not parameters PEFT could freeze.
+
     Args:
         model: The model to apply LoRA to.
         lora_config: A LoraAdapterConfig instance (from workshop_infrastructure.configs).
+        trainable_backbone_modules: Backbone submodules to keep fully trainable,
+            from ``model.trainable_backbone_modules`` in the config. Empty by
+            default, so LoRA freezes the whole backbone unless a config opts a
+            layer out by name.
 
     Returns:
         Model with PEFT LoRA adapters applied.
     """
-    modules_to_save = discover_head_modules(model)
+    head_modules = discover_head_modules(model)
+    backbone_modules = resolve_trainable_backbone_modules(model, trainable_backbone_modules)
+    modules_to_save = head_modules + backbone_modules
 
     print(
         f"Applying PEFT LoRA: r={lora_config.r}, alpha={lora_config.lora_alpha}, "
@@ -351,16 +433,31 @@ def apply_peft_lora(
     print(f"[LoRA] Adapted modules ({len(adapted)}):")
     for name in adapted:
         print(f"[LoRA]   {name}")
-    print(f"[LoRA] Trainable head modules (modules_to_save): {modules_to_save}")
+    print(f"[LoRA] Trainable head modules (modules_to_save): {head_modules}")
+    if backbone_modules:
+        print(f"[LoRA] Trainable backbone modules (modules_to_save): {backbone_modules}")
 
     # Defensive: current PEFT excludes modules_to_save from adapter injection.
-    # If that ever changes, a head module would get both, so fail loudly.
-    head_adapted = [n for n in adapted if n.split(".")[0].startswith(HEAD_PREFIX)]
-    if head_adapted:
+    # If that ever changes, a saved module would get both, so fail loudly. This also
+    # catches a target_modules entry broad enough to reach one of them -- a bare
+    # "proj" instead of "attn.proj" matches the tokenizer's Conv2d at
+    # embedding.patch_embed.proj, which would adapt the tokenizer *and* mark it
+    # trainable.
+    both = [
+        n
+        for n in adapted
+        if n.split(".")[0].startswith(HEAD_PREFIX)
+        or any(n == m or n.startswith(f"{m}.") or n.endswith(f".{m}") or f".{m}." in n
+               for m in backbone_modules)
+    ]
+    if both:
         raise RuntimeError(
-            "PEFT applied LoRA adapters to fine-tuning head modules, which "
-            f"should be fully trainable instead: {head_adapted}. "
-            "Narrow lora_config.target_modules so it cannot match head layers."
+            "PEFT applied LoRA adapters to modules that should be fully trainable "
+            f"instead: {both}. These are listed in modules_to_save (the head, plus "
+            "model.trainable_backbone_modules), so they must not also receive "
+            "adapters. Narrow lora_config.target_modules so it cannot match them -- "
+            'e.g. "attn.proj" rather than a bare "proj", which also matches the '
+            "patch-embedding tokenizer."
         )
 
     # Log the number of trainable parameters

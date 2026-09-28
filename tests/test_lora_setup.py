@@ -16,10 +16,24 @@ import pytest
 import torch
 from torch import nn
 
-from conftest import DEPTH, EMBED_DIM, N_ATTENTION_BLOCKS, N_SPECTRAL_BLOCKS, make_batch, make_model
+from conftest import (
+    DEPTH,
+    EMBED_DIM,
+    IN_CHANS,
+    N_ATTENTION_BLOCKS,
+    N_SPECTRAL_BLOCKS,
+    PATCH_SIZE,
+    make_batch,
+    make_model,
+)
 from workshop_infrastructure.configs import LoraAdapterConfig
 from workshop_infrastructure.models.finetune_models import ClassToken
-from workshop_infrastructure.utils import HEAD_PREFIX, apply_peft_lora, discover_head_modules
+from workshop_infrastructure.utils import (
+    HEAD_PREFIX,
+    apply_peft_lora,
+    discover_head_modules,
+    resolve_trainable_backbone_modules,
+)
 
 
 def adapted_modules(peft_model):
@@ -261,3 +275,114 @@ def test_class_token_init_modes():
     assert torch.count_nonzero(ClassToken(EMBED_DIM, init="randn").token) > 0
     with pytest.raises(ValueError):
         ClassToken(EMBED_DIM, init="uniform")
+
+
+# ---------------------------------------------------------------------------
+# Backbone layers an app deliberately keeps trainable
+# ---------------------------------------------------------------------------
+#
+# LoRA freezes the backbone, which is the point. But an app that changes the *shape* of
+# an input layer -- a tokenizer rebuilt for a subset of the 13 pretraining channels --
+# has to train it: the sliced tokenizer is not the function the backbone was trained to
+# consume, and a low-rank adapter cannot stand in for it, because it acts after
+# tokenization and cannot change a per-channel linear map. Without this list the
+# tokenizer is frozen at that slice and nothing in the logs says so.
+
+TOKENIZER = "embedding.patch_embed"
+
+
+def _tokenizer_params(model):
+    return {n: p for n, p in model.named_parameters() if "patch_embed" in n}
+
+
+def test_tokenizer_is_frozen_by_default():
+    """The default must stay "LoRA freezes the backbone" -- this is opt-in only."""
+    model = apply_peft_lora(make_model(), LoraAdapterConfig())
+    assert not any(p.requires_grad for p in _tokenizer_params(model).values())
+
+
+def test_named_backbone_module_stays_trainable():
+    model = apply_peft_lora(
+        make_model(), LoraAdapterConfig(), trainable_backbone_modules=[TOKENIZER]
+    )
+    trainable = {n for n, p in _tokenizer_params(model).items() if p.requires_grad}
+    assert trainable, "tokenizer must be trainable when named"
+    # Both the conv weight and its bias, not just one of them.
+    assert sum(n.endswith(("proj.weight", "proj.bias")) for n in trainable) == 2
+
+
+def test_naming_one_backbone_module_does_not_unfreeze_the_rest():
+    model = apply_peft_lora(
+        make_model(), LoraAdapterConfig(), trainable_backbone_modules=[TOKENIZER]
+    )
+    leaked = [
+        n
+        for n, p in model.named_parameters()
+        if p.requires_grad
+        and "patch_embed" not in n
+        and "lora_" not in n
+        and HEAD_PREFIX not in n
+    ]
+    assert leaked == [], f"LoRA must still freeze the rest of the backbone, got {leaked}"
+
+
+def test_gradient_reaches_the_trainable_tokenizer():
+    """requires_grad is necessary but not sufficient -- PEFT dispatches through a
+    wrapper, so the *trainable copy* is what must receive the gradient."""
+    model = apply_peft_lora(
+        make_model(pooling="global_average"),
+        LoraAdapterConfig(),
+        trainable_backbone_modules=[TOKENIZER],
+    )
+    model(make_batch()).sum().backward()
+
+    wrapper = model.base_model.model.backbone.embedding.patch_embed
+    assert wrapper.modules_to_save["default"].proj.weight.grad is not None
+    assert wrapper.original_module.proj.weight.grad is None
+
+
+def test_trainable_tokenizer_gets_no_lora_adapters():
+    """It should be fully trainable *instead of* adapted, never both."""
+    model = apply_peft_lora(
+        make_model(), LoraAdapterConfig(), trainable_backbone_modules=[TOKENIZER]
+    )
+    assert [n for n in adapted_modules(model) if "patch_embed" in n] == []
+
+
+def test_trainable_tokenizer_adds_the_expected_parameter_count():
+    base = apply_peft_lora(make_model(), LoraAdapterConfig())
+    with_tok = apply_peft_lora(
+        make_model(), LoraAdapterConfig(), trainable_backbone_modules=[TOKENIZER]
+    )
+    count = lambda m: sum(p.numel() for p in m.parameters() if p.requires_grad)
+    conv = EMBED_DIM * IN_CHANS * 1 * PATCH_SIZE * PATCH_SIZE + EMBED_DIM  # time_dim=1
+    assert count(with_tok) - count(base) == conv
+
+
+def test_unknown_backbone_module_name_raises_instead_of_doing_nothing():
+    with pytest.raises(ValueError, match="matches no module"):
+        resolve_trainable_backbone_modules(make_model(), ["patch_embedd"])
+
+
+def test_ambiguous_backbone_module_name_raises():
+    """PEFT matches modules_to_save by suffix, so an ambiguous name wraps too much."""
+    with pytest.raises(ValueError, match="matches 3 modules"):
+        resolve_trainable_backbone_modules(make_model(), ["norm1"])
+
+
+def test_empty_list_resolves_to_empty():
+    assert resolve_trainable_backbone_modules(make_model(), []) == []
+
+
+def test_trainable_tokenizer_is_not_in_the_head_optimizer_group():
+    """It starts from pretrained weights, so it belongs at the backbone learning rate,
+    not the 10x rate a randomly-initialised read-out needs."""
+    from downstream_apps.template.lightning_modules.pl_finetune import (
+        FlareFinetuneLightningModule as M,
+    )
+
+    model = apply_peft_lora(
+        make_model(), LoraAdapterConfig(), trainable_backbone_modules=[TOKENIZER]
+    )
+    tok = next(n for n, p in _tokenizer_params(model).items() if p.requires_grad)
+    assert not M._is_head_parameter(tok)

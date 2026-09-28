@@ -134,6 +134,25 @@ class ModelConfig:
     dropout: float = 0.2
     freeze_backbone: bool = False
 
+    # --- Backbone layers that must stay trainable under LoRA ---
+    # Named backbone submodules (e.g. ["embedding.patch_embed"]) that apply_peft_lora
+    # adds to PEFT's modules_to_save, so they train instead of being frozen. Empty by
+    # default: freezing the backbone is the point of LoRA, and this is the deliberate
+    # exception for an app that changed the *shape* of an input or output layer.
+    #
+    # The case it exists for: an app feeding Surya a subset of the 13 pretraining
+    # channels rebuilds the tokenizer at that channel count, initialized from a slice
+    # of the pretrained weights (see models/weight_adaptation.py). That slice is not
+    # the function the backbone was trained to consume -- the tokenizer's output is
+    # summed with a fixed-amplitude pos_embed before any normalization, so dropping
+    # channels shifts the content-to-position ratio in every token -- and the
+    # tokenizer is the only layer that can rescale its own output. A low-rank adapter
+    # cannot: it acts after tokenization and cannot change a per-channel linear map.
+    #
+    # Names are resolved and checked for uniqueness at LoRA-application time, because
+    # PEFT matches modules_to_save by suffix. See resolve_trainable_backbone_modules.
+    trainable_backbone_modules: List[str] = field(default_factory=list)
+
     # --- LoRA ---
     use_lora: bool = True
     lora_config: LoraAdapterConfig = field(default_factory=LoraAdapterConfig)

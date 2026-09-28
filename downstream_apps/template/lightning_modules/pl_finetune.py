@@ -26,6 +26,14 @@ sensible prior when you have few samples.
 
 Set ``head_lr_multiplier=1.0`` and ``weight_decay=0.0`` to recover plain Adam over
 everything, i.e. exactly what the baseline module does.
+
+**A trainable backbone layer lands in the backbone group, not the head group.** An app
+that keeps part of the backbone trainable via ``model.trainable_backbone_modules`` -- a
+tokenizer rebuilt for a different channel count, say -- gets it at the base learning
+rate with weight decay, because ``_is_head_parameter`` matches on the ``head_`` prefix
+and such a layer does not carry it. That is the right group for it: it starts from
+pretrained weights, so it wants the rate the rest of the pretrained model gets, not the
+10x rate a randomly-initialized read-out needs.
 """
 
 from __future__ import annotations

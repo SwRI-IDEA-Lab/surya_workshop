@@ -166,3 +166,90 @@ def test_load_adapts_a_two_frame_patch_embedding_into_a_one_frame_model(tmp_path
     assert torch.allclose(loaded, expected)
     # And the model still runs.
     model(make_batch(batch_size=2))
+
+
+# ---------------------------------------------------------------------------
+# Patch embedding: a subset of the pretrained channels
+# ---------------------------------------------------------------------------
+#
+# The app this was added for maps three EUV channels onto one magnetogram, so its
+# tokenizer takes 3 of the 13 channels the checkpoint was pretrained with. Getting the
+# gather wrong here does not fail -- it loads some *other* channel's tokenizer, and the
+# run looks entirely normal. Hence a fixture whose every plane says which (channel, frame)
+# it came from, rather than shape assertions.
+
+def _identifiable_ckpt(in_chans=13, frames=2, embed_dim=4, patch=2):
+    """A checkpoint weight where plane (c, t) is filled with the value c * 100 + t."""
+    w = torch.zeros(embed_dim, in_chans * frames, patch, patch)
+    for c in range(in_chans):
+        for t in range(frames):
+            w[:, c * frames + t] = c * 100 + t
+    return w
+
+
+def _planes(w):
+    return [w[0, i, 0, 0].item() for i in range(w.shape[1])]
+
+
+def test_channel_subset_takes_the_named_channels_in_the_models_order():
+    ckpt = _identifiable_ckpt()
+    # aia304, aia193, aia171 sit at positions 5, 3, 2 of the pretraining order. The
+    # model's channel order is what it asks for, not ascending.
+    out = adapt_patch_embed_weight(
+        ckpt, (4, 3, 2, 2), in_chans=3, ckpt_in_chans=13, channel_indices=[5, 3, 2]
+    )
+    assert out.shape == (4, 3, 2, 2)
+    # Frame 1 of each: the reference timestep, as in the no-subset case.
+    assert _planes(out) == [501, 301, 201]
+
+
+def test_channel_subset_composes_with_frame_selection():
+    ckpt = _identifiable_ckpt(frames=3)
+    # 13x3 -> 2 channels x 2 frames: channels 0 and 7, trailing two frames each.
+    out = adapt_patch_embed_weight(
+        ckpt, (4, 4, 2, 2), in_chans=2, ckpt_in_chans=13, channel_indices=[0, 7]
+    )
+    assert _planes(out) == [1, 2, 701, 702]
+
+
+def test_channel_subset_is_a_noop_when_asked_for_every_channel_in_order():
+    ckpt = _identifiable_ckpt()
+    explicit = adapt_patch_embed_weight(
+        ckpt, (4, 13, 2, 2), in_chans=13, ckpt_in_chans=13, channel_indices=list(range(13))
+    )
+    inferred = adapt_patch_embed_weight(ckpt, (4, 13, 2, 2), in_chans=13)
+    assert torch.equal(explicit, inferred)
+
+
+def test_a_channel_count_change_without_indices_raises_rather_than_guessing():
+    # (embed_dim, 26, p, p) -> (embed_dim, 3, p, p) is consistent with several
+    # channel/frame splits, each selecting different planes. Guessing is not an option.
+    ckpt = _identifiable_ckpt()
+    with pytest.raises(ValueError, match="no channel_indices|cannot be read off"):
+        adapt_patch_embed_weight(ckpt, (4, 3, 2, 2), in_chans=3, ckpt_in_chans=13)
+
+
+def test_wrong_number_of_channel_indices_raises():
+    ckpt = _identifiable_ckpt()
+    with pytest.raises(ValueError, match="entries but the model takes"):
+        adapt_patch_embed_weight(
+            ckpt, (4, 3, 2, 2), in_chans=3, ckpt_in_chans=13, channel_indices=[5, 3]
+        )
+
+
+def test_out_of_range_channel_index_raises():
+    ckpt = _identifiable_ckpt()
+    with pytest.raises(ValueError, match="out-of-range"):
+        adapt_patch_embed_weight(
+            ckpt, (4, 3, 2, 2), in_chans=3, ckpt_in_chans=13, channel_indices=[5, 3, 13]
+        )
+
+
+def test_repeated_channel_index_raises():
+    # Two model channels initialized from the same pretrained tokenizer weights is
+    # almost always a duplicated entry in the config's channel list.
+    ckpt = _identifiable_ckpt()
+    with pytest.raises(ValueError, match="repeats channel"):
+        adapt_patch_embed_weight(
+            ckpt, (4, 3, 2, 2), in_chans=3, ckpt_in_chans=13, channel_indices=[5, 3, 5]
+        )
