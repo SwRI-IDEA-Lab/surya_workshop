@@ -380,8 +380,47 @@ def apply_peft_lora(
     return model
 
 
-def load_pretrained_weights(model: torch.nn.Module, pretrained_path: Optional[str]) -> None:
-    """Load pretrained weights into a fine-tuning model, skipping shape-mismatched keys.
+# Buffers the model regenerates deterministically from (img_size, patch_size, embed_dim).
+# The checkpoint's copy is redundant at the pretraining resolution and *wrong* at any
+# other one, so it is skipped rather than loaded — and skipping it is never an error.
+_REGENERATED_BUFFERS = ("embedding.pos_embed",)
+
+
+def _adapt_pretrained_tensor(key, target_key, value, want_shape, modules):
+    """Convert one shape-mismatched checkpoint tensor, or return None if it cannot be.
+
+    Only two tensors in the Surya checkpoint change shape for legitimate reasons — the
+    patch-embedding convolution (when the number of input frames changes) and the
+    spectral-gating filters (when the token grid changes). See
+    ``workshop_infrastructure/models/weight_adaptation.py`` for why each conversion is
+    the right one. Everything else is a genuine configuration error.
+    """
+    from workshop_infrastructure.models.weight_adaptation import (
+        adapt_patch_embed_weight,
+        truncate_spectral_filter,
+    )
+
+    if key.endswith("patch_embed.proj.weight"):
+        # The Conv2d's parent is the PatchEmbed3D that knows how many frames the model
+        # stacks, which is what turns "26 vs 13 channels" into "2 frames vs 1 frame".
+        patch_embed = modules.get(target_key.rsplit(".", 2)[0])
+        time_dim = getattr(patch_embed, "time_dim", None)
+        if not time_dim or want_shape[1] % time_dim:
+            return None
+        return adapt_patch_embed_weight(value, want_shape, in_chans=want_shape[1] // time_dim)
+
+    if key.endswith("filter.complex_weight"):
+        return truncate_spectral_filter(value, want_shape)
+
+    return None
+
+
+def load_pretrained_weights(
+    model: torch.nn.Module,
+    pretrained_path: Optional[str],
+    strict_shapes: bool = True,
+) -> None:
+    """Load pretrained weights into a fine-tuning model, adapting what can be adapted.
 
     The pretrained checkpoint was saved from HelioSpectFormer directly, so its keys
     are flat (e.g. ``embedding.proj.weight``).  The composed fine-tuning models
@@ -389,26 +428,77 @@ def load_pretrained_weights(model: torch.nn.Module, pretrained_path: Optional[st
     so we try both the original key and the ``backbone.``-prefixed key when matching
     against the current model's state dict.
 
+    Keys whose shape no longer matches are **not** dropped silently. The patch embedding
+    and the spectral filters — together ~170M of the 366M pretrained parameters — are
+    converted (see ``models/weight_adaptation.py``); anything else raises, because a
+    randomly-initialized backbone tensor produces a run that looks normal and is not
+    fine-tuning Surya at all.
+
     Args:
         model: The fine-tuning model to load weights into.
         pretrained_path: Path to the pretrained checkpoint (.pt file). No-op if None.
+        strict_shapes: If True (default), raise when a checkpoint tensor cannot be
+            matched or adapted. Set False to reproduce the old drop-and-continue
+            behaviour — only ever deliberately, e.g. when changing ``embed_dim``.
     """
     if not pretrained_path:
         return
     print(f"Loading pretrained weights from {pretrained_path}.")
     model_state = model.state_dict()
     checkpoint_state = torch.load(pretrained_path, weights_only=True, map_location="cpu")
+    modules = dict(model.named_modules())
 
-    remapped = {}
+    remapped: dict = {}
+    adapted: list[str] = []
+    no_target: list[str] = []
+    mismatched: list[str] = []
+
     for k, v in checkpoint_state.items():
-        for candidate in (k, f"backbone.{k}"):
-            if candidate in model_state and hasattr(v, "shape") and v.shape == model_state[candidate].shape:
-                remapped[candidate] = v
-                break
+        if not hasattr(v, "shape"):
+            continue
+        target = next((c for c in (k, f"backbone.{k}") if c in model_state), None)
+        if target is None:
+            # The fine-tuning models are built with finetune=True, which strips the
+            # pretraining decoder, so its keys having no home here is expected.
+            no_target.append(k)
+            continue
+
+        want = model_state[target].shape
+        if v.shape == want:
+            remapped[target] = v
+            continue
+        if k.endswith(_REGENERATED_BUFFERS):
+            continue
+
+        converted = _adapt_pretrained_tensor(k, target, v, want, modules)
+        if converted is None:
+            mismatched.append(f"  {k}: checkpoint {tuple(v.shape)} vs model {tuple(want)}")
+        else:
+            remapped[target] = converted
+            adapted.append(f"  {k}: checkpoint {tuple(v.shape)} -> model {tuple(want)}")
+
+    if adapted:
+        print("Adapted pretrained tensors to this model's shape:")
+        print("\n".join(adapted))
+    if mismatched:
+        message = (
+            "Pretrained tensor(s) do not fit this model and have no defined conversion:\n"
+            + "\n".join(mismatched)
+            + "\n\nThey would be left at their random initialization, which silently turns "
+            "a Surya fine-tune into a partially-random model. Check model.img_size, "
+            "model.embed_dim, model.depth and model.in_channels against the checkpoint, "
+            "or pass strict_shapes=False if you meant to train these from scratch."
+        )
+        if strict_shapes:
+            raise ValueError(message)
+        print(f"WARNING: {message}")
 
     model_state.update(remapped)
     model.load_state_dict(model_state, strict=True)
-    print(f"Loaded {len(remapped)} / {len(checkpoint_state)} pretrained weights.")
+    print(
+        f"Loaded {len(remapped)} / {len(checkpoint_state)} pretrained tensors "
+        f"({len(adapted)} adapted, {len(no_target)} not present in this model)."
+    )
 
 
 class UploadBestCheckpointToS3(L.Callback):

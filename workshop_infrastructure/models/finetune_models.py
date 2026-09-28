@@ -15,6 +15,70 @@ from workshop_infrastructure.models.embedding import LinearDecoder, PerceiverDec
 
 _VALID_POOLINGS = {"global_average", "global_max", "attention", "transformer", "class_token"}
 
+# Poolings that prepend a global token to the backbone input. Everything else must run
+# with nglo=0 or the long-short attention reshape fails. "transformer" pooling also uses a
+# class token, but concatenates it *after* the backbone, so it is not in this set.
+_POOLINGS_WITH_BACKBONE_CLS_TOKEN = {"class_token"}
+
+
+def nglo_for_pooling(pooling: str) -> int:
+    """Number of extra global tokens the backbone must reserve for this pooling.
+
+    Derived rather than configured: ``nglo`` and ``pooling`` are two spellings of one
+    decision, and a config that let them disagree would fail inside the attention
+    reshape rather than at load time.
+    """
+    if pooling not in _VALID_POOLINGS:
+        raise ValueError(f"pooling must be one of {sorted(_VALID_POOLINGS)}, got {pooling!r}")
+    return 1 if pooling in _POOLINGS_WITH_BACKBONE_CLS_TOKEN else 0
+
+
+def build_surya_backbone(cfg: "ModelConfig", **overrides) -> HelioSpectFormer:
+    """Build the Surya backbone described by a ``ModelConfig``.
+
+    This is the 18-argument block that every fine-tuning model needs and none of them
+    should have to copy. An app that writes its own model (see
+    ``downstream_apps/template/models/finetune_model.py``) calls this for the backbone and
+    then defines only its head.
+
+    ``finetune=True`` is fixed: the pretraining decoder is never wanted downstream.
+    ``nglo`` is passed via ``overrides`` by callers that use a backbone-injected CLS token;
+    it defaults to the value ``nglo_for_pooling(cfg.pooling)`` implies.
+
+    Args:
+        cfg: The ``model:`` section of a loaded config.
+        **overrides: Any ``HelioSpectFormer`` argument to override, plus the ones that
+            live outside ModelConfig (``use_latitude_in_learned_flow``, ``dtype``).
+
+    Returns:
+        An initialized ``HelioSpectFormer``. Pretrained weights are *not* loaded here —
+        call ``load_pretrained_weights()`` on the assembled model, so the head is in
+        place and the backbone keys resolve under their final ``backbone.`` prefix.
+    """
+    kwargs = dict(
+        img_size=cfg.img_size,
+        patch_size=cfg.patch_size,
+        in_chans=cfg.in_channels,
+        embed_dim=cfg.embed_dim,
+        time_embedding=dataclasses.asdict(cfg.time_embedding),
+        depth=cfg.depth,
+        n_spectral_blocks=cfg.spectral_blocks,
+        num_heads=cfg.num_heads,
+        mlp_ratio=cfg.mlp_ratio,
+        drop_rate=cfg.drop_rate,
+        window_size=cfg.window_size,
+        dp_rank=cfg.dp_rank,
+        learned_flow=cfg.learned_flow,
+        init_weights=cfg.init_weights,
+        checkpoint_layers=cfg.checkpoint_layers,
+        rpe=cfg.rpe,
+        ensemble=cfg.ensemble,
+        nglo=nglo_for_pooling(cfg.pooling),
+        finetune=True,
+    )
+    kwargs.update(overrides)
+    return HelioSpectFormer(**kwargs)
+
 
 class ClassToken(nn.Module):
     """A learnable CLS token, wrapped in a Module so PEFT can keep it trainable.
@@ -96,14 +160,7 @@ class HelioSpectformer1D(nn.Module):
     ):
         super().__init__()
 
-        if pooling not in _VALID_POOLINGS:
-            raise ValueError(f"pooling must be one of {_VALID_POOLINGS}, got {pooling!r}")
-
-        # Only "class_token" pooling prepends a global token to the backbone input (via
-        # forward_with_cls_token, below); every other pooling must run with nglo=0 or the
-        # long-short attention reshape fails. "transformer" pooling also uses a class token,
-        # but concatenates it after the backbone, so it is not "class_token" here.
-        nglo = 1 if pooling == "class_token" else 0
+        nglo = nglo_for_pooling(pooling)
 
         self.backbone = HelioSpectFormer(
             img_size=img_size,
@@ -166,12 +223,21 @@ class HelioSpectformer1D(nn.Module):
         else:
             tokens = self.backbone.forward(batch)
 
+        # head_linear is affine and averaging is linear, so for global_average pooling
+        # mean(Linear(t)) == Linear(mean(t)) exactly -- and pooling first applies the
+        # layer to one token instead of every one of them. At 64x64 tokens that is 4096x
+        # less work in the head and one fewer (B, L, D) activation held for the backward
+        # pass. The order is *not* interchangeable for any other pooling.
+        if self.pooling == "global_average":
+            agg_tokens = torch.mean(tokens, dim=1)
+            if self.penultimate_linear_layer_enabled:
+                agg_tokens = self.head_linear(agg_tokens)
+            return self._finish(agg_tokens)
+
         if self.penultimate_linear_layer_enabled:
             tokens = self.head_linear(tokens)
 
-        if self.pooling == "global_average":
-            agg_tokens = torch.mean(tokens, dim=1)
-        elif self.pooling == "global_max":
+        if self.pooling == "global_max":
             agg_tokens, _ = torch.max(tokens, dim=1)
         elif self.pooling == "attention":
             tokens = tokens.permute(1, 0, 2)
@@ -187,9 +253,12 @@ class HelioSpectformer1D(nn.Module):
         elif self.pooling == "class_token":
             agg_tokens = tokens.squeeze(dim=1)
 
+        return self._finish(agg_tokens)
+
+    def _finish(self, agg_tokens):
+        """Dropout and unembed the pooled (B, D) representation into (B,) or (B, out)."""
         if self.head_dropout is not None:
             agg_tokens = self.head_dropout(agg_tokens)
-
         return self.head_unembed(agg_tokens).squeeze(dim=1)
 
     @classmethod

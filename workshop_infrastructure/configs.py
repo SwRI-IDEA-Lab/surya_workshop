@@ -51,6 +51,14 @@ VALID_S3_MODES = ("download", "simplecache", "stream")
 #             backward, so learned_flow: true is incompatible with this setting.
 VALID_DETERMINISTIC = (True, False, "warn")
 
+# Accepted values for training.precision, passed straight to lightning.Trainer.
+#   "bf16-mixed" — the default. Half the activation memory of fp32 with fp32-range
+#                  exponents, so no loss scaling is needed. Requires Ampere or newer.
+#   "16-mixed"   — fp16 autocast with a gradient scaler; for pre-Ampere GPUs.
+#   "32-true"    — full fp32. Roughly doubles activation memory; use when debugging a
+#                  suspected precision problem, and on CPU.
+VALID_PRECISIONS = ("bf16-mixed", "16-mixed", "32-true")
+
 
 @dataclass
 class TimeEmbeddingConfig:
@@ -117,8 +125,11 @@ class ModelConfig:
     time_embedding: TimeEmbeddingConfig = field(default_factory=TimeEmbeddingConfig)
 
     # --- Fine-tuning head ---
-    # One of: "global_average" | "global_max" | "attention" | "transformer" | "class_token"
-    pooling: str = "class_token"
+    # One of: "global_average" | "global_max" | "attention" | "transformer" | "class_token".
+    # global_average is the default: it adds no parameters and every token carries
+    # gradient from the first step, whereas a class_token must first learn what to attend
+    # to -- which a short fine-tune on a few hundred samples may never reach.
+    pooling: str = "global_average"
     penultimate_linear_layer: bool = True
     dropout: float = 0.2
     freeze_backbone: bool = False
@@ -209,8 +220,28 @@ class DataConfig:
     s3_boto3_max_concurrency: int = 4   # parallel threads per multipart download
     s3_boto3_part_size_mb: int = 64     # part size in MB for multipart downloads
 
-    # --- Development ---
+    # --- Resolution ---
+    # Native pixel size of one frame in the NetCDF files. Only change this if your index
+    # points at something other than full-disk 4096x4096 SDO data.
+    native_img_size: int = 4096
+    # Spatial average-pooling factor applied by the dataset, so each sample arrives at
+    # native_img_size // pooling. This is the main VRAM and speed knob: the token count
+    # falls with the square of it. model.img_size must agree (validated in
+    # TrainingConfig.__post_init__), and load_pretrained_weights() restricts the
+    # pretrained spectral filters to the smaller token grid.
+    pooling: int = 1
+
+    # --- Dataset size ---
+    # Train and validation are capped independently so a data-scaling study can vary the
+    # training set while every run is scored on the *same* validation set. max_samples is
+    # a shorthand that sets both when the specific keys are not given.
+    #
+    # The subset is a prefix of a seeded permutation, so it is a random sample of the
+    # whole index (not the earliest N timesteps) and smaller subsets nest inside larger
+    # ones: the 100-sample run trains on a subset of the 1000-sample run's data.
     max_samples: Optional[int] = None
+    max_train_samples: Optional[int] = None
+    max_val_samples: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.s3_mode not in VALID_S3_MODES:
@@ -218,6 +249,22 @@ class DataConfig:
                 f"Unknown data.s3_mode {self.s3_mode!r}. "
                 f"Valid modes are: {', '.join(VALID_S3_MODES)}."
             )
+        if not isinstance(self.pooling, int) or isinstance(self.pooling, bool) or self.pooling < 1:
+            raise ValueError(
+                f"data.pooling must be an integer >= 1, got {self.pooling!r}. "
+                "It is the average-pooling factor applied to each frame (1 = no pooling)."
+            )
+        if self.native_img_size % self.pooling:
+            raise ValueError(
+                f"data.pooling ({self.pooling}) must divide data.native_img_size "
+                f"({self.native_img_size}) exactly."
+            )
+        # The shorthand fills in only what was left unset, so specifying one of the two
+        # explicitly alongside max_samples does what it reads like.
+        if self.max_train_samples is None:
+            self.max_train_samples = self.max_samples
+        if self.max_val_samples is None:
+            self.max_val_samples = self.max_samples
 
 
 @dataclass
@@ -238,6 +285,12 @@ class TrainingConfig:
     model: ModelConfig
     output: OutputConfig = field(default_factory=OutputConfig)
     learning_rate: float = 1e-4
+    # The fine-tuning head trains at learning_rate * head_lr_multiplier. The head starts
+    # random while the LoRA adapters start as a small perturbation of a backbone that
+    # already works, so one rate for both is a compromise; 1.0 disables the split.
+    head_lr_multiplier: float = 10.0
+    # Applied to the adapters (or the backbone under full fine-tuning), never to the head.
+    weight_decay: float = 0.0
     max_epochs: int = 20
     batch_size: int = 2
     num_workers: int = 8
@@ -248,10 +301,17 @@ class TrainingConfig:
     # One of VALID_DETERMINISTIC (above). Defaults to False for speed; set "warn" when
     # you need reproducible results.
     deterministic: Union[bool, str] = False
+    # Passed straight to lightning.Trainer. One of VALID_PRECISIONS (above); "bf16-mixed"
+    # is the default because the pretrained backbone is large and bf16 needs no loss
+    # scaling. Note the spectral blocks upcast to float32 internally regardless.
+    precision: str = "bf16-mixed"
+    # Steps to accumulate before an optimizer step. Effective batch size is
+    # batch_size * accumulate_grad_batches * num_devices, so this buys a large effective
+    # batch on a GPU that cannot hold one.
+    accumulate_grad_batches: int = 1
     rollout_steps: int = 0
     drop_hmi_probability: float = 0.0
     use_latitude_in_learned_flow: bool = False
-    dtype: str = "float32"
     wandb_project: str = "surya_downstream"
     wandb_entity: Optional[str] = None
 
@@ -285,6 +345,34 @@ class TrainingConfig:
                 f"model.time_embedding.time_dim ({time_dim}) must be <= "
                 f"len(data.time_delta_input_minutes) ({n_available}): the dataset samples "
                 "time_dim frames from that list and cannot sample more than it contains."
+            )
+        # The dataset hands the model frames of native_img_size // pooling pixels. If
+        # model.img_size disagrees, the patch grid the model builds does not match the
+        # tensor it receives, and the failure surfaces as an opaque reshape error deep in
+        # the first forward pass -- or, worse, silently loads the wrong spectral filters.
+        expected_img_size = self.data.native_img_size // self.data.pooling
+        if self.model.img_size != expected_img_size:
+            raise ValueError(
+                f"model.img_size ({self.model.img_size}) does not match the frames the "
+                f"dataset produces: data.native_img_size ({self.data.native_img_size}) // "
+                f"data.pooling ({self.data.pooling}) = {expected_img_size}.\n"
+                f"Set model.img_size: {expected_img_size}, or set data.pooling so that "
+                f"data.native_img_size // data.pooling == model.img_size if you meant to "
+                f"train at {self.model.img_size}x{self.model.img_size}."
+            )
+        if self.precision not in VALID_PRECISIONS:
+            raise ValueError(
+                f"Unknown training.precision {self.precision!r}. "
+                f"Valid values are: {', '.join(repr(p) for p in VALID_PRECISIONS)}."
+            )
+        if (
+            isinstance(self.accumulate_grad_batches, bool)
+            or not isinstance(self.accumulate_grad_batches, int)
+            or self.accumulate_grad_batches < 1
+        ):
+            raise ValueError(
+                "training.accumulate_grad_batches must be an integer >= 1, got "
+                f"{self.accumulate_grad_batches!r}."
             )
 
 
@@ -411,37 +499,46 @@ def load_config(
     _check_section_keys(training, _TRAINING_KEYS, "training")
     _check_section_keys(logging_cfg, _LOGGING_KEYS, "logging")
 
+    # Both sections map onto flat TrainingConfig fields, and every key in them has been
+    # validated above, so they can be splatted in. Adding a training: or logging: key is
+    # therefore one edit -- a field on TrainingConfig -- rather than three.
     return TrainingConfig(
         job_id=raw["job_id"],
         data=data_cfg,
         model=model_cfg,
         output=_from_dict(OutputConfig, raw.get("output", {}) or {}, "output"),
-        learning_rate=training.get("learning_rate", 1e-4),
-        max_epochs=training.get("max_epochs", 20),
-        batch_size=training.get("batch_size", 2),
-        num_workers=training.get("num_workers", 8),
-        seed=training.get("seed", 42),
-        deterministic=training.get("deterministic", False),
-        rollout_steps=training.get("rollout_steps", 0),
-        drop_hmi_probability=training.get("drop_hmi_probability", 0.0),
-        use_latitude_in_learned_flow=training.get("use_latitude_in_learned_flow", False),
-        dtype=training.get("dtype", "float32"),
-        wandb_project=logging_cfg.get("wandb_project", "surya_downstream"),
-        wandb_entity=logging_cfg.get("wandb_entity"),
+        **training,
+        **logging_cfg,
     )
 
 
-# The training: and logging: sections map onto flat TrainingConfig fields rather than
-# onto a dataclass of their own, so their keys are checked explicitly.
-_TRAINING_KEYS = frozenset({
-    "learning_rate", "max_epochs", "batch_size", "num_workers", "seed", "deterministic",
-    "rollout_steps", "drop_hmi_probability", "use_latitude_in_learned_flow", "dtype",
-})
+# The training: and logging: sections have no dataclass of their own; their keys are the
+# flat fields of TrainingConfig, split between the two by _LOGGING_KEYS. Deriving them
+# from the dataclass means a new field is accepted by the YAML the moment it is declared.
 _LOGGING_KEYS = frozenset({"wandb_project", "wandb_entity"})
+_TRAINING_KEYS = frozenset(
+    {f.name for f in dc_fields(TrainingConfig)} - {"job_id", "data", "model", "output"}
+) - _LOGGING_KEYS
+
+# Keys that used to exist and now have a different name (or none). Matching one produces
+# a message that says what to write instead, rather than a list of 14 valid alternatives.
+_RETIRED_KEYS = {
+    "dtype": (
+        "training.dtype never had any effect -- it was passed to the backbone as a string "
+        "and ignored. Use training.precision (bf16-mixed | 16-mixed | 32-true), which is "
+        "passed to lightning.Trainer and does control the compute dtype."
+    ),
+}
 
 
 def _check_section_keys(section: dict, valid: frozenset, name: str) -> None:
     """Raise on unrecognized keys in a section that has no dataclass of its own."""
+    retired = [k for k in section if k in _RETIRED_KEYS and k not in valid]
+    if retired:
+        raise ValueError(
+            f"Retired key(s) in '{name}:' section of the config:\n"
+            + "\n".join(f"  {k}: {_RETIRED_KEYS[k]}" for k in sorted(retired))
+        )
     unknown = sorted(set(section) - valid)
     if unknown:
         raise ValueError(

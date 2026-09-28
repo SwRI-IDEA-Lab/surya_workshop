@@ -63,9 +63,14 @@ def _base_dataset_kwargs(cfg, scalers) -> dict:
         # Channels and normalization
         channels=cfg.data.channels,
         scalers=scalers,
+        # Resolution: each frame arrives at native_img_size // pooling pixels.
+        # TrainingConfig validates that cfg.model.img_size agrees.
+        pooling=cfg.data.pooling,
         # Augmentation
         drop_hmi_probability=cfg.drop_hmi_probability,
         use_latitude_in_learned_flow=cfg.use_latitude_in_learned_flow,
+        # Reproducible subsetting; the per-split cap is added in build_helio_datasets().
+        subsample_seed=cfg.seed,
         # Storage: local root, and how s3:// paths in the index are read
         sdo_data_root_path=cfg.data.sdo_data_root_path,
         s3_mode=cfg.data.s3_mode,
@@ -93,17 +98,38 @@ def build_helio_datasets(
             task-specific parameters your subclass adds.
 
     Returns:
-        ``(train_dataset, val_dataset)``. They differ only in the index they read and in
-        ``phase``: the validation set uses ``phase="val"``, which disables the random
-        channel masking and vertical flips that are applied during training.
+        ``(train_dataset, val_dataset)``. They differ in the index they read, in
+        ``phase`` (the validation set uses ``phase="val"``, which disables the random
+        channel masking and vertical flips applied during training), and in their size
+        cap: ``data.max_train_samples`` and ``data.max_val_samples`` are separate, so a
+        data-scaling study can vary the training set while every run is scored on the
+        same validation set.
     """
     if scalers is None:
         scalers = build_scalers(info=cfg.data.scalers_path)
 
+    if "max_number_of_samples" in task_kwargs:
+        raise TypeError(
+            "max_number_of_samples is set from the config, not passed here: the whole "
+            "point of the split is that train and validation get different caps.\n"
+            "Use data.max_train_samples / data.max_val_samples in the YAML (or "
+            "data.max_samples to set both), and drop the argument from this call."
+        )
+
     common = {**_base_dataset_kwargs(cfg, scalers), **task_kwargs}
 
-    train_dataset = dataset_cls(index_path=cfg.data.train_data_path, phase="train", **common)
-    val_dataset = dataset_cls(index_path=cfg.data.valid_data_path, phase="val", **common)
+    train_dataset = dataset_cls(
+        index_path=cfg.data.train_data_path,
+        phase="train",
+        max_number_of_samples=cfg.data.max_train_samples,
+        **common,
+    )
+    val_dataset = dataset_cls(
+        index_path=cfg.data.valid_data_path,
+        phase="val",
+        max_number_of_samples=cfg.data.max_val_samples,
+        **common,
+    )
     return train_dataset, val_dataset
 
 
@@ -144,7 +170,6 @@ def build_helio_dataloaders(
         batch_size=cfg.batch_size,
         num_workers=workers,
         pin_memory=True,
-        drop_last=True,
     )
     if workers > 0:
         # "spawn": the dataset holds an s3fs/boto3 handle that does not survive fork.
@@ -158,9 +183,13 @@ def build_helio_dataloaders(
     shuffle_generator = torch.Generator()
     shuffle_generator.manual_seed(base_seed)
 
+    # drop_last=True on training keeps every step the same shape (DDP wants that, and a
+    # ragged final batch makes a noisy gradient). Validation keeps its last partial batch:
+    # dropping it would quietly score the run on fewer samples than max_val_samples asked
+    # for -- at batch_size 8 and 20 validation samples, on 16 of them.
     train_loader = DataLoader(
-        train_dataset, shuffle=True, generator=shuffle_generator, **loader_kwargs
+        train_dataset, shuffle=True, generator=shuffle_generator, drop_last=True, **loader_kwargs
     )
     # No generator for validation: it is not shuffled, so there is nothing to seed.
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
     return train_loader, val_loader
