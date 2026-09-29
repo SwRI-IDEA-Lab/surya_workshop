@@ -294,17 +294,12 @@ def save_prediction_figure(
     pred = prediction[0].float().cpu().numpy()
     truth = batch["forecast"][0].squeeze(1).float().cpu().numpy()
 
-    # inverse_transform_data expects (C, H, W) and indexes its per-channel statistics by
-    # the dataset's channel order, so a prediction over target_channels only has to be
-    # placed in a full-width stack first.
-    def to_physical(stack):
-        full = np.zeros((len(dataset.channels), *stack.shape[1:]), dtype=np.float32)
-        for i, name in enumerate(dataset.target_channels):
-            full[dataset.channels.index(name)] = stack[i]
-        physical = dataset.inverse_transform_data(full)
-        return np.stack([physical[dataset.channels.index(n)] for n in dataset.target_channels])
-
-    pred_phys, truth_phys = to_physical(pred), to_physical(truth)
+    # inverse_transform_subset, not inverse_transform_data: the latter indexes its
+    # per-channel statistics positionally by dataset.channels, and these stacks hold
+    # target_channels in their own order. See the method's docstring -- getting this wrong
+    # does not raise, it silently returns the wrong channel's units.
+    pred_phys = dataset.inverse_transform_subset(pred, dataset.target_channels)
+    truth_phys = dataset.inverse_transform_subset(truth, dataset.target_channels)
 
     n = len(dataset.target_channels)
     fig, axes = plt.subplots(n, 3, figsize=(13, 4.2 * n), squeeze=False)

@@ -65,6 +65,45 @@ class Euv2MagDataset(HelioNetCDFDataset):
         self._input_indices = [position[c] for c in self.input_channels]
         self._target_indices = [position[c] for c in self.target_channels]
 
+    def inverse_transform_subset(self, data, channel_names: list[str]):
+        """Undo normalization for a stack holding only ``channel_names``, in that order.
+
+        **Why this exists.** ``HelioNetCDFDataset.inverse_transform_data`` indexes its
+        per-channel statistics positionally, by ``self.channels``. What this dataset hands
+        back is *not* in that order: ``ts`` holds ``input_channels`` and ``forecast`` holds
+        ``target_channels``, each in its own order. Calling ``inverse_transform_data``
+        directly on either applies the wrong channel's mean and scale factor -- and it does
+        not raise, it just returns numbers that look like a magnetogram and are not one.
+
+        For this app's shipped config the mismatch is total: ``ts[0]`` is ``aia304`` while
+        ``channels[0]`` is ``aia171``.
+
+        So scatter the subset into a full-width stack by name, invert, and gather back.
+
+        Args:
+            data: ``(len(channel_names), H, W)``, normalized.
+            channel_names: What each channel of ``data`` is, in order. Usually
+                ``self.input_channels`` or ``self.target_channels``.
+
+        Returns:
+            The same shape, in physical units (DN, Gauss, m/s).
+        """
+        import numpy as np
+
+        data = np.asarray(data)
+        if data.ndim != 3 or data.shape[0] != len(channel_names):
+            raise ValueError(
+                f"Expected data of shape (len(channel_names)={len(channel_names)}, H, W), "
+                f"got {data.shape}. Pass a single frame -- index the time axis first, e.g. "
+                'item["ts"][:, 0, ...].'
+            )
+
+        full = np.zeros((len(self.channels), *data.shape[1:]), dtype=np.float32)
+        for i, name in enumerate(channel_names):
+            full[self.channels.index(name)] = data[i]
+        physical = self.inverse_transform_data(full)
+        return np.stack([physical[self.channels.index(n)] for n in channel_names])
+
     def __getitem__(self, idx: int) -> dict:
         """Return the base sample with ``ts`` and ``forecast`` restricted to their channels.
 

@@ -59,6 +59,11 @@ working around it.
 | `3_euv2mag_100train_20val_pilot.py` | `3_finetune_euv2mag.py`. The 100/20 regime is config now, not a filename |
 | `setup_conda_data001.sh` | `workshop_infrastructure/setup_scripts/setup_conda_shared_storage.sh`, with `SURYA_WS_BASE` / `SURYA_WS_ENV` instead of `/data001/finetuning_dh` and `surya_dhegde` |
 | `pilot_100.sbatch` | Same name, no absolute paths; needs `SURYA_WS_CACHE_DIR` |
+| your EUV + HMI channel plots | `0_euv2mag_dataset_dataloader.ipynb`, now via `inverse_transform_subset` (see §5) |
+| "why a simple baseline matters" | `1_euv2mag_baseline.ipynb`, close to verbatim |
+| "To LoRA or not to LoRA" | `2_euv2mag_finetune.ipynb`, close to verbatim, extended with the tokenizer |
+| your truth/prediction/residual plot | the end of notebooks 1 and 2, and `save_prediction_figure()` in the script |
+| `TensorOnlyLightningModule` | deleted. It existed only to unwrap `batch["ts"]` for a baseline that took a bare tensor; the baseline takes the batch dict now, so it shares the Lightning module with the fine-tune |
 
 Your evaluation figure survived, in `save_prediction_figure()` at the bottom of the training
 script — including the inverse transform to Gauss, which is the part that makes it a
@@ -81,7 +86,7 @@ was imported nowhere.
 Also removed: the unused `RegressionFlareModel`, `FlareLightningModule` and `FlareMetrics`
 copies that came along when the template was forked.
 
-## 5. Three things that were silently wrong
+## 5. Four things that were silently wrong
 
 This bears on numbers you may already have shown people.
 
@@ -104,6 +109,19 @@ by summing over the time axis. That instinct was right, and better than what `ma
 Both are superseded: the tokenizer is now built for 3 channels and initialized by *selecting*
 the three channels' pretrained planes at the trailing frame, and `strict_shapes=True` makes
 a silent drop impossible.
+
+**The notebooks taught a metric this app never computed.** Notebooks 1 and 2 explained Root
+Relative Squared Error at some length, with a link to the torchmetrics docs and the rule of
+thumb that a value below 1 beats predicting the mean. `ImageTranslationMetrics` computed MSE
+and MAE — never RRSE. The text came across with the rest of the flare template and nobody
+noticed, because prose does not fail a test. Anyone who read it and went looking for the
+number would not have found one. The rewritten notebooks explain MSE and MAE instead, and why
+this task wants both: a magnetogram is mostly quiet Sun near zero with a thin strong-field
+tail, so MSE is driven almost entirely by that tail while MAE tells you whether the quiet Sun
+is right.
+
+The same sweep caught smaller flare leftovers in the notebook prose — "6294 flares", "log
+normalization on xray flux", a pointer to `1_baseline_template.ipynb` — all now EUV2MAG.
 
 **`ImageTranslationLightningModule` defined `forward` twice.** Python kept the second, so
 the behaviour was fine, but the surviving docstring described the dead one. Also,
@@ -222,20 +240,32 @@ sbatch --export=ALL,SURYA_WS_CACHE_DIR=/scratch/$USER/helio_cache pilot_100.sbat
 To re-run the tokenizer A/B yourself, set `model.trainable_backbone_modules: []` in the YAML
 and compare against the default. `[MODEL] Trainable parameters` should differ by 984,320.
 
-## 9. Still to do
+## 9. What happened to the notebooks
 
-**The three notebooks do not run.** `0_euv2mag_dataset_dataloader.ipynb`,
-`1_euv2mag_baseline.ipynb` and `2_euv2mag_finetune.ipynb` still import
-`EUV2MAG_Dataset`, `helio_boto` and the deleted `config.yaml`. They were deliberately left
-for a second pass rather than half-converted, because the script path had to be settled
-first. When they are rewritten:
+They were rebuilt, and they run. Rather than repairing them in place they were rebuilt from
+the current template notebooks, because a third of their cells were environment scaffolding
+with no app-specific value and two of them were designs that had been superseded rather than
+renamed — the `ChannelAdapter` and the hand-rolled checkpoint loop with its
+`assert len(matched) == 157`. Those are deleted, not fixed.
 
-- Notebook 0's per-channel EUV and inverse-transformed HMI plots are worth keeping — they
-  are the reason that notebook exists.
-- Notebook 1 no longer needs `TensorOnlyLightningModule`: the baseline takes the batch dict
-  now, so it shares the Lightning module with the fine-tune.
-- Notebook 2 should mirror `3_finetune_euv2mag.py` and import from the app's modules rather
-  than retyping them, so the two cannot drift.
+What was kept: your EUV and HMI channel plots, your truth/prediction/residual figure, and the
+markdown that carries the teaching — the baseline-methodology argument and "To LoRA or not to
+LoRA" read close to verbatim. What went: `%cd /data001/...`, the `strings -a libstdc++`
+diagnostic, `CUDA_VISIBLE_DEVICES` juggling beyond one cell, `%mkdir /tmp/helio_s3_cache`
+(the cache directory is `data.s3_cache_dir` now), the hardcoded WandB entity, the
+commented-out blocks, and the duplicated diagnostic prints. They went from 29 / 37 / 45 code
+cells to 14 / 18 / 19.
+
+Two things worth knowing about the result:
+
+- **Nothing is hardcoded.** Every literal that could disagree with the config now reads from
+  `cfg` — the seed, the epochs, the precision, the sample caps. That is the discipline the
+  template adopted in "Stop the notebooks drifting from the script and the config", and it is
+  the only thing keeping notebook 2 and `3_finetune_euv2mag.py` honest, since nothing executes
+  the notebooks automatically. There is no notebook CI in this repo.
+- **The stored outputs were stripped.** The three notebooks carried 5.2 MB of saved results
+  between them, against a template convention of none. They are still in git history if you
+  want a figure back.
 
 **One thing not carried over:** your `environment.yml` pins (`s3fs==2024.6.1`,
 `fsspec==2024.6.1`, `datasets==2.21.0`, `boto3==1.41.5`, `pyarrow=23.*`). They fixed a real

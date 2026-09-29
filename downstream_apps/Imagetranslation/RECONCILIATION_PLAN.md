@@ -146,6 +146,22 @@ distributions, not single numbers.
 6. **Generalized** the conda setup script and the sbatch file.
 7. **Documented**: this file, `MIGRATION.md`, `README.md`, and additions to `CLAUDE.md` and
    `ADAPTING.md`.
+8. **Rebuilt the three notebooks** from the current template notebooks, in a second pass once
+   the script and config were settled. Repairing them in place was considered and rejected: a
+   third of their cells were environment scaffolding, and the `ChannelAdapter` and the
+   hand-rolled checkpoint loop were superseded designs rather than renamed imports. The
+   developer's plots and teaching markdown were ported across; 29 / 37 / 45 code cells became
+   14 / 18 / 19, and 5.2 MB of stored outputs were stripped to match the template's
+   convention of committing none.
+
+   Two defects surfaced during the rebuild. The notebooks taught **RRSE**, a metric this app
+   never computed — inherited prose from the flare template, invisible because prose does not
+   fail a test. And plotting revealed that `inverse_transform_data` indexes its per-channel
+   statistics positionally by `dataset.channels`, while `ts` and `forecast` hold their own
+   channel subsets in their own order; for the shipped config `ts[0]` is `aia304` while
+   `channels[0]` is `aia171`. `Euv2MagDataset.inverse_transform_subset()` now does the
+   scatter-by-name, and the training script's figure uses it too rather than keeping a second
+   copy.
 
 ## What was verified
 
@@ -181,10 +197,11 @@ documentation was corrected to the config rather than the reverse, and the choic
 
 ## What was deliberately not done
 
-- **The three notebooks were not rewritten.** They do not run. This was the agreed sequencing
-  — settle the script and config first — but it means the app currently ships broken
-  notebooks, which is called out in `MIGRATION.md` §9 and the README rather than left to be
-  discovered.
+- **No notebook execution test was added.** This repo has no notebook CI, and adding it would
+  mean a new dependency plus test infrastructure that needs a GPU and cached data to be
+  meaningful. The notebooks were each executed once by hand instead, and what keeps them
+  honest is the same discipline the template relies on: every literal reads from `cfg`, so
+  the notebook and the script cannot numerically disagree even though nothing checks.
 - **The `environment.yml` pins were not folded in**, contrary to the original plan. Comparing
   the actual versions showed the target's pins were newer and deliberate; the plan had been
   written before that comparison. Recorded here because a plan that was wrong on the facts

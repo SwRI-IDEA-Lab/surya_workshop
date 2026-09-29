@@ -125,7 +125,21 @@ including a channel listed in `data.channels` but never used.
 
 ## Notebooks
 
-`0_euv2mag_dataset_dataloader.ipynb`, `1_euv2mag_baseline.ipynb` and
-`2_euv2mag_finetune.ipynb` are **from the first workshop and do not currently run** — they
-import modules that no longer exist. The script path above is the working one. Rewriting
-them against the current API is tracked in MIGRATION.md.
+The interactive path through the same material, in order:
+
+| Notebook | What it covers |
+|---|---|
+| `0_euv2mag_dataset_dataloader.ipynb` | The dataset and dataloader, the four channel lists, and what the EUV inputs and the magnetogram target actually look like |
+| `1_euv2mag_baseline.ipynb` | The 1x1-conv baseline end to end — the number Surya has to beat |
+| `2_euv2mag_finetune.ipynb` | The fine-tune: the tokenizer slice, LoRA, and the comparison against the baseline |
+
+Notebooks 1 and 2 are deliberately almost identical — read them side by side, and the
+differences are exactly what fine-tuning a foundation model adds. Notebook 2 and
+`3_finetune_euv2mag.py` are the same run expressed two ways: same config, same builders,
+same model, and with `--deterministic warn` the same numbers.
+
+Every value comes from `configs/config_script.yaml`, so editing the config changes both the
+notebooks and the script. While iterating, set `cfg.data.max_train_samples = 8` in the
+notebook so an epoch takes seconds — each sample is a ~1 GB read the first time.
+
+Committed without stored outputs, matching the template.
