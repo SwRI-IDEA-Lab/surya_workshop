@@ -476,6 +476,67 @@ and a 20-minute one.
 
 ---
 
+## If your task changes the backbone's input channels
+
+Most forks change the labels and leave the 13-channel input stack alone. If yours feeds
+Surya a *subset* of those channels — as `downstream_apps/Imagetranslation/` does, mapping
+three EUV channels onto a magnetogram — two things need saying explicitly, and both are
+opt-in because they are wrong for every other app.
+
+**1. Tell `load_pretrained_weights` which pretrained channels yours are.**
+
+```python
+load_pretrained_weights(
+    model, cfg.model.pretrained_path,
+    channel_indices=cfg.data.input_channel_indices,      # positions in the PRETRAINING order
+    ckpt_in_chans=len(cfg.data.pretrained_channel_order),
+)
+```
+
+The tokenizer is then built at your channel count and initialized from exactly those
+channels' pretrained filters, instead of from scratch. Without `channel_indices` the load
+raises rather than guessing: `(1280, 26, p, p) -> (1280, 3, p, p)` is consistent with
+several channel/frame splits, each selecting different planes.
+
+> **The indices are positions in the pretraining channel order** — not in your
+> `data.channels`, and not in `assets/scalers.yaml` (where `hmi_bx/by/bz` precede `hmi_m`).
+> Record the pretraining order as a field on your `DataConfig` subclass and derive the
+> indices from it. Getting this wrong loads three *other* channels' filters, with no error
+> and nothing in the loss curve to say so.
+
+**2. Keep the tokenizer trainable.**
+
+```yaml
+model:
+  trainable_backbone_modules: [embedding.patch_embed]
+```
+
+The restricted tokenizer is not the function the backbone was trained to consume.
+`LinearEmbedding` is `patch_embed(x) + pos_embed` with no normalization in between, and the
+blocks are pre-norm, so LayerNorm only ever sees a branch input and never the residual
+stream. Fewer channels means a smaller tokenizer output, while `pos_embed` is a
+fixed-amplitude buffer that does not shrink with it — so position's share of every token
+grows, and normalization cannot undo that because it acts on the sum. Only the tokenizer can
+rescale its own output; a LoRA adapter acts *after* tokenization and cannot change a
+per-channel linear map.
+
+Measure it for your channel set before deciding:
+
+```bash
+python -m downstream_apps.Imagetranslation.tools.measure_token_scale
+```
+
+For 3 of 13 it is a factor of 1.68 in position's share, at a cost of ~984k trainable
+parameters. Such a layer trains at the base learning rate, not the head's multiplier, since
+it starts from pretrained weights.
+
+**3. Validate the two against each other.** Override `validate_with_model()` on your
+`DataConfig` so `model.in_channels` and `len(data.input_channels)` cannot disagree — that
+mismatch otherwise surfaces as an opaque error in the first forward pass. See
+`downstream_apps/Imagetranslation/configs.py`.
+
+---
+
 ## Checklist: files you should have edited
 
 If you touched anything outside this list, ask whether it belongs in
@@ -487,3 +548,6 @@ If you touched anything outside this list, ask whether it belongs in
 - [ ] `metrics/your_task_metrics.py` — your loss and evaluation metrics
 - [ ] `3_finetune_template_1D.py` — the two imports and the kwargs in `build_datasets`
 - [ ] `models/` — only if you need a custom head
+- [ ] `lightning_modules/` — normally just `target_fn`, i.e. how to get the target out
+      of the batch dict; the training loop itself is inherited from
+      `workshop_infrastructure/lightning_modules/pl_base.py`

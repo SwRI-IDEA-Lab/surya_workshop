@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **surya_workshop**, a standalone repo built around the [Surya](https://github.com/NASA-IMPACT/Surya.git) foundation model for heliophysics (a NASA-IMPACT / IBM AI4Science collaboration). The repo provides:
 - `workshop_infrastructure/` — shared config, dataset loaders, dataset/dataloader builders, PEFT utilities, and data pipeline scripts. Also contains a **vendored copy** of the 366M-parameter Surya backbone under `workshop_infrastructure/models/`. There is no `Surya/` submodule: the code was copied in so the repo runs standalone, which means it can drift from upstream without any diff signal.
-- `downstream_apps/` — template and concrete downstream fine-tuning applications
+- `downstream_apps/` — template and concrete downstream fine-tuning applications. `template/` is flare regression (1D output); `Imagetranslation/` is EUV2MAG (2D output, and the worked example of an app that changes the backbone's input channel count)
 - `analysis/` — research scripts (embedding probing/ablation); not part of the workshop template path
 
 The objective of this repo is to allow future Surya users an easy to modify set of templates that they can use to build their own finetunign applications.  Most of the reusable infrastructure should be in the `workshop_infrastructure/` folder. 
@@ -78,7 +78,7 @@ Each downstream task follows this pattern:
 - `configs.py` — a `DataConfig` subclass holding **only** the task-specific config fields. Everything generic (and `load_config()` itself) lives in `workshop_infrastructure/configs.py` and is never copied.
 - `datasets/` — task dataset inheriting from `HelioNetCDFDataset` (see `workshop_infrastructure/datasets/helio.py`)
 - `models/` — **both** models live in the app, not in infrastructure: `simple_baseline.py` (the linear baseline) and `finetune_model.py` (`FlareSuryaModel` = `build_surya_backbone()` + a head written out in app code). Changing the fine-tuning architecture must never require editing `workshop_infrastructure/`; `HelioSpectformer1D`/`2D` remain as reference implementations of all five pooling variants.
-- `lightning_modules/` — `pl_simple_baseline.py` holds the shared training mechanics; `pl_finetune.py` subclasses it and overrides `configure_optimizers` only, splitting the learning rate between the randomly-initialized head and the LoRA adapters (`training.head_lr_multiplier`, `training.weight_decay`)
+- `lightning_modules/` — the training mechanics live in `workshop_infrastructure/lightning_modules/pl_base.py` (`SuryaLightningModule`, and `SuryaFinetuneLightningModule` which overrides `configure_optimizers` only, splitting the learning rate between the randomly-initialized head and the LoRA adapters via `training.head_lr_multiplier` / `training.weight_decay`). An app subclasses them to supply **`target_fn`** — how to get the target tensor out of the batch dict — which is required and has no default, because a wrong target shape broadcasts rather than raising. Flare: `batch["forecast"].unsqueeze(1)` → `(B, 1)`. EUV2MAG: `batch["forecast"].squeeze(2)` → `(B, C, H, W)`
 - `metrics/` — custom metric implementations. Four modes: `train_loss` (backpropagated), `val_loss` (**what ModelCheckpoint monitors**; defaults to `train_loss`), `train_metrics` and `val_metrics` (reported only — they do *not* select checkpoints)
 - `configs/config_script.yaml` — single YAML drives everything
 - `N_*.py` / `N_*.ipynb` — numbered scripts/notebooks for step-by-step workflow
@@ -113,6 +113,20 @@ Trainable counts for the template config (`pooling: global_average`, `img_size: 
 The default pooling is **`global_average`**, not `class_token`: it adds no parameters and every token carries gradient from the first step, whereas a CLS token must learn what to attend to before it contributes — which a few-hundred-sample fine-tune may never reach. For `global_average` only, `HelioSpectformer1D.forward` and `FlareSuryaModel.forward` pool *before* `head_linear`, which is exactly equivalent (mean and an affine map commute) and applies the layer to one token instead of L. The reorder is **not** valid for any other pooling.
 
 `ModelConfig`/`TrainingConfig` also validate several other cross-field invariants at config-load time (`img_size` vs `patch_size`, `spectral_blocks`/`checkpoint_layers` vs `depth`, `time_embedding.time_dim` vs `data.time_delta_input_minutes`, `training.deterministic` vs `model.learned_flow`, `model.learned_flow` vs `time_embedding.type`, and `model.img_size` vs `data.native_img_size // data.pooling`) — see `ModelConfig.__post_init__` and `TrainingConfig.__post_init__` in `workshop_infrastructure/configs.py` for the current list, and add new ones there rather than leaving them as documentation-only footguns.
+
+### Changing the Backbone's Input Channels
+
+`downstream_apps/Imagetranslation/` feeds Surya 3 of the 13 pretraining channels. Two pieces of infrastructure exist for that case, and both are opt-in:
+
+**The tokenizer is initialized from the pretrained weights, not from scratch.** `adapt_patch_embed_weight()` selects along the channel axis as well as the frame axis, so `(1280, 26, 16, 16)` becomes `(1280, 3, 16, 16)` holding exactly the chosen channels' pretrained planes. The subset **cannot be inferred from the shapes** — `(…, 26, …) → (…, 3, …)` fits several channel/frame splits, each selecting different planes — so `load_pretrained_weights(channel_indices=…, ckpt_in_chans=…)` takes it explicitly and raises without it.
+
+The indices are positions in the **pretraining channel order**, which is neither the app's own `data.channels` nor the key order in `assets/scalers.yaml` (where `hmi_bx/by/bz` precede `hmi_m`). An app records it as a config field (`Euv2MagDataConfig.pretrained_channel_order`) and derives the indices from that; using the wrong list loads the wrong channels' filters with no error.
+
+**The restricted tokenizer must then be trainable**, via `model.trainable_backbone_modules: [embedding.patch_embed]` (empty by default — freezing the backbone is the point of LoRA). `LinearEmbedding` is `patch_embed(x) + pos_embed` with no normalization between them and the blocks are pre-norm, so LayerNorm only ever sees a branch input, never the residual stream. Dropping channels shrinks the tokenizer's output while the fixed-amplitude `pos_embed` does not, and nothing downstream restores that ratio because normalization acts on the sum. A LoRA adapter cannot substitute: it acts *after* tokenization and cannot change a per-channel linear map. Measured for 3-of-13 by `downstream_apps/Imagetranslation/tools/measure_token_scale.py`: token std falls to 0.59 of the 13-channel value, so position's share of each token grows 1.68x.
+
+`resolve_trainable_backbone_modules()` requires each name to match exactly one module, because PEFT matches `modules_to_save` by suffix — the same trap the `head_` convention guards against. Such a layer lands in the **backbone** optimizer group (it starts from pretrained weights, so it wants the base rate, not the head's multiplier).
+
+`DataConfig.validate_with_model()` is the hook for cross-section checks an app needs — EUV2MAG uses it to require `model.in_channels == len(data.input_channels)`.
 
 ### Data Pipeline
 
@@ -195,7 +209,7 @@ DDP via PyTorch Lightning. Use `CUDA_VISIBLE_DEVICES` to select GPUs. Logging is
 | Purpose | Path |
 |---|---|
 | Core model architecture (vendored) | `workshop_infrastructure/models/helio_spectformer.py` |
-| Pretrained-weight adaptation (resolution, frames) | `workshop_infrastructure/models/weight_adaptation.py` |
+| Pretrained-weight adaptation (resolution, frames, channels) | `workshop_infrastructure/models/weight_adaptation.py` |
 | Base dataset loader | `workshop_infrastructure/datasets/helio.py` |
 | Dataset/DataLoader builders | `workshop_infrastructure/datasets/builders.py` |
 | Config dataclasses + `load_config()` | `workshop_infrastructure/configs.py` |
@@ -206,7 +220,11 @@ DDP via PyTorch Lightning. Use `CUDA_VISIBLE_DEVICES` to select GPUs. Logging is
 | Defaults / subsampling / app-model tests | `tests/test_template_defaults.py` |
 | Backbone builder + reference heads | `workshop_infrastructure/models/finetune_models.py` |
 | App's editable fine-tuning model | `downstream_apps/template/models/finetune_model.py` |
-| App's fine-tuning LightningModule | `downstream_apps/template/lightning_modules/pl_finetune.py` |
+| Shared LightningModules | `workshop_infrastructure/lightning_modules/pl_base.py` |
+| EUV2MAG app (channel-subset example) | `downstream_apps/Imagetranslation/` |
+| EUV2MAG handover notes | `downstream_apps/Imagetranslation/MIGRATION.md` |
+| Token-scale diagnostic | `downstream_apps/Imagetranslation/tools/measure_token_scale.py` |
+| EUV2MAG config tests | `tests/test_euv2mag_config.py` |
 | Fine-tuning entry point | `downstream_apps/template/3_finetune_template_1D.py` |
 | Model weights (HuggingFace) | `nasa-impact/surya` |
 | Pretrained checkpoint | `downstream_apps/template/assets/surya.366m.v1.pt` |
