@@ -146,3 +146,50 @@ def test_in_channels_disagreeing_with_input_channels_raises(tmp_path):
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValueError, match="does not match len\\(data.input_channels\\)"):
         load_euv2mag_config(str(path))
+
+
+# ---------------------------------------------------------------------------
+# The tokenizer must stay trainable in every regime, not just under LoRA
+# ---------------------------------------------------------------------------
+
+def test_linear_probe_keeps_the_named_backbone_modules_trainable():
+    """The regression this guards: trainable_backbone_modules was passed only inside the
+    `if use_lora:` branch, so the linear-probe regime (use_lora: false, freeze_backbone:
+    true) froze the channel-sliced tokenizer -- the one thing this app must not do. A probe
+    of the backbone with a trainable input layer is the intended reading of that regime.
+
+    Exercises build_model's freeze path on a tiny model rather than the real 366M one.
+    """
+    import torch.nn as nn
+
+    from workshop_infrastructure.utils import resolve_trainable_backbone_modules
+
+    class TinyBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Module()
+            self.embedding.patch_embed = nn.Conv2d(3, 8, 1)
+            self.blocks = nn.Linear(8, 8)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = TinyBackbone()
+            self.head_unembed = nn.Linear(8, 1)
+
+    model = TinyModel()
+    trainable_backbone = resolve_trainable_backbone_modules(model, ["embedding.patch_embed"])
+
+    # The freeze_backbone path from build_model, verbatim in shape.
+    for name, param in model.named_parameters():
+        if name.startswith("backbone."):
+            param.requires_grad = False
+    for keep in trainable_backbone:
+        for param in model.get_submodule(keep).parameters():
+            param.requires_grad = True
+
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert "backbone.embedding.patch_embed.weight" in trainable
+    assert "backbone.embedding.patch_embed.bias" in trainable
+    assert "backbone.blocks.weight" not in trainable, "the rest of the backbone stays frozen"
+    assert "head_unembed.weight" in trainable

@@ -1,14 +1,21 @@
 # EUV2MAG — predicting a magnetogram from EUV images
 
 Fine-tunes the Surya backbone to map three AIA extreme-ultraviolet channels onto an HMI
-line-of-sight magnetogram of the same moment:
+line-of-sight magnetogram:
 
 ```
-aia304, aia193, aia171   ->   hmi_m
+aia304, aia193, aia171  (t)   ->   hmi_m  (t + 60 min)
 ```
 
 The scientific question is how much of the photospheric magnetic field is recoverable from
-the coronal and chromospheric emission it drives. The 1x1-convolution baseline
+the coronal and chromospheric emission it drives.
+
+> **The target is 60 minutes ahead, not co-temporal.** That is
+> `data.time_delta_target_minutes: 60`, carried over from the original pilot config, so this
+> is strictly a forecast rather than a pure translation. If you meant the two to be
+> simultaneous — which is what "image translation" usually implies, and which isolates the
+> EUV-to-field relationship from an hour of evolution — set it to `0`. Worth deciding
+> deliberately, because it changes what a result means. The 1x1-convolution baseline
 (`--train_baseline`) answers the trivial version of it — how much is predictable per pixel,
 with no spatial context — and whatever the fine-tune gains over that is what Surya's
 spatial and spectral structure is buying.

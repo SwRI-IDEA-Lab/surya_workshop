@@ -58,6 +58,7 @@ from workshop_infrastructure.utils import (
     apply_peft_lora,
     build_scalers,
     load_pretrained_weights,
+    resolve_trainable_backbone_modules,
 )
 
 DEFAULT_CONFIG = Path(__file__).parent / "configs" / "config_script.yaml"
@@ -163,15 +164,28 @@ def build_model(cfg: TrainingConfig, train_baseline: bool = False) -> L.Lightnin
     # freeze_backbone is ignored when use_lora is true: PEFT freezes every parameter, then
     # re-enables the adapters, every head_* module, and whatever
     # model.trainable_backbone_modules names.
+    # Resolved up front, so a typo in the list is caught in every regime rather than only
+    # when use_lora happens to be true.
+    trainable_backbone = resolve_trainable_backbone_modules(
+        model, cfg.model.trainable_backbone_modules
+    )
+
     if cfg.model.freeze_backbone:
         for name, param in model.named_parameters():
             if name.startswith("backbone."):
                 param.requires_grad = False
+        # Re-enable what the config asked to keep trainable. Without this the linear-probe
+        # regime freezes the channel-sliced tokenizer, which is the one thing this app must
+        # not do: the slice is not the function the backbone was trained to consume, and no
+        # other layer can rescale the tokenizer's output. The regime is then a probe of the
+        # *backbone* with a trainable input layer, which is the intended reading.
+        for keep in trainable_backbone:
+            for param in model.get_submodule(keep).parameters():
+                param.requires_grad = True
+
     if cfg.model.use_lora:
         model = apply_peft_lora(
-            model,
-            cfg.model.lora_config,
-            trainable_backbone_modules=cfg.model.trainable_backbone_modules,
+            model, cfg.model.lora_config, trainable_backbone_modules=trainable_backbone
         )
 
     _log_trainable_parameters(model)

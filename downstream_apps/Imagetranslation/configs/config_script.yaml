@@ -61,7 +61,12 @@ data:
 
   # -- Temporal sampling --
   time_delta_input_minutes: [0]   # Offsets (minutes) of input frames from the reference step
-  time_delta_target_minutes: 60   # Step size (minutes) to the target frame
+
+  # How far ahead the target magnetogram is. 60 is inherited from the original pilot, which
+  # makes this a one-hour FORECAST, not a co-temporal translation. Set 0 for the
+  # simultaneous version, which isolates the EUV-to-field relationship from an hour of
+  # evolution. Either is defensible; the point is to choose it rather than inherit it.
+  time_delta_target_minutes: 60
 
   # -- Resolution --
   # The main VRAM and speed knob: each frame is average-pooled by this factor, so the

@@ -12,7 +12,14 @@
 #   SURYA_WS_ENV        conda environment name          (default: surya_ws)
 #   SURYA_WS_CACHE_DIR  local cache for the S3 reads     (no default -- required)
 #
+#   cd downstream_apps/Imagetranslation
+#   mkdir -p slurm_logs          # SLURM opens --output BEFORE the job runs and will not
+#                                # create the directory; without this the submission fails
+#                                # with "Unable to open file". Only needed once.
 #   sbatch --export=ALL,SURYA_WS_CACHE_DIR=/scratch/$USER/helio_cache pilot_100.sbatch
+#
+# --output is relative to the directory you submit from, which is why the two lines above
+# go together. Submitting from elsewhere means creating slurm_logs/ there instead.
 #
 #SBATCH --job-name=euv2mag
 #SBATCH --partition=gpu
@@ -30,8 +37,6 @@ set -euo pipefail
 SBATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SBATCH_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
-
-mkdir -p "$SBATCH_DIR/slurm_logs"
 
 export PYTHONUNBUFFERED=1
 export MPLBACKEND=Agg          # No display on a compute node; the figure still writes.

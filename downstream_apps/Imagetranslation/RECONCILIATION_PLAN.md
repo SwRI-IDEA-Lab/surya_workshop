@@ -95,7 +95,35 @@ the head's multiplier, because it starts from pretrained weights.
 It was made a config knob (`model.trainable_backbone_modules`) rather than hardcoded,
 precisely so the decision could be tested rather than asserted.
 
-<!-- AB_RESULTS -->
+### The A/B: does training the tokenizer actually help?
+
+Both arms identical but for `model.trainable_backbone_modules`, same seed,
+`--deterministic warn`, 40 train / 20 val samples, 8 epochs, one A100 each. The arms differ
+by exactly 984,320 trainable parameters, which is the tokenizer.
+
+| epoch | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| tokenizer **trainable** | 1.2911 | 1.2718 | 1.2652 | 1.2623 | 1.2604 | 1.2577 | 1.2547 | **1.2535** |
+| tokenizer **frozen** | 1.3012 | 1.2760 | 1.2677 | 1.2641 | 1.2624 | 1.2601 | 1.2586 | **1.2583** |
+
+Training the tokenizer is ahead at **every epoch**, ending 0.0048 lower (0.38%).
+
+**How much this proves: not much on its own.** One seed, 40 training samples, 8 epochs, and a
+gap of 0.4% — this is indicative, not conclusive, and it would be wrong to quote the
+difference as an effect size. What it does do is rule out the outcome that would have
+contradicted the design: the frozen arm is not better, and the ordering is consistent across
+all eight epochs rather than crossing over.
+
+The gap is small for a reason worth understanding. The frozen arm is not helpless — its LoRA
+adapters and its decoder head still train, and they can partially compensate downstream for a
+tokenizer whose output is scaled wrong. What they cannot do is change a per-channel linear
+map, which is why the compensation is partial and why the ordering holds.
+
+So the case for the trainable tokenizer rests mainly on the measurement above — the 1.68x
+shift in position's share of each token, which is a property of the architecture and not of
+any particular run — with the A/B as a consistency check rather than as the evidence. If you
+want it to be evidence, run several seeds at a realistic sample count and compare
+distributions, not single numbers.
 
 ## What was done
 
@@ -134,6 +162,22 @@ precisely so the decision could be tested rather than asserted.
 | Determinism (`--deterministic warn`) | `val_loss` 1.836134 on three independent runs |
 | Baseline path | trains, `val_loss` 2.789744 |
 | DDP on 2 GPUs | both ranks report identical `val_loss`, so `sync_dist` reduces correctly |
+| Linear-probe regime (`use_lora: false`, `freeze_backbone: true`) | 1,312,256 trainable = head 327,936 + tokenizer 984,320, rest of backbone frozen |
+
+A code review over the finished branch found six defects, all fixed before merge and worth
+recording because most were silent rather than loud:
+
+| Defect | Consequence |
+|---|---|
+| `trainable_backbone_modules` passed only inside the `use_lora` branch | the linear-probe regime froze the channel-sliced tokenizer — precisely what the design forbids |
+| `resolve_trainable_backbone_modules` returned the as-written suffix | `model.get_submodule()` resolves from the top-level model, so the above fix crashed until it returned the fully-qualified name |
+| `ckpt_in_chans` silently defaulted to `in_chans` | omitting it alongside `channel_indices` passes every check and gathers the wrong planes |
+| `HelioSpectformer2D.from_config` never read `ft_unembedding_type` | `perceiver` was a silent no-op for the reference 2D model |
+| `#SBATCH --output` into `slurm_logs/` with the `mkdir` in the job body | SLURM opens the file before the body runs, so the first submission fails |
+| `conda config --remove-key envs_dirs` in the setup script | wipes entries the script never added, breaking a user's other environments |
+
+The README also described the task as co-temporal while the config predicts +60 min; the
+documentation was corrected to the config rather than the reverse, and the choice flagged.
 
 ## What was deliberately not done
 

@@ -55,14 +55,20 @@ for dir in "$BASE/conda_envs" "$BASE/conda_pkgs" "$BASE/.cache/pip" \
 done
 
 echo "[2/6] Pointing conda at $BASE"
-# Removed first so re-running does not stack duplicate entries.
-conda config --remove-key envs_dirs >/dev/null 2>&1 || true
-conda config --remove-key pkgs_dirs >/dev/null 2>&1 || true
+# --remove (one entry) rather than --remove-key (the whole list): the list may hold
+# directories this script never added, and dropping those would make the user's other named
+# environments stop resolving. Removing our own entry first keeps re-runs from stacking
+# duplicates; the || true covers the first run, when there is nothing to remove.
+conda config --remove envs_dirs "$BASE/conda_envs" >/dev/null 2>&1 || true
+conda config --remove pkgs_dirs "$BASE/conda_pkgs" >/dev/null 2>&1 || true
 conda config --add envs_dirs "$BASE/conda_envs"
 conda config --add pkgs_dirs "$BASE/conda_pkgs"
 
 echo "[3/6] Updating ~/.bashrc cache exports"
-# Delete before appending, so this is idempotent rather than additive.
+# Delete before appending, so this is idempotent rather than additive. Guarded because
+# set -e would otherwise abort here on a machine with no ~/.bashrc -- after step 2 has
+# already reconfigured conda, leaving a half-applied setup.
+touch ~/.bashrc
 sed -i '/^export PIP_CACHE_DIR=/d;/^export HF_HOME=/d;/^export TORCH_HOME=/d' ~/.bashrc
 cat >> ~/.bashrc <<EOF
 export PIP_CACHE_DIR=$BASE/.cache/pip

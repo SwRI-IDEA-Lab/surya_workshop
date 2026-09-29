@@ -87,7 +87,8 @@ def adapt_patch_embed_weight(
         target_shape: Shape the model wants, ``(embed_dim, in_chans * T_model, p, p)``.
         in_chans: Number of physical input channels the **model** takes.
         ckpt_in_chans: Number of physical input channels the **checkpoint** was pretrained
-            with (13 for Surya). Defaults to ``in_chans``, i.e. no channel change.
+            with (13 for Surya). Defaults to ``in_chans`` (i.e. no channel change) and is
+            **required** whenever ``channel_indices`` is given.
         channel_indices: Which of the checkpoint's channels the model's channels
             correspond to, in the model's own channel order, as positions in the
             pretraining channel order. Required whenever ``ckpt_in_chans != in_chans``;
@@ -111,6 +112,14 @@ def adapt_patch_embed_weight(
             "number of input frames and the choice of input channels can be adapted."
         )
 
+    if channel_indices is not None and ckpt_in_chans is None:
+        raise ValueError(
+            "channel_indices was given without ckpt_in_chans, so how many channels the "
+            "checkpoint holds is unknown. Defaulting it to in_chans would silently gather "
+            "the wrong planes: the input axis is ordered c * T + t, so the stride between "
+            "channels depends on ckpt_in_chans, and a wrong value passes every other check "
+            "here. Pass ckpt_in_chans=13 for the Surya checkpoint."
+        )
     if ckpt_in_chans is None:
         ckpt_in_chans = in_chans
 

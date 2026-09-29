@@ -379,8 +379,9 @@ class HelioSpectformer2D(nn.Module):
         """Construct from a ModelConfig, with optional field overrides.
 
         Fields that live outside ModelConfig (e.g. ``dtype``,
-        ``use_latitude_in_learned_flow``, ``ft_unembedding_type``,
-        ``ft_out_chans``) should be supplied via ``overrides``.
+        ``use_latitude_in_learned_flow``, ``ft_out_chans``) should be supplied via
+        ``overrides``. ``ft_unembedding_type`` is read from the config; pass it in
+        ``overrides`` only to deviate from what the YAML says.
         """
         kwargs = dict(
             img_size=cfg.img_size,
@@ -399,6 +400,7 @@ class HelioSpectformer2D(nn.Module):
             init_weights=cfg.init_weights,
             checkpoint_layers=cfg.checkpoint_layers,
             rpe=cfg.rpe,
+            ft_unembedding_type=cfg.ft_unembedding_type,
         )
         kwargs.update(overrides)
         return cls(**kwargs)

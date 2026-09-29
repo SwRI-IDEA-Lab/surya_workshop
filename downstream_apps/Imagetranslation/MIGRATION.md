@@ -144,7 +144,44 @@ the tokenizer can rescale its own output. Hence
 `model.trainable_backbone_modules: [embedding.patch_embed]`, which costs ~984k parameters,
 about what the LoRA adapters themselves cost.
 
-<!-- AB_RESULTS -->
+### The A/B: does training the tokenizer actually help?
+
+Both arms identical but for `model.trainable_backbone_modules`, same seed,
+`--deterministic warn`, 40 train / 20 val samples, 8 epochs, one A100 each. The arms differ
+by exactly 984,320 trainable parameters, which is the tokenizer.
+
+| epoch | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| tokenizer **trainable** | 1.2911 | 1.2718 | 1.2652 | 1.2623 | 1.2604 | 1.2577 | 1.2547 | **1.2535** |
+| tokenizer **frozen** | 1.3012 | 1.2760 | 1.2677 | 1.2641 | 1.2624 | 1.2601 | 1.2586 | **1.2583** |
+
+Training the tokenizer is ahead at **every epoch**, ending 0.0048 lower (0.38%).
+
+**How much this proves: not much on its own.** One seed, 40 training samples, 8 epochs, and a
+gap of 0.4% — this is indicative, not conclusive, and it would be wrong to quote the
+difference as an effect size. What it does do is rule out the outcome that would have
+contradicted the design: the frozen arm is not better, and the ordering is consistent across
+all eight epochs rather than crossing over.
+
+The gap is small for a reason worth understanding. The frozen arm is not helpless — its LoRA
+adapters and its decoder head still train, and they can partially compensate downstream for a
+tokenizer whose output is scaled wrong. What they cannot do is change a per-channel linear
+map, which is why the compensation is partial and why the ordering holds.
+
+So the case for the trainable tokenizer rests mainly on the measurement above — the 1.68x
+shift in position's share of each token, which is a property of the architecture and not of
+any particular run — with the A/B as a consistency check rather than as the evidence. If you
+want it to be evidence, run several seeds at a realistic sample count and compare
+distributions, not single numbers.
+
+## 6b. One thing worth deciding rather than inheriting
+
+`data.time_delta_target_minutes: 60` came straight from your pilot config, so the model
+predicts the magnetogram **one hour after** the EUV input — a forecast, not a co-temporal
+translation. It was left as you had it rather than changed silently, but it is worth a
+deliberate decision: `0` gives the simultaneous version, which isolates the EUV-to-field
+relationship from an hour of solar evolution. It changes what a result means, so it should
+not be an accident either way.
 
 ## 7. Things you can do now that you could not before
 

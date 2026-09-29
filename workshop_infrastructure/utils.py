@@ -332,7 +332,11 @@ def resolve_trainable_backbone_modules(
             ``["embedding.patch_embed"]``.
 
     Returns:
-        The names, unchanged, once every one is known to resolve uniquely.
+        The **fully-qualified** name of each match, e.g. ``embedding.patch_embed`` ->
+        ``backbone.embedding.patch_embed``. Qualified rather than as-written because
+        callers use these with ``model.get_submodule()``, which resolves from the top-level
+        model and fails on a partial path. PEFT is happy either way, since it matches
+        ``modules_to_save`` by suffix, and the qualified form is the more precise of the two.
 
     Raises:
         ValueError: If a name matches no module, or more than one.
@@ -362,7 +366,7 @@ def resolve_trainable_backbone_modules(
                 "PEFT matches these names by suffix, so an ambiguous entry would wrap "
                 "more than intended. Qualify the name until it matches exactly one."
             )
-        resolved.append(want)
+        resolved.append(matches[0])
     return resolved
 
 
